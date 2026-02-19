@@ -1,0 +1,200 @@
+"""Parse pre-existing citations from a document that already has references.
+
+Detects and extracts:
+- The "References" heading and bibliography entries
+- In-text citation numbers (superscript and bracketed)
+- Basic metadata from bibliography entries (DOI, PMID, year)
+"""
+
+import re
+import logging
+from ..models.existing_refs import ExistingBibEntry, ExistingCitationMap, InTextCitation
+from ..services.docx_io import DocxHandler
+
+logger = logging.getLogger(__name__)
+
+# Pattern for the References / Bibliography heading
+REFS_HEADING_PATTERN = re.compile(
+    r'^(References|Bibliography|Literature Cited|Works Cited)\s*$',
+    re.IGNORECASE,
+)
+
+# Pattern for a numbered bibliography entry: "1. Author..." or "1) Author..."
+BIB_ENTRY_PATTERN = re.compile(r'^(\d+)[.\s)\]]+\s*(.+)')
+
+# Pattern for bracketed in-text citations: [1], [1,2,3], [1-3]
+BRACKET_CITE_PATTERN = re.compile(r'\[(\d+(?:\s*[,\-\u2013]\s*\d+)*)\]')
+
+# Pattern for (REF) / (REFS) markers — used to detect char offsets
+MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+
+
+class ExistingCitationParser:
+    """Analyze a DOCX for pre-existing citations and bibliography."""
+
+    def __init__(self, handler: DocxHandler):
+        self.handler = handler
+
+    def analyze(self) -> ExistingCitationMap:
+        """Full analysis: detect heading, parse bib, scan in-text numbers."""
+        result = ExistingCitationMap()
+        paragraphs = self.handler.get_paragraphs()
+
+        # Step 1: Find the References heading
+        refs_start_idx = self._find_references_heading(paragraphs)
+        if refs_start_idx < 0:
+            return result
+        result.references_heading_para_idx = refs_start_idx
+
+        # Step 2: Parse bibliography entries
+        result.bib_entries = self._parse_bibliography(paragraphs, refs_start_idx)
+        if result.bib_entries:
+            result.max_existing_number = max(result.bib_entries.keys())
+
+        # Step 3: Scan body paragraphs for in-text citation numbers
+        result.in_text_citations = self._scan_in_text_citations(
+            paragraphs[:refs_start_idx]
+        )
+
+        # Step 4: Detect superscript vs bracket style
+        result.detected_style_is_superscript = self._detect_superscript(
+            paragraphs[:refs_start_idx]
+        )
+
+        logger.info(
+            f"Existing citation analysis: {len(result.bib_entries)} bib entries, "
+            f"refs heading at para {refs_start_idx}, "
+            f"max number={result.max_existing_number}, "
+            f"superscript={result.detected_style_is_superscript}"
+        )
+        return result
+
+    def _find_references_heading(self, paragraphs) -> int:
+        """Find the paragraph index of the References heading."""
+        for i, para in enumerate(paragraphs):
+            text = para.text.strip()
+            if REFS_HEADING_PATTERN.match(text):
+                return i
+            if para.style.name.startswith('Heading') and 'reference' in text.lower():
+                return i
+        return -1
+
+    def _parse_bibliography(
+        self, paragraphs, start_idx: int
+    ) -> dict[int, ExistingBibEntry]:
+        """Parse numbered bibliography entries after the heading."""
+        entries = {}
+        for i in range(start_idx + 1, len(paragraphs)):
+            text = paragraphs[i].text.strip()
+            if not text:
+                continue
+            match = BIB_ENTRY_PATTERN.match(text)
+            if match:
+                num = int(match.group(1))
+                body = match.group(2).strip()
+                entry = ExistingBibEntry(
+                    original_number=num,
+                    raw_text=text,
+                )
+                self._extract_bib_fields(entry, body)
+                entries[num] = entry
+        return entries
+
+    @staticmethod
+    def _extract_bib_fields(entry: ExistingBibEntry, body: str):
+        """Best-effort extraction of DOI, PMID, year from raw bib text."""
+        # DOI
+        doi_match = re.search(r'doi:\s*(10\.\S+)', body, re.IGNORECASE)
+        if doi_match:
+            entry.doi = doi_match.group(1).rstrip('.')
+        # PMID
+        pmid_match = re.search(r'PMID:\s*(\d+)', body)
+        if pmid_match:
+            entry.pmid = pmid_match.group(1)
+        # Year
+        year_match = re.search(r'(?:19|20)\d{2}', body)
+        if year_match:
+            entry.year = int(year_match.group())
+
+    def _scan_in_text_citations(
+        self, paragraphs
+    ) -> dict[int, list[InTextCitation]]:
+        """Scan body paragraphs for in-text citation numbers.
+
+        Finds both superscript number runs and bracketed citations like [1,2,3].
+        Skips any numbers that fall inside (REF)/(REFS) markers.
+        """
+        cite_map: dict[int, list[InTextCitation]] = {}
+        for idx, para in enumerate(paragraphs):
+            citations: list[InTextCitation] = []
+
+            # Determine character ranges occupied by (REF)/(REFS) markers
+            marker_ranges = []
+            for m in MARKER_PATTERN.finditer(para.text):
+                marker_ranges.append((m.start(), m.end()))
+
+            def _in_marker(offset: int) -> bool:
+                return any(s <= offset < e for s, e in marker_ranges)
+
+            # Superscript runs
+            char_offset = 0
+            for run in para.runs:
+                if run.font.superscript:
+                    for m in re.finditer(r'\d+', run.text):
+                        abs_offset = char_offset + m.start()
+                        if not _in_marker(abs_offset):
+                            citations.append(InTextCitation(
+                                char_offset=abs_offset,
+                                number=int(m.group()),
+                                is_superscript=True,
+                            ))
+                char_offset += len(run.text)
+
+            # Bracketed citations
+            for m in BRACKET_CITE_PATTERN.finditer(para.text):
+                if not _in_marker(m.start()):
+                    for num in self._expand_citation_range(m.group(1)):
+                        citations.append(InTextCitation(
+                            char_offset=m.start(),
+                            number=num,
+                            is_superscript=False,
+                        ))
+
+            if citations:
+                # Sort by position to enable sequential processing
+                citations.sort(key=lambda c: (c.char_offset, c.number))
+                cite_map[idx] = citations
+
+        return cite_map
+
+    @staticmethod
+    def _expand_citation_range(range_str: str) -> list[int]:
+        """Expand '1,2,3' or '1-3' into [1, 2, 3]."""
+        numbers = []
+        parts = re.split(r'[,\s]+', range_str)
+        for part in parts:
+            if '-' in part or '\u2013' in part:
+                bounds = re.split(r'[-\u2013]', part)
+                if len(bounds) == 2:
+                    try:
+                        start, end = int(bounds[0]), int(bounds[1])
+                        numbers.extend(range(start, end + 1))
+                    except ValueError:
+                        pass
+            else:
+                try:
+                    numbers.append(int(part))
+                except ValueError:
+                    pass
+        return numbers
+
+    def _detect_superscript(self, paragraphs) -> bool:
+        """Detect whether the document uses superscript or bracketed citations."""
+        superscript_count = 0
+        bracket_count = 0
+        for para in paragraphs:
+            for run in para.runs:
+                if run.font.superscript and re.search(r'\d+', run.text):
+                    superscript_count += 1
+            bracket_count += len(BRACKET_CITE_PATTERN.findall(para.text))
+        return superscript_count >= bracket_count

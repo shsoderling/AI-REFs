@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bodyGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#5ba3e8;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#4a90d9;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="headGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#6bb3f0;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#4a90d9;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background circle for depth -->
+  <circle cx="256" cy="256" r="240" fill="#f5f7fa" opacity="0.5"/>
+  
+  <!-- Left arm with pencil -->
+  <g id="leftArm">
+    <!-- Arm -->
+    <rect x="140" y="240" width="50" height="120" rx="25" fill="#5ba3e8" transform="rotate(-30 165 240)"/>
+    <!-- Hand -->
+    <circle cx="110" cy="310" r="20" fill="#e8c4a0"/>
+    
+    <!-- Pencil in left hand -->
+    <g id="pencil">
+      <!-- Pencil shaft -->
+      <rect x="85" y="285" width="15" height="90" rx="7" fill="#e6b84d" transform="rotate(-35 92 285)"/>
+      <!-- Pencil tip -->
+      <polygon points="90,370 88,382 102,382" fill="#c21a1a"/>
+      <!-- Pencil eraser -->
+      <circle cx="92" cy="270" r="8" fill="#f5a0a0"/>
+    </g>
+  </g>
+  
+  <!-- Right arm with beaker -->
+  <g id="rightArm">
+    <!-- Arm -->
+    <rect x="322" y="240" width="50" height="120" rx="25" fill="#5ba3e8" transform="rotate(30 347 240)"/>
+    <!-- Hand -->
+    <circle cx="402" cy="310" r="20" fill="#e8c4a0"/>
+    
+    <!-- Science beaker in right hand -->
+    <g id="beaker">
+      <!-- Beaker body -->
+      <path d="M 405 300 L 410 360 Q 410 375 420 375 L 435 375 Q 445 375 445 360 L 450 300 Z" 
+            fill="none" stroke="#4a90d9" stroke-width="3" stroke-linecap="round"/>
+      <!-- Beaker mouth -->
+      <line x1="405" y1="300" x2="450" y2="300" stroke="#4a90d9" stroke-width="3" stroke-linecap="round"/>
+      <!-- Liquid in beaker -->
+      <path d="M 408 340 L 413 360 Q 413 372 420 372 L 435 372 Q 442 372 442 360 L 447 340 Z" 
+            fill="#7cc8ff" opacity="0.6"/>
+      <!-- Beaker measurement lines -->
+      <line x1="405" y1="320" x2="410" y2="320" stroke="#4a90d9" stroke-width="2"/>
+      <line x1="405" y1="340" x2="410" y2="340" stroke="#4a90d9" stroke-width="2"/>
+    </g>
+  </g>
+  
+  <!-- Body/Torso -->
+  <g id="body">
+    <!-- Main body -->
+    <rect x="190" y="260" width="140" height="120" rx="20" fill="url(#bodyGradient)"/>
+    <!-- Body accent lines -->
+    <line x1="200" y1="280" x2="310" y2="280" stroke="#3a6fa8" stroke-width="2" opacity="0.4"/>
+    <line x1="200" y1="330" x2="310" y2="330" stroke="#3a6fa8" stroke-width="2" opacity="0.4"/>
+  </g>
+  
+  <!-- Head -->
+  <g id="head">
+    <!-- Main head -->
+    <circle cx="256" cy="160" r="65" fill="url(#headGradient)"/>
+    <!-- Head shine/highlight -->
+    <circle cx="236" cy="130" r="20" fill="white" opacity="0.3"/>
+    
+    <!-- Left eye -->
+    <g id="leftEye">
+      <circle cx="225" cy="150" r="14" fill="white"/>
+      <circle cx="225" cy="150" r="10" fill="#3a6fa8"/>
+      <circle cx="227" cy="148" r="4" fill="white"/>
+    </g>
+    
+    <!-- Right eye -->
+    <g id="rightEye">
+      <circle cx="287" cy="150" r="14" fill="white"/>
+      <circle cx="287" cy="150" r="10" fill="#3a6fa8"/>
+      <circle cx="289" cy="148" r="4" fill="white"/>
+    </g>
+    
+    <!-- Antenna/sensor left -->
+    <g id="antennaLeft">
+      <line x1="215" y1="85" x2="210" y2="50" stroke="#4a90d9" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="210" cy="45" r="6" fill="#e8c4a0"/>
+    </g>
+    
+    <!-- Antenna/sensor right -->
+    <g id="antennaRight">
+      <line x1="297" y1="85" x2="302" y2="50" stroke="#4a90d9" stroke-width="4" stroke-linecap="round"/>
+      <circle cx="302" cy="45" r="6" fill="#e8c4a0"/>
+    </g>
+    
+    <!-- Smile -->
+    <path d="M 235 175 Q 256 190 277 175" stroke="#3a6fa8" stroke-width="3" fill="none" stroke-linecap="round"/>
+  </g>
+  
+  <!-- Legs -->
+  <g id="legs">
+    <!-- Left leg -->
+    <rect x="210" y="380" width="25" height="60" rx="12" fill="#5ba3e8"/>
+    <!-- Left foot -->
+    <ellipse cx="222" cy="450" rx="18" ry="12" fill="#4a90d9"/>
+    
+    <!-- Right leg -->
+    <rect x="277" y="380" width="25" height="60" rx="12" fill="#5ba3e8"/>
+    <!-- Right foot -->
+    <ellipse cx="289" cy="450" rx="18" ry="12" fill="#4a90d9"/>
+  </g>
+  
+  <!-- Text: "AI REFs" -->
+  <text x="256" y="485" font-family="Arial, sans-serif" font-size="42" font-weight="bold" 
+        text-anchor="middle" fill="#4a90d9" letter-spacing="2">
+    AI REFs
+  </text>
+</svg>

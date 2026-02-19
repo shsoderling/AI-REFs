@@ -1,0 +1,41 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Environment & secrets ─────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── AI REFs local data (user-specific, may contain personal refs) ─────
+.ai_refs/
+saved projects/
+
+# ── PyInstaller build artifacts ───────────────────────────────────────
+packaging/build/
+packaging/dist/
+*.spec.bak
+
+# ── IDE & OS ──────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# ── Claude Code working files ────────────────────────────────────────
+.claude/
+
+# ── Cached bytecode (PyInstaller temp) ────────────────────────────────
+.pycache_tmp/
+
+# ── Misc junk files ──────────────────────────────────────────────────
+=0.42.0
