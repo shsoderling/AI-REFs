@@ -123,6 +123,9 @@ class DocxHandler:
         self.path = path
         self.doc = Document(path)
         self._fields: Optional[FieldIndex] = None
+        # Element that followed the last removed References section; a
+        # rebuilt bibliography is inserted before it so it stays in place.
+        self._insert_anchor = None
 
     @property
     def fields(self) -> FieldIndex:
@@ -428,8 +431,9 @@ class DocxHandler:
         if not entries:
             return
         self.ensure_bibliography_styles()
-        self.doc.add_paragraph(heading_text, style=BIBLIOGRAPHY_HEADING_STYLE)
-        self._new_entry_paragraphs(entries, bibl_code)
+        heading = self.doc.add_paragraph(heading_text, style=BIBLIOGRAPHY_HEADING_STYLE)
+        new_paragraphs = [heading] + self._new_entry_paragraphs(entries, bibl_code)
+        self._place_new_paragraphs(new_paragraphs)
         self.invalidate_fields()
 
     def replace_bibliography_field(self, field, entries: list[str], bibl_code: str) -> int:
@@ -617,51 +621,76 @@ class DocxHandler:
                                   end_para_idx: Optional[int] = None) -> int:
         """Remove the References section: the heading paragraph and its entries.
 
-        Without *end_para_idx* the section is bounded: it ends at the last
-        paragraph after the heading that is blank or entry-shaped
-        (``BIB_ENTRY_PATTERN``), so an appendix, acknowledgements or any
-        other text that follows the bibliography is left alone. Blank
-        paragraphs trailing the last entry are kept. With *end_para_idx*
-        exactly ``[start_para_idx, end_para_idx]`` is removed.
-
-        Returns the number of paragraphs removed.
+        Without *end_para_idx* the section ends where
+        ``existing_citation_parser.bibliography_bounds`` says it does (the
+        same rule the parser used to read the entries), so an appendix or
+        acknowledgements after the list survive. With *end_para_idx* exactly
+        ``[start_para_idx, end_para_idx]`` is removed. Refuses to cut through
+        a multi-paragraph field. Remembers what followed the section so
+        :meth:`append_bibliography` / :meth:`write_bibliography_field` put the
+        rebuilt list back in the same place. Returns the number removed.
         """
-        from ..pipeline.existing_citation_parser import BIB_ENTRY_PATTERN
+        from ..pipeline.existing_citation_parser import bibliography_bounds
         paragraphs = self.doc.paragraphs
         if end_para_idx is None:
-            end_para_idx = start_para_idx
-            for i in range(start_para_idx + 1, len(paragraphs)):
-                text = paragraphs[i].text.strip()
-                if not text or BIB_ENTRY_PATTERN.match(text):
-                    end_para_idx = i
-                    continue
-                break
-            while (end_para_idx > start_para_idx
-                   and not paragraphs[end_para_idx].text.strip()):
-                end_para_idx -= 1
+            end_para_idx = max(start_para_idx, bibliography_bounds(paragraphs, start_para_idx)[1])
+        if not (0 <= start_para_idx <= end_para_idx < len(paragraphs)):
+            raise ValueError(
+                f"invalid References range [{start_para_idx}, {end_para_idx}] "
+                f"for a document with {len(paragraphs)} paragraphs")
+        self._check_field_boundary(paragraphs, start_para_idx - 1, start_para_idx)
+        self._check_field_boundary(paragraphs, end_para_idx, end_para_idx + 1)
+        following = paragraphs[end_para_idx]._element.getnext()
+        if following is not None and following.tag == f'{{{W_NS}}}sectPr':
+            following = None
         body_elem = self.doc.element.body
         for i in range(end_para_idx, start_para_idx - 1, -1):
             body_elem.remove(paragraphs[i]._element)
+        self._insert_anchor = following
         removed = end_para_idx - start_para_idx + 1
         logger.info(f"Removed {removed} paragraphs "
                     f"(References section from para {start_para_idx} to {end_para_idx})")
         self.invalidate_fields()
         return removed
 
+    def _check_field_boundary(self, paragraphs, inside_idx: int, outside_idx: int):
+        """Raise if one field spans both paragraphs (one to be removed, one kept)."""
+        if not (0 <= inside_idx < len(paragraphs) and 0 <= outside_idx < len(paragraphs)):
+            return
+        inside, outside = paragraphs[inside_idx]._p, paragraphs[outside_idx]._p
+        for f in self.fields.fields_in_paragraph(inside):
+            if any(q is outside for q in f.paragraphs):
+                raise FieldBoundaryError(
+                    "the References section boundary cuts through a field; "
+                    "refusing to remove part of it")
+
+    def _place_new_paragraphs(self, paragraphs: list):
+        """Move freshly appended paragraphs before the remembered anchor, if any."""
+        anchor = self._insert_anchor
+        if anchor is None:
+            return
+        for p in paragraphs:
+            anchor.addprevious(p._p)
+        self._insert_anchor = None
+
     def append_bibliography(self, entries: list[str]):
-        """Append a bibliography section to the end of the document."""
-        # Add a section break / heading
+        """Write a plain-text bibliography section (legacy, no field).
+
+        Goes where the removed References section was when one was just
+        removed, else at the end of the document.
+        """
         bib_heading = self.doc.add_paragraph()
         run = bib_heading.add_run("References")
         run.bold = True
         run.font.size = Pt(14)
         bib_heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-        # Add each entry
+        new_paragraphs = [bib_heading]
         for entry in entries:
             p = self.doc.add_paragraph()
             run = p.add_run(entry)
             run.font.size = Pt(10)
+            new_paragraphs.append(p)
+        self._place_new_paragraphs(new_paragraphs)
         self.invalidate_fields()
 
     def save(self, output_path: str):
@@ -677,7 +706,10 @@ class DocxHandler:
             self.doc.save(tmp)
             os.replace(tmp, output_path)
         except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                logger.warning(f"Could not remove temporary file {tmp}")
             raise
         logger.info(f"Document saved to {output_path}")

@@ -1,5 +1,6 @@
 """One paragraph index space: parser, marker finder and field walker agree."""
 import glob
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +9,7 @@ from src.pipeline.document_parser import DocumentParser
 from src.services.docx_io import DocxHandler
 from tests.fixture_builders import DocBuilder
 
-FIXTURES = sorted(glob.glob("fixtures/*.docx"))
+FIXTURES = sorted(str(p) for p in (Path(__file__).resolve().parent.parent / "fixtures").glob("*.docx"))
 assert FIXTURES, "no fixture DOCX files found"
 
 

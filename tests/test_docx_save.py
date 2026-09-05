@@ -1,6 +1,7 @@
 """DocxHandler.save writes atomically: temp file beside the target, then rename."""
 import os
 
+import pytest
 from docx import Document
 
 import src.services.docx_io as docx_io
@@ -39,9 +40,7 @@ def test_failed_save_leaves_target_untouched(tmp_path, monkeypatch):
     out.write_bytes(b"previous")
     h = DocxHandler(str(src))
     monkeypatch.setattr(h.doc, "save", lambda path: (_ for _ in ()).throw(OSError("disk full")))
-    try:
+    with pytest.raises(OSError):
         h.save(str(out))
-    except OSError:
-        pass
     assert out.read_bytes() == b"previous"
     assert not (tmp_path / "out.docx.tmp").exists()

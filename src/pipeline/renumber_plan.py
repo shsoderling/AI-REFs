@@ -13,7 +13,7 @@ from typing import Optional
 from ..models.citation import CitationCandidate, is_valid_citation
 from ..models.evidence import ReviewDecision
 from ..models.project import ProjectState
-from ..models.sentence import MarkerType, SentenceRecord
+from ..models.sentence import SentenceRecord
 from .renumbering import NewMarkerInfo, RenumberingResult, compute_renumbering
 
 logger = logging.getLogger(__name__)

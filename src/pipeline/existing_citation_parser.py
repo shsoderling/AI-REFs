@@ -39,6 +39,31 @@ CITATION_SHAPE_PATTERN = re.compile(r'^[\d\s,;\-\u2013]+$')
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
 
 
+def bibliography_bounds(paragraphs, heading_idx: int) -> tuple[int, int]:
+    """Body indices (first entry, last entry) of the bibliography under
+    *heading_idx*, or (-1, -1) when no entry follows.
+
+    The section is the run of blank or entry-shaped (``BIB_ENTRY_PATTERN``)
+    paragraphs after the heading; it ends at the first paragraph that is
+    neither, so a numbered appendix or acknowledgements after the list are
+    never mistaken for entries. Trailing blank paragraphs are excluded.
+    This is the one definition of where the bibliography ends: the parser
+    reads entries within it and ``remove_references_section`` deletes it.
+    """
+    first = last = -1
+    for i in range(heading_idx + 1, len(paragraphs)):
+        text = paragraphs[i].text.strip()
+        if not text:
+            continue
+        if BIB_ENTRY_PATTERN.match(text):
+            if first < 0:
+                first = i
+            last = i
+            continue
+        break
+    return first, last
+
+
 def in_field_result(match, result_spans) -> bool:
     """True when a regex *match* over ``paragraph.text`` overlaps one of the
     paragraph's field result spans (``FieldIndex.result_spans``).
@@ -111,10 +136,16 @@ class ExistingCitationParser:
             return
         result.references_heading_para_idx = refs_start_idx
 
-        # Step 2: Parse bibliography entries
-        result.bib_entries = self._parse_bibliography(paragraphs, refs_start_idx)
+        # Step 2: Parse bibliography entries within the bounded section
+        result.bibliography_span = bibliography_bounds(paragraphs, refs_start_idx)
+        result.bib_entries, duplicates = self._parse_bibliography(
+            paragraphs, refs_start_idx, result.bibliography_span[1])
         if result.bib_entries:
             result.max_existing_number = max(result.bib_entries.keys())
+        for num in duplicates:
+            result.tracking.problems.append(
+                f"Duplicate bibliography number {num}: two entries carry the same "
+                "number, so they cannot be told apart. Fix the numbering in Word first.")
 
         # Step 3: Scan body paragraphs for in-text citation numbers.
         # Only numbers that exist in the bibliography count as citations —
@@ -147,26 +178,36 @@ class ExistingCitationParser:
         return -1
 
     def _parse_bibliography(
-        self, paragraphs, start_idx: int
-    ) -> dict[int, ExistingBibEntry]:
-        """Parse numbered bibliography entries after the heading."""
-        entries = {}
-        for i in range(start_idx + 1, len(paragraphs)):
+        self, paragraphs, start_idx: int, end_idx: int,
+    ) -> tuple[dict[int, ExistingBibEntry], list[int]]:
+        """Parse numbered entries between the heading and *end_idx* (inclusive).
+
+        Returns the entries keyed by number and the numbers that occurred
+        more than once (the first occurrence is kept).
+        """
+        entries: dict[int, ExistingBibEntry] = {}
+        duplicates: list[int] = []
+        for i in range(start_idx + 1, end_idx + 1):
             text = paragraphs[i].text.strip()
             if not text:
                 continue
             match = BIB_ENTRY_PATTERN.match(text)
-            if match:
-                num = int(match.group(1))
-                body = match.group(2).strip()
-                entry = ExistingBibEntry(
-                    original_number=num,
-                    raw_text=text,
-                    body=body,
-                )
-                self._extract_bib_fields(entry, body)
-                entries[num] = entry
-        return entries
+            if not match:
+                continue
+            num = int(match.group(1))
+            if num in entries:
+                if num not in duplicates:
+                    duplicates.append(num)
+                continue
+            body = match.group(2).strip()
+            entry = ExistingBibEntry(
+                original_number=num,
+                raw_text=text,
+                body=body,
+            )
+            self._extract_bib_fields(entry, body)
+            entries[num] = entry
+        return entries, duplicates
 
     @staticmethod
     def _extract_bib_fields(entry: ExistingBibEntry, body: str):

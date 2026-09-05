@@ -22,10 +22,11 @@ from ..models.project import (
     AUTHOR_DATE_STYLES, SUPERSCRIPT_STYLES,
 )
 from ..models.evidence import ReviewDecision
-from ..models.sentence import MarkerType
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
-from ..pipeline.docx_export import ExportBlocked, check_export_guard
+from ..pipeline.docx_export import (
+    ExportBlocked, check_export_guard, fresh_append_needs_confirmation,
+)
 from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
 from ..pipeline.renumbering import CitationKeyIndex
@@ -159,11 +160,30 @@ class MainWindow(QMainWindow):
         # Compute hash for change detection
         self._project.input_docx_hash = self._hash_file(path)
 
-        self._analyze_document(path)
+        try:
+            self._analyze_document(path)
+        except Exception as e:                     # unreadable / corrupt / not a DOCX
+            logger.exception("Could not open document")
+            self._project.input_docx_path = None
+            self._project.existing_citations = None
+            self._project.is_insert_mode = False
+            self.inputs_tab.set_document_mode("fresh")
+            QMessageBox.critical(self, "Cannot Open Document",
+                                 f"AI REFs could not read this file as a Word document:\n{e}")
+            return
 
         self._mark_dirty()
         self.statusBar().showMessage(f"Loaded: {Path(path).name}")
         logger.info(f"Document loaded: {path}")
+
+    @staticmethod
+    def _unused_backup_path(input_path: Path) -> str:
+        candidate = f"{input_path}.bak"
+        n = 1
+        while os.path.exists(candidate):
+            n += 1
+            candidate = f"{input_path}.bak{n}"
+        return candidate
 
     @staticmethod
     def _hash_file(path: str) -> str:
@@ -296,22 +316,40 @@ class MainWindow(QMainWindow):
         if not output_path:
             return
 
-        # Exporting onto the input file: keep a backup of the original.
+        existing = self._project.existing_citations
+        mode = "legacy" if (self._project.is_insert_mode and existing) else "fresh"
+        allow_fresh_append = False
+        if mode == "fresh" and fresh_append_needs_confirmation(existing):
+            choice = QMessageBox.question(
+                self, "References Heading Found",
+                "This document has a References heading but no numbered entries AI REFs "
+                "can read (an author-date list, perhaps).\n\nTreat it as an uncited "
+                "document and append a new bibliography?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+            allow_fresh_append = True
+        reasons = check_export_guard(existing, mode, self._project.settings,
+                                     allow_fresh_append=allow_fresh_append)
+        if reasons:
+            QMessageBox.critical(self, "Export Blocked", "\n\n".join(reasons))
+            return
+
+        # Exporting onto the input file: keep a backup of the original
+        # (never overwriting an earlier backup).
         if Path(output_path).resolve() == input_path.resolve():
-            backup = f"{input_path}.bak"
-            shutil.copy2(str(input_path), backup)
+            backup = self._unused_backup_path(input_path)
+            try:
+                shutil.copy2(str(input_path), backup)
+            except OSError as e:
+                QMessageBox.critical(self, "Backup Failed",
+                                     f"Could not back up the input document:\n{e}\n\n"
+                                     "Choose a different output file.")
+                return
             QMessageBox.warning(
                 self, "Overwriting the Input Document",
                 f"You chose to overwrite the input document.\n\n"
                 f"The original was backed up to:\n{backup}")
-
-        mode = "legacy" if (self._project.is_insert_mode
-                            and self._project.existing_citations) else "fresh"
-        reasons = check_export_guard(
-            self._project.existing_citations, mode, self._project.settings)
-        if reasons:
-            QMessageBox.critical(self, "Export Blocked", "\n\n".join(reasons))
-            return
 
         try:
             stats = self._do_export(output_path)
@@ -646,7 +684,12 @@ class MainWindow(QMainWindow):
                 logger.warning(f"  Insert-mode marker {i} exported as [?]")
 
         # ── Step 5: Remove old References section, build merged bibliography ──
-        handler.remove_references_section(existing.references_heading_para_idx)
+        span_end = existing.bibliography_span[1]
+        removed = handler.remove_references_section(
+            existing.references_heading_para_idx,
+            span_end if span_end >= 0 else None)
+        logger.info(f"Removed {removed} References paragraphs for "
+                    f"{len(existing.bib_entries)} parsed entries")
         if is_author_date:
             merged_bib = build_author_date_bibliography(
                 existing, renumber_result, style)
@@ -733,8 +776,16 @@ class MainWindow(QMainWindow):
                     # can no longer be trusted.
                     self._project.input_docx_hash = current_hash
                     self._analyze_document(docx_path)
+                    self.review_tab.load_project(self._project)
                     self._mark_dirty()
                     message += " — document changed since the project was saved; re-analysed"
+                    if self._project.sentences or self._project.evidence_map:
+                        QMessageBox.warning(
+                            self, "Document Changed",
+                            "The document was edited after this project was saved. Its "
+                            "existing citations were re-analysed, but the pipeline results "
+                            "(sentences and citations) may no longer line up with the "
+                            "text. Re-run the pipeline before exporting.")
                 else:
                     self._apply_document_mode(self._project.existing_citations)
             else:
