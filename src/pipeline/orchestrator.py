@@ -286,8 +286,7 @@ class PipelineOrchestrator:
                 # Sentences with multiple markers that include at least one
                 # (REF): run a SEPARATE search for each marker.  All-(REFS)
                 # sentences keep the single combined search.
-                marker_types = sent.effective_marker_types()
-                if len(marker_types) > 1 and MarkerType.REF in marker_types:
+                if sent.searched_per_marker:
                     evidence = self._find_citations_per_ref(
                         agent, sent, self.project.inferred_domains
                     )

@@ -436,11 +436,9 @@ class MainWindow(QMainWindow):
             if sent.marker_type is not None:
                 ev = self._project.evidence_map.get(sent.id)
                 count = max(sent.marker_count, 1)
-                types = sent.effective_marker_types()
                 # Per-marker slots whenever the orchestrator ran independent
-                # per-marker searches (multi-marker with at least one (REF)).
-                # Must stay in sync with the split condition in orchestrator.py.
-                if len(types) > 1 and MarkerType.REF in types:
+                # per-marker searches (SentenceRecord.searched_per_marker).
+                if sent.searched_per_marker:
                     for ref_idx in range(count):
                         para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
                 else:

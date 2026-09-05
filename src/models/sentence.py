@@ -35,3 +35,15 @@ class SentenceRecord(BaseModel):
         if self.marker_type is None:
             return []
         return [self.marker_type] * max(self.marker_count, 1)
+
+    @property
+    def searched_per_marker(self) -> bool:
+        """True when the orchestrator ran one search per marker.
+
+        Mixed sentences with at least one (REF) get independent per-marker
+        searches; all-(REFS) sentences keep one combined search. The export
+        and renumbering code must slice ``evidence.selected`` the same way,
+        so this is the single home for the rule.
+        """
+        types = self.effective_marker_types()
+        return len(types) > 1 and MarkerType.REF in types
