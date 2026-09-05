@@ -195,7 +195,7 @@ class DocxHandler:
                     first = (i, start - run_start)
                 last = (i, end - run_start)
             offset = run_end
-        if first is None:
+        if first is None:               # only an empty marker_text overlaps no run
             return None
         span = MarkerSpan(runs, first[0], first[1], last[0], last[1])
         for r in runs[span.first:span.last + 1]:
