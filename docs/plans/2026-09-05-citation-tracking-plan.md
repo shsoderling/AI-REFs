@@ -892,8 +892,8 @@ git commit -m "feat(docx): complex-field reader and FieldIndex"
 - Test: `tests/test_replace_marker.py`
 
 **Behaviour:**
-- `DocxHandler.fields` is a lazily built `FieldIndex`; `DocxHandler.invalidate_fields()` clears it. Every structural edit method calls `invalidate_fields()`.
-- `replace_marker_by_regex(paragraph, marker_text, replacement, superscript=False)` keeps its signature (call sites: `main_window.py`, `renumber_apply.py`, `author_date_convert.py`) but is now: `_locate_span(paragraph, marker_text)` → `(first_run, first_offset_in_run, last_run, last_offset_in_run)` over `iter_text_runs`; raise `FieldBoundaryError` if any touched run is `fields.in_field`; then `_split_and_emit(...)` builds up to three new runs (before | citation | after), each carrying a copy of its neighbour's `w:rPr` (formatting travels through `w:rPr` alone). The before-run keeps every content child of the first touched run up to the marker and the after-run every content child of the last touched run from the marker on: a straddling `w:t` is cut, while `w:tab`, `w:br` (soft and page), `w:sym`, `w:drawing`, footnote references... are deep-copied as the elements they are (Word packs them into the same run as adjacent same-formatted text; flattening them through `run_text()` would turn tabs and line breaks into literal control characters and drop everything else). The citation run holds exactly one `w:t`. Insert the new runs after the last touched run and remove the touched runs. Returns the new citation run element. The `if not runs` and the run-scanning fallbacks are deleted — if `marker_text in paragraph.text`, `_locate_span` always finds it.
+- `DocxHandler.fields` is a lazily built `FieldIndex`; `DocxHandler.invalidate_fields()` clears it. Every structural edit method calls `invalidate_fields()`, with one exemption: `_split_and_emit` keeps the index, because its guard has already rejected any span touching a field run, so it removes no field run and adds none (the index is keyed on run identity and stays exact). Rebuilding it per call walks the whole body: a 300-token bracket renumber makes 600 calls and went from 0.5 s to 9 s on an 8,000-run document. A test counts `FieldIndex` constructions across N replacements.
+- `replace_marker_by_regex(paragraph, marker_text, replacement, superscript=False)` keeps its signature (call sites: `main_window.py`, `renumber_apply.py`, `author_date_convert.py`; `superscript` becomes tri-state, None = keep the marker run's vertical alignment, see the note after Step 3) but is now: `_locate_span(paragraph, marker_text)` → `(first_run, first_offset_in_run, last_run, last_offset_in_run)` over `iter_text_runs`; raise `FieldBoundaryError` if any touched run is `fields.in_field`; then `_split_and_emit(...)` builds up to three new runs (before | citation | after), each carrying a copy of its neighbour's `w:rPr` (formatting travels through `w:rPr` alone). The before-run keeps every content child of the first touched run up to the marker and the after-run every content child of the last touched run from the marker on: a straddling `w:t` is cut, while `w:tab`, `w:br` (soft and page), `w:sym`, `w:drawing`, footnote references... are deep-copied as the elements they are (Word packs them into the same run as adjacent same-formatted text; flattening them through `run_text()` would turn tabs and line breaks into literal control characters and drop everything else). The citation run holds exactly one `w:t`. Insert the new runs after the last touched run and remove the touched runs. Returns the new citation run element. The `if not runs` and the run-scanning fallbacks are deleted — if `marker_text in paragraph.text`, `_locate_span` always finds it.
 - `_collapse_and_replace_superscript` raises `FieldBoundaryError` if the paragraph contains any `w:fldChar`; otherwise unchanged. It is no longer reachable from `replace_marker_by_regex` (kept only for backward compatibility of tests; delete if no test uses it).
 
 **Step 1: Write the failing test**
@@ -1060,7 +1060,7 @@ Replace the body of `replace_marker_by_regex` with:
 
 ```python
     def replace_marker_by_regex(self, paragraph, marker_text: str, replacement: str,
-                                superscript: bool = False):
+                                superscript: bool | None = False):
         span = self._locate_span(paragraph, marker_text)
         if span is None:
             return None
@@ -1148,7 +1148,7 @@ Replace the body of `replace_marker_by_regex` with:
             out.append(piece)
         return out
 
-    def _split_and_emit(self, span, replacement: str, superscript: bool):
+    def _split_and_emit(self, span, replacement: str, superscript: bool | None):
         runs, fi, fo, li, lo = span
         first_r, last_r = runs[fi], runs[li]
         before = self._slice_children(first_r, 0, fo)
@@ -1158,7 +1158,7 @@ Replace the body of `replace_marker_by_regex` with:
             r = self._run_with_rpr(first_r, None)
             r.extend(before)
             new_runs.append(r)
-        cite = self._run_with_rpr(first_r, bool(superscript))
+        cite = self._run_with_rpr(first_r, superscript)   # None keeps the template's vertAlign
         cite.append(self._text_elem(replacement))
         new_runs.append(cite)
         if after:                       # emitted even when it holds no text (e.g. only a page break)
@@ -1169,11 +1169,12 @@ Replace the body of `replace_marker_by_regex` with:
             last_r.addnext(r)
         for r in runs[fi:li + 1]:
             r.getparent().remove(r)
-        self.invalidate_fields()
+        # No invalidate_fields(): no field run was touched (the guard in
+        # _locate_span saw to that), so the identity-keyed index is still exact.
         return cite
 ```
 
-`_child_text(child)` is the per-child rule `run_text` (Task 2) is made of -- factor `run_text` as `''.join(_child_text(c) for c in r_elem)` so the slicer and `paragraph.text` can never disagree on offsets. Never rebuild the before/after runs from `run_text()` as a single `w:t`: that turns `w:tab` / `w:br` into literal `\t` / `\n` inside `w:t` (Word does not render them as tabs or line breaks; python-docx's own `Run.text` setter emits `w:tab` / `w:br` for exactly this reason) and silently drops page breaks, `w:sym`, drawings and footnote references that share the run. The citation run is superscript iff `superscript` (so a citation inserted into a superscript template with `superscript=False` is not superscript); keep the after-run rule from today: strip superscript from it only when inserting a superscript citation.
+`_child_text(child)` is the per-child rule `run_text` (Task 2) is made of -- factor `run_text` as `''.join(_child_text(c) for c in r_elem)` so the slicer and `paragraph.text` can never disagree on offsets. Never rebuild the before/after runs from `run_text()` as a single `w:t`: that turns `w:tab` / `w:br` into literal `\t` / `\n` inside `w:t` (Word does not render them as tabs or line breaks; python-docx's own `Run.text` setter emits `w:tab` / `w:br` for exactly this reason) and silently drops page breaks, `w:sym`, drawings and footnote references that share the run. `superscript` is tri-state and only ever touches `w:vertAlign`. True: the citation run is superscript (a fresh superscript citation). False: it carries no vertical alignment, so a `(REF)` sitting in a superscript template comes out as a plain bracket citation. None: it keeps the marker run's vertical alignment -- this is what an in-place rewrite of an existing token needs, and `apply_renumbering` passes it for its two sentinel calls, because superscript-bracket styles write a superscript `[3]` that `CITATION_SHAPE_PATTERN` does not match (it takes the bracket path) and that must still be superscript after renumbering; `False` there silently flattened it. `convert_in_text_to_author_date` keeps `False`: an author-date label is normal text, exactly as its superscript-run path un-superscripts. The after-run rule stays as today: strip superscript from it only when inserting a superscript citation (True); for False and None it keeps its own.
 
 `_collapse_and_replace_superscript`: add at the top
 

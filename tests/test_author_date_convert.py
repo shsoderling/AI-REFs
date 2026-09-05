@@ -107,6 +107,22 @@ class TestConvertInText:
         assert para.text == "As shown(Smith et al., 2020; Doe, 2019)."
         assert not any(r.font.superscript for r in para.runs)
 
+    def test_superscript_bracket_group_becomes_normal_text(self, tmp_path):
+        """A superscript '[1]' takes the bracket path; like the superscript
+        path, the author-date label it becomes is normal text."""
+        def build(d):
+            p = d.add_paragraph()
+            p.add_run("Shown")
+            p.add_run("[1]").font.superscript = True
+            p.add_run(".")
+        handler = _doc(tmp_path, build)
+        existing = _existing({1: entry(1, "x")}, refs_idx=1)
+        n = convert_in_text_to_author_date(handler, existing, {1: "Smith, 2020"})
+        assert n == 1
+        para = handler.get_paragraphs()[0]
+        assert para.text == "Shown(Smith, 2020)."
+        assert not any(r.font.superscript for r in para.runs)
+
     def test_non_citation_superscript_untouched(self, tmp_path):
         def build(d):
             p = d.add_paragraph()

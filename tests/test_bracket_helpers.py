@@ -93,6 +93,24 @@ class TestApplyRenumberingBrackets:
         apply_renumbering(handler, _existing_map(1), {1: 2, 2: 3, 3: 5})
         assert handler.get_paragraphs()[0].text == "Shown previously [2, 3, 5]."
 
+    def test_superscript_bracket_citation_keeps_its_superscript(self, tmp_path):
+        """Superscript-bracket styles: '[3]' is not citation-shaped, so it
+        takes the bracket path, which rewrites the token in place and must
+        leave its vertical alignment alone."""
+        doc = Document()
+        para = doc.add_paragraph()
+        para.add_run("See")
+        para.add_run("[3]").font.superscript = True
+        para.add_run(".")
+        doc.add_paragraph("References")
+        path = tmp_path / "supbr.docx"
+        doc.save(str(path))
+        handler = DocxHandler(str(path))
+        apply_renumbering(handler, _existing_map(1), {3: 7})
+        para = handler.get_paragraphs()[0]
+        assert [(r.text, r.font.superscript) for r in para.runs] == [
+            ("See", None), ("[7]", True), (".", None)]
+
     def test_references_section_untouched(self, tmp_path):
         path = _make_doc(tmp_path, [
             "Body cite [1].",

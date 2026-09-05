@@ -120,7 +120,9 @@ class DocxHandler:
         """Field membership for the current document tree, built on demand.
 
         Keyed on run element identity, so every method that adds or removes
-        runs calls :meth:`invalidate_fields` afterwards.
+        a field run calls :meth:`invalidate_fields` afterwards. Building it
+        walks the whole body, so an edit that provably leaves every field
+        run in place (``_split_and_emit``) keeps the index instead.
         """
         if self._fields is None:
             self._fields = FieldIndex(self.doc)
@@ -163,7 +165,7 @@ class DocxHandler:
         return markers
 
     def replace_marker_by_regex(self, paragraph, marker_text: str, replacement: str,
-                                superscript: bool = False):
+                                superscript: Optional[bool] = False):
         """Replace the first occurrence of *marker_text* in *paragraph*.
 
         Locates the marker over the text runs, then replaces the touched runs
@@ -171,10 +173,14 @@ class DocxHandler:
         after-runs keep their neighbours' ``w:rPr`` and every content child
         outside the marker (tabs, breaks, symbols, drawings... included, as
         the elements they are); the citation run is one ``w:t`` under the
-        first touched run's ``w:rPr``. Every other run is untouched. When
-        *superscript* is True the citation run is superscript and the
-        after-run loses any superscript; when False the citation run carries
-        no vertical alignment.
+        first touched run's ``w:rPr``. Every other run is untouched.
+
+        *superscript* is tri-state. True: the citation run is superscript and
+        the after-run loses any superscript (a fresh superscript citation).
+        False: the citation run carries no vertical alignment (a fresh
+        bracket citation). None: the citation run keeps the marker run's
+        vertical alignment -- for rewriting an existing citation in place,
+        where a superscript ``[3]`` must stay superscript.
 
         Returns the new citation ``w:r`` element, or None when the marker is
         not in the paragraph. Raises :class:`FieldBoundaryError` rather than
@@ -282,7 +288,8 @@ class DocxHandler:
             out.append(piece)
         return out
 
-    def _split_and_emit(self, span: MarkerSpan, replacement: str, superscript: bool):
+    def _split_and_emit(self, span: MarkerSpan, replacement: str,
+                        superscript: Optional[bool]):
         """Replace the runs of *span* with before | citation | after runs.
 
         The touched runs are split at the child level. The before-run carries
@@ -294,10 +301,18 @@ class DocxHandler:
         child strictly inside it -- is replaced. Whole runs between the first
         and the last touched run lie entirely inside the marker.
 
-        The citation run holds exactly one ``w:t`` and is superscript iff
-        *superscript*, never inheriting vertical alignment from its
-        neighbour; a superscript citation must not bleed into the after-run,
-        which then loses any superscript. Returns the citation run element.
+        The citation run holds exactly one ``w:t``. Its vertical alignment
+        follows *superscript*: set when True, stripped when False, kept from
+        the first touched run when None. A superscript citation must not
+        bleed into the after-run, which then loses any superscript; otherwise
+        the after-run keeps its own. Returns the citation run element.
+
+        The cached :attr:`fields` index is deliberately kept: the span guard
+        in ``_locate_span`` has already rejected any touched run that belongs
+        to a field, so no field run is removed here, and the runs added carry
+        no field characters or code. Every run the identity-keyed index knows
+        stays in the tree, so it remains exact -- and rebuilding it per call
+        made a 300-token renumber (two calls per token) 20x slower.
         """
         runs, first, first_off, last, last_off = span
         first_r, last_r = runs[first], runs[last]
@@ -308,7 +323,7 @@ class DocxHandler:
             before_r = self._run_with_rpr(first_r, None)
             before_r.extend(before)
             new_runs.append(before_r)
-        cite = self._run_with_rpr(first_r, bool(superscript))
+        cite = self._run_with_rpr(first_r, superscript)
         cite.append(self._text_elem(replacement))
         new_runs.append(cite)
         if after:
@@ -321,7 +336,9 @@ class DocxHandler:
             last_r.addnext(r)
         for r in runs[first:last + 1]:
             r.getparent().remove(r)
-        self.invalidate_fields()
+        # No invalidate_fields(): see the docstring -- no field run was
+        # touched, so the index is still exact and a rebuild per marker
+        # would dominate renumbering and export.
         return cite
 
     def _collapse_and_replace_superscript(self, paragraph, marker_text: str,

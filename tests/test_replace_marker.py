@@ -121,15 +121,27 @@ def test_zero_width_children_at_the_marker_bounds_are_kept(tmp_path):
     assert [r.font.superscript for r in para.runs] == [None, True, None]
 
 
-def test_unsuperscripted_citation_in_superscript_template(tmp_path):
+@pytest.mark.parametrize("template_sup, superscript, expected", [
+    (True, False, None),     # fresh insertion: superscript iff superscript
+    (False, True, True),
+    (True, True, True),
+    (False, False, None),
+    (True, None, True),      # in-place rewrite: keep the marker run's vertAlign
+    (False, None, None),
+])
+def test_citation_vertical_alignment_follows_the_superscript_argument(
+        tmp_path, template_sup, superscript, expected):
+    """False strips, True sets, None keeps whatever the marker's run had --
+    the tri-state renumbering relies on to rewrite an existing token in
+    place without changing its look."""
     def build(b):
         p = b.paragraph("")
         p.add_run("x").font.superscript = True
-        b.add_text(p, "(REF)", superscript=True)
+        b.add_text(p, "(REF)", superscript=template_sup)
     h = _handler(tmp_path, build)
     para = h.get_paragraphs()[0]
-    h.replace_marker_by_regex(para, "(REF)", "[2]", superscript=False)
-    assert [(r.text, r.font.superscript) for r in para.runs] == [("x", True), ("[2]", None)]
+    h.replace_marker_by_regex(para, "(REF)", "[2]", superscript=superscript)
+    assert [(r.text, r.font.superscript) for r in para.runs] == [("x", True), ("[2]", expected)]
 
 
 def test_missing_marker_returns_none_and_changes_nothing(tmp_path):
@@ -163,6 +175,45 @@ def test_works_adjacent_to_a_field(tmp_path):
     fldchars = para._p.findall(f".//{{{W_NS}}}fldChar")
     assert [fc.get(f"{{{W_NS}}}fldCharType") for fc in fldchars] == ["begin", "separate", "end"]
     assert 'AIREFS.CITE' in para._p.xml
+
+
+def test_replacements_reuse_one_field_index(tmp_path, monkeypatch):
+    """_split_and_emit never adds or removes a field run (the guard rejects a
+    span touching one first), so the identity-keyed FieldIndex stays valid
+    across replacements and is built once -- not once per call, which made a
+    300-token renumber (two calls per token) 20x slower. The guard must still
+    hold against the retained index after neighbouring edits."""
+    import src.services.docx_io as docx_io
+    builds = []
+
+    class CountingIndex(docx_io.FieldIndex):
+        def __init__(self, doc):
+            builds.append(doc)
+            super().__init__(doc)
+    monkeypatch.setattr(docx_io, "FieldIndex", CountingIndex)
+
+    n_paras = 20
+
+    def build(b):
+        p = b.paragraph("Cells")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="[F]", superscript=True)
+        b.add_text(p, " grow (REF) and divide (REF).")
+        for i in range(n_paras - 1):
+            b.paragraph(f"Claim {i} (REF) and (REF).")
+    h = _handler(tmp_path, build)
+    paras = h.get_paragraphs()
+    calls = 0
+    for para in paras[:n_paras]:
+        for k in (1, 2):                       # two calls per paragraph, as renumbering does
+            h.replace_marker_by_regex(para, "(REF)", str(k), superscript=True)
+            calls += 1
+    assert calls == 2 * n_paras
+    assert len(builds) == 1
+    assert paras[0].text == "Cells[F] grow 1 and divide 2."
+    with pytest.raises(FieldBoundaryError):
+        h.replace_marker_by_regex(paras[0], "[F]", "9")
+    assert len(builds) == 1
+    assert 'AIREFS.CITE' in paras[0]._p.xml
 
 
 def test_never_clears_paragraph_content(tmp_path, monkeypatch):

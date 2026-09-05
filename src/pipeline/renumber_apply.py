@@ -141,12 +141,15 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
                 sentinel = f"{i}"
                 replacements.append((old_token, sentinel, new_token))
 
+        # superscript=None: rewrite the token in place, keeping the run's
+        # vertical alignment (superscript-bracket styles write a superscript
+        # "[3]", which must stay superscript after renumbering).
         for old_token, sentinel, _ in replacements:
             handler.replace_marker_by_regex(para, old_token, sentinel,
-                                            superscript=False)
+                                            superscript=None)
         for _, sentinel, new_token in replacements:
             handler.replace_marker_by_regex(para, sentinel, new_token,
-                                            superscript=False)
+                                            superscript=None)
             bracket_updates += 1
 
     if bracket_updates:
