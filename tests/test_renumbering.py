@@ -165,6 +165,18 @@ class TestEventsEngine:
         assert result.renumber_map == {1: 1, 2: 1}
         assert result.seeded_uncited == []
 
+    def test_uncited_entry_refound_by_a_new_marker_merges_into_it(self):
+        """A new candidate carrying an uncited entry's DOI owns that number."""
+        existing = make_existing(num_entries=2, refs_heading=3, citations={0: [(0, 1)]})
+        refound = cand(doi="10.1000/old2")
+        new = [NewMarkerInfo(para_index=1, char_offset=0, citations=[refound])]
+        result = compute_renumbering(existing, new)
+        assert sorted(result.assignments) == [1, 2]
+        assert result.assignments[2].is_new
+        assert result.number_for_candidate(refound) == 2
+        assert result.renumber_map == {1: 1, 2: 2}
+        assert result.seeded_uncited == []
+
     def test_events_are_ordered_and_existing_wins_ties(self):
         existing = make_existing(num_entries=2, refs_heading=4, citations={1: [(5, 2)], 0: [(0, 1)]})
         new = [NewMarkerInfo(para_index=1, char_offset=5, citations=[cand(pmid="7")])]
