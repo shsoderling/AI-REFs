@@ -4,6 +4,9 @@ Detects and extracts:
 - The "References" heading and bibliography entries
 - In-text citation numbers (superscript and bracketed)
 - Basic metadata from bibliography entries (DOI, PMID, year)
+
+Every result carries a ``TrackingReport`` (tier, field counts, problems);
+``analyze()`` never raises, a failure is reported as ``DocumentTier.FAILED``.
 """
 
 import re
