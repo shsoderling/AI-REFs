@@ -59,6 +59,36 @@ REM Output: dist\AI REFs\AI REFs.exe
    - XLSX citation justification report
    - Optional RIS and BibTeX files
 
+## Tracked Documents
+
+Since this version, every citation AI REFs writes is a hidden Word field (the
+same mechanism EndNote and Zotero use). The field carries the reference's
+identity (PMID, DOI, a stable record id) and its full record, and the
+bibliography is wrapped in a second field. When you load an exported document
+again — in a new session, on another computer, after editing it in Word — AI
+REFs reads those fields instead of parsing the text, so it knows exactly
+which reference each citation is, adds your new `(REF)`/`(REFS)` markers,
+renumbers everything and rebuilds the bibliography in place. No PubMed
+look-ups are needed to reopen a tracked document.
+
+Things to know:
+
+- Word shows the fields' cached text (the numbers). Alt+F9 toggles the raw
+  field codes; they look like ` ADDIN AIREFS.CITE {…} `. Alt+F9 again hides them.
+- Do not retype citation numbers by hand: numbers are regenerated on export.
+  Hand-edited author-date citations are preserved.
+- Deleting a sentence removes its citation; the reference is dropped from the
+  bibliography on the next export (or kept, with the "keep uncited entries"
+  setting).
+- If the bibliography is deleted in Word, AI REFs regenerates it.
+- Google Docs, Apple Pages and RTF/ODT saves strip Word fields. AI REFs then
+  recognises its former export from the visible text and falls back to
+  text-based detection, but exact tracking is lost until the next export.
+- Documents made with the previous AI REFs (plain text) are adopted into
+  tracked documents the first time they are exported again.
+- Documents that contain EndNote, Zotero or Mendeley fields are left alone:
+  AI REFs shows a banner and disables export for them.
+
 ## Markers
 
 - `(REF)` → replaced with 1 best reference
