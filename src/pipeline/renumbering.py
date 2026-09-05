@@ -38,8 +38,10 @@ class CitationKeyIndex:
         self._alias_to_key: dict[str, str] = {}
 
     @staticmethod
-    def _aliases(pmid: str, doi: str, title: str) -> list[str]:
+    def _aliases(pmid: str, doi: str, title: str, record_uuid: str = "") -> list[str]:
         aliases = []
+        if record_uuid and record_uuid.strip():
+            aliases.append(f"uuid:{record_uuid.strip()}")
         if pmid and pmid.strip():
             aliases.append(f"pmid:{pmid.strip()}")
         if doi and doi.strip():
@@ -50,9 +52,15 @@ class CitationKeyIndex:
                 aliases.append(f"title:{norm}")
         return aliases
 
-    def get_or_assign(self, pmid: str = "", doi: str = "", title: str = "") -> str:
-        """Return the canonical key for this identifier set, registering aliases."""
-        aliases = self._aliases(pmid, doi, title)
+    def get_or_assign(self, pmid: str = "", doi: str = "", title: str = "",
+                      record_uuid: str = "") -> str:
+        """Return the canonical key for this identifier set, registering aliases.
+
+        A record uuid (tracked documents) is the strongest alias and comes
+        first; PMID, DOI and normalised title follow, so a record found again
+        through any of them keeps one number.
+        """
+        aliases = self._aliases(pmid, doi, title, record_uuid)
         if not aliases:
             return ""
         canonical = next(
@@ -64,11 +72,12 @@ class CitationKeyIndex:
         return canonical
 
     def key_for_candidate(self, cand: CitationCandidate) -> str:
-        return self.get_or_assign(cand.pmid, cand.doi, cand.title)
+        return self.get_or_assign(cand.pmid, cand.doi, cand.title, cand.record_uuid)
 
     def key_for_existing(self, entry: ExistingBibEntry) -> str:
-        # Enriched entries carry pmid/doi; bare entries may only have raw text.
-        key = self.get_or_assign(entry.pmid, entry.doi, entry.title)
+        # Tracked entries carry a record uuid; enriched entries pmid/doi;
+        # bare entries may only have raw text.
+        key = self.get_or_assign(entry.pmid, entry.doi, entry.title, entry.record_uuid)
         return key or f"existing_{entry.original_number}"
 
 

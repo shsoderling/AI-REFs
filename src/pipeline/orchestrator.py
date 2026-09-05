@@ -8,6 +8,7 @@ import logging
 from typing import Optional, Callable
 
 from ..models.project import ProjectState, PipelineStage
+from ..models.embedded import DocumentTier
 from ..models.sentence import SentenceRecord, MarkerType
 from ..models.evidence import EvidenceRecord, ConfidenceLevel
 from ..services.docx_io import DocxHandler
@@ -150,10 +151,16 @@ class PipelineOrchestrator:
             self._progress("Analyze Existing Citations", 0, total_stages)
 
             handler = DocxHandler(self.project.input_docx_path)
-            citation_parser = ExistingCitationParser(handler)
-            self.project.existing_citations = citation_parser.analyze()
-
             existing = self.project.existing_citations
+            is_tracked = (existing is not None and existing.tracking is not None
+                          and existing.tracking.tier == DocumentTier.TRACKED)
+            if not is_tracked:
+                citation_parser = ExistingCitationParser(
+                    handler, keep_uncited=settings.keep_uncited_entries)
+                self.project.existing_citations = citation_parser.analyze()
+                existing = self.project.existing_citations
+            else:
+                self._emit("info", "  Tracked document: citations read from embedded fields")
             self._emit("info", f"  Found {len(existing.bib_entries)} existing references")
             self._emit("info", f"  References heading at paragraph {existing.references_heading_para_idx}")
             self._emit("info", f"  Max existing number: {existing.max_existing_number}")
@@ -161,7 +168,7 @@ class PipelineOrchestrator:
             # Recover PMIDs/DOIs for entries that don't print one, so new
             # candidates can be deduplicated against them.
             needs_ids = sum(1 for e in existing.bib_entries.values()
-                            if not e.pmid and not e.doi)
+                            if not e.pmid and not e.doi and not e.record_uuid)
             if settings.enrich_existing_refs and settings.ncbi_email and needs_ids:
                 self._emit("info",
                            f"  Matching {needs_ids} entries without PMID/DOI "
@@ -194,7 +201,7 @@ class PipelineOrchestrator:
         handler = DocxHandler(self.project.input_docx_path)
         stop_at = -1
         if is_insert and self.project.existing_citations:
-            stop_at = self.project.existing_citations.references_heading_para_idx
+            stop_at = self.project.existing_citations.body_end_para_idx
         parser = DocumentParser(handler, stop_at_para=stop_at)
         sentences = parser.parse()
         self.project.sentences = sentences

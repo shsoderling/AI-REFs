@@ -20,15 +20,28 @@ class ExistingBibEntry(BaseModel):
     journal: str = Field(default="")
     doi: str = Field(default="")
     pmid: str = Field(default="")
-    # If matched to a CitationCandidate (e.g. via PubMed fetch)
+    # If matched to a CitationCandidate (e.g. via PubMed fetch, or read from a field)
     matched_candidate: Optional[CitationCandidate] = Field(default=None)
+    # Tracked documents: identity and record read from the citation fields
+    record_uuid: str = Field(default="")
+    item: dict = Field(default_factory=dict, description="Raw CSL-JSON item from the field")
+    uris: list[str] = Field(default_factory=list)
+    is_uncited: bool = Field(default=False, description="Kept in the bibliography without a citation")
+    entry_hash: str = Field(default="", description="Hash of the entry text at the last export")
 
 
 class InTextCitation(BaseModel):
     """A single in-text citation occurrence at a specific position."""
     char_offset: int = Field(description="Character offset within the paragraph text")
-    number: int = Field(description="The citation number")
+    number: int = Field(description="The citation number (0 for an unresolved field)")
     is_superscript: bool = Field(default=False)
+    # Tracked documents: which field and record this occurrence belongs to
+    cid: str = Field(default="", description="Cluster (field) id; shared by the items of one field")
+    record_uuid: str = Field(default="")
+    cluster_index: int = Field(default=0, description="Position of the item within its field")
+    source: str = Field(default="text", description="'field' (read from a field) or 'text' (regex)")
+    user_edited: bool = Field(default=False, description="The field's visible text was edited by hand")
+    unresolved: bool = Field(default=False, description="A [?] field still waiting for a citation")
 
 
 class ExistingCitationMap(BaseModel):
@@ -66,3 +79,14 @@ class ExistingCitationMap(BaseModel):
     @property
     def has_existing_citations(self) -> bool:
         return len(self.bib_entries) > 0
+
+    @property
+    def body_end_para_idx(self) -> int:
+        """First body paragraph that is not text to search for markers: the
+        References heading, else the start of the bibliography field, else
+        -1 (no bibliography: the whole document is body)."""
+        if self.references_heading_para_idx >= 0:
+            return self.references_heading_para_idx
+        if self.bibliography_span[0] >= 0:
+            return self.bibliography_span[0]
+        return -1

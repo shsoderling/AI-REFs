@@ -90,7 +90,7 @@ class ExistingRefEnricher:
         enriched = 0
         targets = [
             e for e in existing.bib_entries.values()
-            if not e.pmid and not e.doi
+            if not e.pmid and not e.doi and not e.record_uuid   # tracked entries carry identity
         ]
         for i, entry in enumerate(targets):
             if should_cancel and should_cancel():

@@ -79,8 +79,10 @@ def in_field_result(match, result_spans) -> bool:
 class ExistingCitationParser:
     """Analyze a DOCX for pre-existing citations and bibliography."""
 
-    def __init__(self, handler: DocxHandler):
+    def __init__(self, handler: DocxHandler, keep_uncited: bool = False):
         self.handler = handler
+        # Tracked documents: keep bibliography entries whose citations are all gone
+        self.keep_uncited = keep_uncited
 
     def analyze(self) -> ExistingCitationMap:
         """Full analysis, reported through ``result.tracking``.
@@ -117,13 +119,13 @@ class ExistingCitationParser:
         return result
 
     def _analyze_tracked(self, result: ExistingCitationMap, idx) -> ExistingCitationMap:
-        """Read a document that carries AIREFS.CITE fields.
-
-        Placeholder until the field reader exists (Task 16): the document is
-        read the legacy way and keeps ``DocumentTier.LEGACY``.
-        """
-        self._analyze_legacy(result)
-        return result
+        """Read a document that carries AIREFS.CITE fields: exact and offline."""
+        from .field_citation_reader import build_tracked_map
+        tracked = build_tracked_map(self.handler, keep_uncited=self.keep_uncited)
+        # Carry over what analyze() already established about the whole document
+        tracked.tracking.foreign_field_count = idx.foreign
+        tracked.tracking.problems = result.tracking.problems + tracked.tracking.problems
+        return tracked
 
     def _legacy_map(self) -> ExistingCitationMap:
         """The plain-text reading of the document, regardless of fields
