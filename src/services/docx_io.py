@@ -14,11 +14,19 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from .docx_fields import FieldIndex, run_ancestry
+from docx.enum.style import WD_STYLE_TYPE
+
+from .docx_fields import (
+    FieldIndex, build_field_runs, make_result_run, run_ancestry,
+)
 
 logger = logging.getLogger(__name__)
 
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+
+BIBLIOGRAPHY_HEADING_STYLE = 'AIREFS Bibliography Heading'
+BIBLIOGRAPHY_ENTRY_STYLE = 'AIREFS Bibliography'
+MAX_HEADING_LENGTH = 80
 
 W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
@@ -341,6 +349,169 @@ class DocxHandler:
         # touched, so the index is still exact and a rebuild per marker
         # would dominate renumbering and export.
         return cite
+
+    def insert_citation_field(self, paragraph, marker_text: str, code: str,
+                              result_text: str, superscript: bool):
+        """Replace the first *marker_text* with an AIREFS citation field.
+
+        Same run surgery as :meth:`replace_marker_by_regex`, but the marker
+        becomes the five runs of a complex field whose cached result shows
+        *result_text* (formatted like the marker's run, plus ``noProof`` and
+        the requested vertical alignment). Returns the result run, or None
+        when the marker is not in the paragraph. Raises
+        :class:`FieldBoundaryError` if the marker overlaps a field.
+        """
+        span = self._locate_span(paragraph, marker_text)
+        if span is None:
+            return None
+        runs, first, first_off, last, last_off = span
+        first_r, last_r = runs[first], runs[last]
+        before = self._slice_children(first_r, 0, first_off)
+        after = self._slice_children(last_r, last_off, None)
+        new_runs = []
+        if before:
+            before_r = self._run_with_rpr(first_r, None)
+            before_r.extend(before)
+            new_runs.append(before_r)
+        result_run = make_result_run(result_text, first_r, superscript=superscript)
+        new_runs.extend(build_field_runs(code, result_run))
+        if after:
+            after_r = self._run_with_rpr(last_r, False if superscript else None)
+            after_r.extend(after)
+            new_runs.append(after_r)
+        for r in reversed(new_runs):
+            last_r.addnext(r)
+        for r in runs[first:last + 1]:
+            r.getparent().remove(r)
+        self.invalidate_fields()          # a new field: the identity index must learn it
+        return result_run
+
+    # ── Bibliography field ───────────────────────────────────────────
+
+    def ensure_bibliography_styles(self):
+        """Create the two AI REFs paragraph styles if the document lacks them."""
+        styles = self.doc.styles
+        names = {s.name for s in styles}
+        if BIBLIOGRAPHY_HEADING_STYLE not in names:
+            st = styles.add_style(BIBLIOGRAPHY_HEADING_STYLE, WD_STYLE_TYPE.PARAGRAPH)
+            st.base_style = styles['Normal']
+            st.font.bold = True
+            st.font.size = Pt(14)
+        if BIBLIOGRAPHY_ENTRY_STYLE not in names:
+            st = styles.add_style(BIBLIOGRAPHY_ENTRY_STYLE, WD_STYLE_TYPE.PARAGRAPH)
+            st.base_style = styles['Normal']
+            st.font.size = Pt(10)
+
+    def _new_entry_paragraphs(self, entries: list[str], bibl_code: str) -> list:
+        """Entry paragraphs carrying one AIREFS.BIBL field: begin, code and
+        separate in the first, end in the last (all in one when there is a
+        single entry). Appended at the end of the body; callers may move them.
+        """
+        from .docx_fields import _fldchar_run, _instr_run
+        paragraphs = []
+        n = len(entries)
+        for i, entry in enumerate(entries):
+            p = self.doc.add_paragraph(style=BIBLIOGRAPHY_ENTRY_STYLE)
+            if i == 0:
+                p._p.append(_fldchar_run('begin', True))
+                p._p.append(_instr_run(bibl_code))
+                p._p.append(_fldchar_run('separate'))
+            p._p.append(make_result_run(entry, no_proof=False))
+            if i == n - 1:
+                p._p.append(_fldchar_run('end'))
+            paragraphs.append(p)
+        return paragraphs
+
+    def write_bibliography_field(self, entries: list[str], bibl_code: str,
+                                 heading_text: str = "References"):
+        """Append the heading paragraph and the bibliography field."""
+        if not entries:
+            return
+        self.ensure_bibliography_styles()
+        self.doc.add_paragraph(heading_text, style=BIBLIOGRAPHY_HEADING_STYLE)
+        self._new_entry_paragraphs(entries, bibl_code)
+        self.invalidate_fields()
+
+    def replace_bibliography_field(self, field, entries: list[str], bibl_code: str) -> int:
+        """Replace the paragraphs of an existing AIREFS.BIBL *field* in place.
+
+        The heading and anything after the field are untouched. Returns the
+        body index of the first new entry paragraph.
+        """
+        self.ensure_bibliography_styles()
+        old_paragraphs = list(field.paragraphs)
+        anchor = old_paragraphs[0]
+        new_paragraphs = self._new_entry_paragraphs(entries, bibl_code)
+        for p in new_paragraphs:
+            anchor.addprevious(p._p)
+        for old in old_paragraphs:
+            old.getparent().remove(old)
+        self.invalidate_fields()
+        first = new_paragraphs[0]._p if new_paragraphs else None
+        for i, p in enumerate(self.doc.paragraphs):
+            if p._p is first:
+                return i
+        return -1
+
+    def locate_bibliography_heading(self, field, heading_text: str) -> int:
+        """Body index of the heading paragraph belonging to a bibliography
+        *field*, or -1.
+
+        Rule: the paragraph immediately before the field, if it holds no
+        field, is non-empty, shorter than 80 characters and not entry-shaped;
+        else the nearest preceding paragraph styled as our heading; else the
+        nearest preceding paragraph whose text equals *heading_text*.
+        """
+        from ..pipeline.existing_citation_parser import BIB_ENTRY_PATTERN
+        paragraphs = self.doc.paragraphs
+        first_p = field.paragraphs[0] if field.paragraphs else None
+        idx = next((i for i, p in enumerate(paragraphs) if p._p is first_p), -1)
+        if idx < 0:
+            return -1
+        cand = idx - 1
+        if cand >= 0:
+            p = paragraphs[cand]
+            text = p.text.strip()
+            if (not p._p.findall(f'.//{{{W_NS}}}fldChar') and 0 < len(text) < MAX_HEADING_LENGTH
+                    and not BIB_ENTRY_PATTERN.match(text)):
+                return cand
+        for j in range(idx - 1, -1, -1):
+            if paragraphs[j].style is not None and paragraphs[j].style.name == BIBLIOGRAPHY_HEADING_STYLE:
+                return j
+        wanted = (heading_text or "").strip()
+        if wanted:
+            for j in range(idx - 1, -1, -1):
+                if paragraphs[j].text.strip() == wanted:
+                    return j
+        return -1
+
+    def validate_before_save(self, expected_cite_fields: Optional[int] = None) -> list[str]:
+        """Problems that must abort an export: an incomplete or unparsable
+        AIREFS field, field code leaked into visible text, or a citation
+        field count that differs from *expected_cite_fields*."""
+        from ..pipeline.citation_payload import (
+            PayloadError, parse_bibl_code, parse_cite_code,
+        )
+        self.invalidate_fields()
+        problems = []
+        idx = self.fields
+        for f in idx.fields:
+            if not f.kind.startswith('airefs'):
+                continue
+            if not f.complete:
+                problems.append(f"incomplete {f.kind} field")
+                continue
+            try:
+                (parse_cite_code if f.kind == 'airefs_cite' else parse_bibl_code)(f.code)
+            except PayloadError as exc:
+                problems.append(f"{f.kind} payload does not parse: {exc}")
+        for t in self.doc.element.body.iter(f'{{{W_NS}}}t'):
+            if t.text and 'ADDIN AIREFS' in t.text:
+                problems.append("field code leaked into visible text")
+                break
+        if expected_cite_fields is not None and idx.airefs_cite != expected_cite_fields:
+            problems.append(f"expected {expected_cite_fields} citation fields, found {idx.airefs_cite}")
+        return problems
 
     def _collapse_and_replace_superscript(self, paragraph, marker_text: str,
                                            replacement: str):

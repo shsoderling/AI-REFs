@@ -320,3 +320,122 @@ class FieldIndex:
         if current is not None:
             spans.append((current[1], current[2]))
         return spans
+
+
+# ── writing fields ──────────────────────────────────────────────────
+
+def make_result_run(text: str, template_r=None, *, superscript: bool = False,
+                    no_proof: bool = True):
+    """A ``w:r`` for a field's cached result: *template_r*'s ``w:rPr`` (only),
+    ``w:noProof`` so Word's checker leaves citation numbers alone, vertical
+    alignment per *superscript*, and exactly one ``w:t``."""
+    import copy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    r = OxmlElement('w:r')
+    if template_r is not None:
+        src = template_r.find(qn('w:rPr'))
+        if src is not None:
+            r.append(copy.deepcopy(src))
+    rpr = r.get_or_add_rPr()
+    for va in rpr.findall(qn('w:vertAlign')):
+        rpr.remove(va)
+    if no_proof:
+        rpr.get_or_add_noProof()
+    if superscript:
+        rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
+    r.append(_text_elem(text))
+    return r
+
+
+def _text_elem(text: str):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    t = OxmlElement('w:t')
+    t.set(qn('xml:space'), 'preserve')
+    t.text = text
+    return t
+
+
+def _fldchar_run(kind: str, lock: bool = False):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    r = OxmlElement('w:r')
+    fc = OxmlElement('w:fldChar')
+    fc.set(qn('w:fldCharType'), kind)
+    if lock:
+        fc.set(qn('w:fldLock'), '1')
+    r.append(fc)
+    return r
+
+
+def _instr_run(code: str):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    r = OxmlElement('w:r')
+    it = OxmlElement('w:instrText')
+    it.set(qn('xml:space'), 'preserve')
+    it.text = code
+    r.append(it)
+    return r
+
+
+def build_field_runs(code: str, result_run, *, fld_lock: bool = True) -> list:
+    """The five runs of a complex field: begin (locked, so F9 never touches
+    the result), instruction, separate, *result_run*, end."""
+    return [_fldchar_run('begin', fld_lock), _instr_run(code), _fldchar_run('separate'),
+            result_run, _fldchar_run('end')]
+
+
+def rewrite_result(field: ComplexField, text: str, *, superscript: Optional[bool] = None):
+    """Set a single-paragraph field's cached result to *text*.
+
+    Word may have re-split the result into several runs (revision
+    boundaries); they collapse into the first one, which keeps its ``w:rPr``
+    and gets exactly one ``w:t``. *superscript* True/False sets or strips the
+    vertical alignment; None keeps it. Not for multi-paragraph fields (the
+    bibliography is replaced paragraph-wise instead).
+    """
+    from docx.oxml.ns import qn
+    if not field.result_runs:
+        keep = make_result_run(text, superscript=bool(superscript))
+        anchor = field.separate if field.separate is not None else field.begin
+        anchor.addnext(keep)
+        field.result_runs = [keep]
+        return keep
+    keep = field.result_runs[0]
+    for r in field.result_runs[1:]:
+        r.getparent().remove(r)
+    for child in list(keep):
+        if child.tag != qn('w:rPr'):
+            keep.remove(child)
+    keep.append(_text_elem(text))
+    if superscript is not None:
+        rpr = keep.get_or_add_rPr()
+        for va in rpr.findall(qn('w:vertAlign')):
+            rpr.remove(va)
+        if superscript:
+            rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
+    field.result_runs = [keep]
+    return keep
+
+
+def rewrite_code(field: ComplexField, code: str):
+    """Replace the field's instruction text with *code* (one code run)."""
+    from docx.oxml.ns import qn
+    if not field.code_runs:
+        run = _instr_run(code)
+        field.begin.addnext(run)
+        field.code_runs = [run]
+    else:
+        keep = field.code_runs[0]
+        for r in field.code_runs[1:]:
+            r.getparent().remove(r)
+        for child in list(keep):
+            if child.tag in (qn('w:instrText'), qn('w:delInstrText')):
+                keep.remove(child)
+        it = _instr_run(code).find(qn('w:instrText'))
+        keep.append(it)
+        field.code_runs = [keep]
+    field.code = code.strip()
+    field.kind = classify_code(field.code)
