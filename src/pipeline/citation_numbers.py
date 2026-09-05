@@ -7,8 +7,16 @@ renumbering writer can share one definition without a circular import.
 import re
 
 
-def expand_bracket_numbers(group_text: str) -> list[int]:
-    """Expand citation list/range text into explicit numbers."""
+def expand_bracket_numbers(group_text: str, *, lenient: bool = False) -> list[int]:
+    """Expand citation list/range text into explicit numbers.
+
+    A token that is neither a number nor a well-formed range is dropped:
+    a bracket group matched by ``BRACKET_CITE_PATTERN`` never holds one.
+    With ``lenient`` such a token contributes the numbers written in it
+    instead ("3-" -> [3], "1, 3-" -> [1, 3]). Word splits a superscript run
+    at revision (rsid) boundaries, so a run may hold only a piece of its
+    list, and no citation may go unreported because of that.
+    """
     numbers: list[int] = []
     for part in re.split(r'[;,]\s*', group_text):
         token = part.strip()
@@ -25,6 +33,8 @@ def expand_bracket_numbers(group_text: str) -> list[int]:
                 numbers.extend(range(start, end - 1, -1))
         elif token.isdigit():
             numbers.append(int(token))
+        elif lenient:
+            numbers.extend(int(n) for n in re.findall(r'\d+', token))
 
     return numbers
 

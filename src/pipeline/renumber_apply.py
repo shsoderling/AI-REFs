@@ -4,6 +4,7 @@ Headless (no Qt) so it can be exercised by tests and reused by previews.
 """
 
 import logging
+import re
 
 from ..models.existing_refs import ExistingCitationMap
 from .citation_numbers import expand_bracket_numbers, format_bracket_numbers  # noqa: F401  (re-exported)
@@ -12,6 +13,12 @@ from .existing_citation_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A superscript run's digit core: from its first digit to its last. Whatever
+# lies outside it -- the separator or space Word left at a run boundary when
+# it split the citation at a revision (rsid): "3," + "4", "3-" + "5", "3 " --
+# is reattached untouched, so the pieces still read as one list afterwards.
+_DIGIT_CORE = re.compile(r'(\D*)(\d(?:.*\d)?)(\D*)', re.S)
 
 
 def renumber_bracket_group(group_text: str, renumber_map: dict[int, int]) -> str:
@@ -37,9 +44,13 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
     """Update all existing in-text citation numbers using the renumber_map.
 
     Walks superscript runs in body paragraphs (before the References heading)
-    and rewrites each citation-shaped run as its mapped, re-collapsed group
-    (a range "3-5" expands to 3, 4, 5 first, so its middle number is mapped
-    too), then renumbers bracketed citation groups.
+    and rewrites the digit core of each citation-shaped run as its mapped,
+    re-collapsed group (a range "3-5" expands to 3, 4, 5 first, so its
+    middle number is mapped too), then renumbers bracketed citation groups.
+    Only the core -- first digit to last digit -- is rewritten: Word splits
+    a citation into several runs at revision boundaries ("3," + "4"), and
+    reformatting a whole run would drop the separator it carries ("10" +
+    "11" reads as 1011). Each piece keeps its own prefix/suffix instead.
 
     Runs that belong to a Word field and bracket groups inside a field's
     cached result are left alone: a field result is rewritten through the
@@ -64,11 +75,16 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
         # superscripts like the "2+" in Ca2+ from being renumbered.
         if not CITATION_SHAPE_PATTERN.match(text or ""):
             continue
-        new_text = renumber_bracket_group(text, renumber_map)
+        core = _DIGIT_CORE.fullmatch(text)
+        if core is None:            # separators only, e.g. a lone "-"
+            continue
+        prefix, digits, suffix = core.groups()
+        new_digits = renumber_bracket_group(digits, renumber_map)
         # format_bracket_numbers separates with ", "; keep the run's own
         # tight "1,2" shape unless it already used ", ".
         if ", " not in text:
-            new_text = new_text.replace(", ", ",")
+            new_digits = new_digits.replace(", ", ",")
+        new_text = prefix + new_digits + suffix
         if new_text != text:
             run.text = new_text
 

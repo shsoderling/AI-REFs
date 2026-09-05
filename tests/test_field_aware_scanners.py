@@ -8,10 +8,14 @@ from src.services.docx_io import DocxHandler
 from tests.fixture_builders import DocBuilder
 
 
-def _cited_doc(tmp_path, *, with_field=True):
+def _cited_doc(tmp_path, *, with_field=True, split_range=False):
     b = DocBuilder()
     p = b.paragraph("First claim")
-    b.add_text(p, "3-5", superscript=True)
+    if split_range:                 # Word split "3-5" at an rsid boundary
+        b.add_text(p, "3-", superscript=True)
+        b.add_text(p, "5", superscript=True)
+    else:
+        b.add_text(p, "3-5", superscript=True)
     b.add_text(p, ". Second claim [1, 2]. ")
     if with_field:
         b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="6", superscript=True)
@@ -44,6 +48,23 @@ def test_apply_renumbering_skips_fields_and_maps_ranges(tmp_path):
     apply_renumbering(h, existing, {3: 10, 4: 11, 5: 12, 1: 2, 2: 3, 6: 66, 7: 99})
     para = h.get_paragraphs()[0]
     assert para.text == "First claim10-12. Second claim [2, 3]. 6 and [7]"
+    assert "AIREFS.CITE" in para._p.xml
+
+
+def test_split_range_run_is_scanned_and_renumbered(tmp_path):
+    """Word may split a superscript "3-5" into "3-" + "5" at an rsid
+    boundary. Neither piece is a well-formed range, yet every number written
+    must be reported (a dropped 3 would later be seeded as uncited) and the
+    range must be renumbered as a whole: 10-12, not 3-12."""
+    h = _cited_doc(tmp_path, split_range=True)
+    runs = h.find_superscript_citation_runs()
+    assert [r["numbers"] for r in runs] == [[3], [5]]      # field result "6" skipped
+    existing = ExistingCitationParser(h).analyze()
+    sups = [c.number for c in existing.in_text_citations[0] if c.is_superscript]
+    assert sups == [3, 5]
+    apply_renumbering(h, existing, {3: 10, 4: 11, 5: 12})
+    para = h.get_paragraphs()[0]
+    assert para.text == "First claim10-12. Second claim [1, 2]. 6 and [7]"
     assert "AIREFS.CITE" in para._p.xml
 
 

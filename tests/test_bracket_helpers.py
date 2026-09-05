@@ -24,6 +24,20 @@ class TestExpandBracketNumbers:
     def test_expand(self, text, expected):
         assert expand_bracket_numbers(text) == expected
 
+    @pytest.mark.parametrize("text,strict,lenient", [
+        ("3-", [], [3]),                    # "3-5" split by Word into "3-" + "5"
+        ("-5", [], [5]),
+        ("1, 3-", [1], [1, 3]),
+        ("3-5, 7-", [3, 4, 5], [3, 4, 5, 7]),
+    ])
+    def test_lenient_keeps_numbers_of_a_split_run(self, text, strict, lenient):
+        """A token that is neither a number nor a well-formed range is
+        dropped by default (bracket groups are always well-formed); with
+        lenient=True the numbers written in it are kept, so a superscript
+        run that Word split mid-list loses no citation."""
+        assert expand_bracket_numbers(text) == strict
+        assert expand_bracket_numbers(text, lenient=True) == lenient
+
 
 class TestFormatBracketNumbers:
     @pytest.mark.parametrize("nums,expected", [
@@ -165,3 +179,38 @@ class TestApplyRenumberingSuperscript:
         para = handler.get_paragraphs()[0]
         sup_texts = [r.text for r in para.runs if r.font.superscript]
         assert sup_texts == ["2", "3"]
+
+    def test_rsid_split_runs_keep_their_separators(self, tmp_path):
+        """Word splits a superscript citation into several runs at revision
+        (rsid) boundaries. Each run is renumbered on its own, so only its
+        digit core may change: "3," + "4" must become "10," + "11", never
+        "10" + "11" (which reads as 1011)."""
+        path = self._make_superscript_doc(
+            tmp_path, [("As shown", False), ("3,", True), ("4", True), (".", False)])
+        handler = DocxHandler(path)
+        apply_renumbering(handler, _existing_map(1), {3: 10, 4: 11})
+        para = handler.get_paragraphs()[0]
+        assert [r.text for r in para.runs if r.font.superscript] == ["10,", "11"]
+        assert para.text == "As shown10,11."
+
+    def test_split_range_is_renumbered_as_a_range(self, tmp_path):
+        """"3-5" split into "3-" + "5" (or "3" + "-5"): both pieces are
+        scanned and renumbered, so the range becomes 10-12, not 3-12."""
+        path = self._make_superscript_doc(
+            tmp_path, [("A", False), ("3-", True), ("5", True), (" B", False),
+                       ("3", True), ("-5", True)])
+        handler = DocxHandler(path)
+        apply_renumbering(handler, _existing_map(1), {3: 10, 4: 11, 5: 12})
+        para = handler.get_paragraphs()[0]
+        assert [r.text for r in para.runs if r.font.superscript] == [
+            "10-", "12", "10", "-12"]
+        assert para.text == "A10-12 B10-12"
+
+    def test_trailing_space_in_superscript_run_is_kept(self, tmp_path):
+        path = self._make_superscript_doc(
+            tmp_path, [("See", False), ("3 ", True), ("here", False)])
+        handler = DocxHandler(path)
+        apply_renumbering(handler, _existing_map(1), {3: 10})
+        para = handler.get_paragraphs()[0]
+        assert [r.text for r in para.runs if r.font.superscript] == ["10 "]
+        assert para.text == "See10 here"

@@ -167,13 +167,15 @@ class ExistingCitationParser:
             result_spans = fields.result_spans(para)
 
             # Superscript runs. Every number of the run shares the run's
-            # start offset; a range "3-5" expands to 3, 4, 5.
+            # start offset; a range "3-5" expands to 3, 4, 5, and a piece
+            # Word split off at a revision boundary ("3-") still reports
+            # its 3 (lenient expansion) instead of vanishing.
             char_offset = 0
             for run in para.runs:
                 if (run.font.superscript and not fields.in_field(run)
                         and CITATION_SHAPE_PATTERN.match(run.text or "")
                         and not _in_marker(char_offset)):
-                    for number in expand_bracket_numbers(run.text):
+                    for number in expand_bracket_numbers(run.text, lenient=True):
                         if number in valid_numbers:
                             citations.append(InTextCitation(
                                 char_offset=char_offset,

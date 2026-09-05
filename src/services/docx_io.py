@@ -408,9 +408,12 @@ class DocxHandler:
         """Find all superscript runs whose text is a citation number list.
 
         ``numbers`` is the run's text expanded, so a range ``3-5`` yields
-        ``[3, 4, 5]``. With ``skip_fields`` (the default) a run that belongs
-        to a Word field -- a cached result such as an AIREFS.CITE number --
-        is omitted: field results are rewritten through the field API.
+        ``[3, 4, 5]``. Expansion is lenient: Word splits a superscript run at
+        revision boundaries, so a piece such as ``3-`` (of ``3-5``) is
+        reported as ``[3]`` rather than dropped. With ``skip_fields`` (the
+        default) a run that belongs to a Word field -- a cached result such
+        as an AIREFS.CITE number -- is omitted: field results are rewritten
+        through the field API.
 
         Returns list of dicts with keys:
             paragraph, para_index, run, run_index, numbers (list[int]),
@@ -424,7 +427,7 @@ class DocxHandler:
             for run_idx, run in enumerate(para.runs):
                 if run.font.superscript and not (
                         skip_fields and self.fields.in_field(run)):
-                    nums = expand_bracket_numbers(run.text)
+                    nums = expand_bracket_numbers(run.text, lenient=True)
                     if nums:
                         results.append({
                             'paragraph': para,
