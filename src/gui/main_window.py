@@ -19,13 +19,14 @@ from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence
 
 from ..models.project import (
     ProjectState, ProjectSettings, PipelineStage, CitationStyle,
-    AUTHOR_DATE_STYLES, SUPERSCRIPT_STYLES, get_csl_path,
+    AUTHOR_DATE_STYLES, SUPERSCRIPT_STYLES,
 )
 from ..models.evidence import ReviewDecision
 from ..models.sentence import MarkerType
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.docx_export import ExportBlocked, check_export_guard
+from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
 from ..pipeline.renumbering import CitationKeyIndex
 from ..pipeline.renumber_plan import build_renumber_plan
@@ -354,43 +355,6 @@ class MainWindow(QMainWindow):
         dialog = RenumberPreviewDialog(plan.renumber_result, parent=self)
         dialog.exec()
 
-    # ── CSL-derived citation formatting helpers ──────────────────────
-
-    @staticmethod
-    def _parse_csl_citation_layout(style: CitationStyle) -> dict:
-        """Parse the <citation><layout> element from the CSL file.
-
-        Returns dict with keys: prefix, suffix, delimiter, is_author_date.
-        Falls back to sensible defaults (numeric with brackets) on error.
-        """
-        defaults = {"prefix": "[", "suffix": "]", "delimiter": ", ",
-                     "is_author_date": style in AUTHOR_DATE_STYLES}
-        try:
-            import xml.etree.ElementTree as ET
-            csl_path = get_csl_path(style)
-            if not csl_path.exists():
-                return defaults
-            tree = ET.parse(csl_path)
-            root = tree.getroot()
-            ns = {"csl": "http://purl.org/net/xbiblio/csl"}
-
-            citation_el = root.find(".//csl:citation", ns)
-            if citation_el is None:
-                return defaults
-            layout_el = citation_el.find(".//csl:layout", ns)
-            if layout_el is None:
-                return defaults
-
-            return {
-                "prefix": layout_el.get("prefix", ""),
-                "suffix": layout_el.get("suffix", ""),
-                "delimiter": layout_el.get("delimiter", ","),
-                "is_author_date": style in AUTHOR_DATE_STYLES,
-            }
-        except Exception as exc:
-            logger.warning(f"Could not parse CSL for {style}: {exc}")
-            return defaults
-
     def _do_export(self, output_path: str) -> Optional[ExportStats]:
         """Route to the appropriate export path based on mode.
 
@@ -412,11 +376,11 @@ class MainWindow(QMainWindow):
         style = self._project.settings.citation_style
 
         # Parse the CSL file once for in-text citation formatting
-        csl_info = self._parse_csl_citation_layout(style)
-        is_author_date = csl_info["is_author_date"]
-        cite_prefix = csl_info["prefix"]
-        cite_suffix = csl_info["suffix"]
-        cite_delim = csl_info["delimiter"]
+        layout = parse_csl_layout(style)
+        is_author_date = layout.is_author_date
+        cite_prefix = layout.prefix
+        cite_suffix = layout.suffix
+        cite_delim = layout.delimiter
 
         use_superscript = style in SUPERSCRIPT_STYLES
 
@@ -550,11 +514,11 @@ class MainWindow(QMainWindow):
         existing = self._project.existing_citations
         style = self._project.settings.citation_style
 
-        csl_info = self._parse_csl_citation_layout(style)
-        is_author_date = csl_info["is_author_date"]
-        cite_prefix = csl_info["prefix"]
-        cite_suffix = csl_info["suffix"]
-        cite_delim = csl_info["delimiter"]
+        layout = parse_csl_layout(style)
+        is_author_date = layout.is_author_date
+        cite_prefix = layout.prefix
+        cite_suffix = layout.suffix
+        cite_delim = layout.delimiter
         use_superscript = style in SUPERSCRIPT_STYLES
 
         # An author-date style cannot coherently merge with a numerically-cited
