@@ -568,7 +568,7 @@ class ReviewTab(QWidget):
                 continue
             ins, upd = self._ref_library.upsert_candidate(
                 citation, source=f"accepted_{source}",
-                merge=(source == "embedded"),   # a record read from a document never degrades a row
+                merge=bool(citation.record_uuid),   # read back from a document: never degrade a row
             )
             if ins:
                 imported += 1
@@ -617,10 +617,13 @@ class ReviewTab(QWidget):
 
         # A tracked document can be exported with no new markers at all:
         # that renumbers it after edits made in Word.
-        tracked = (self._project.existing_citations is not None
-                   and self._project.existing_citations.tracking is not None
-                   and self._project.existing_citations.tracking.tier == DocumentTier.TRACKED)
-        exportable = (all_done and total > 0) or (tracked and all_done)
+        existing = self._project.existing_citations
+        tracking = existing.tracking if existing is not None else None
+        tracked = tracking is not None and tracking.tier == DocumentTier.TRACKED
+        read_only = tracking is not None and (
+            tracking.tier in (DocumentTier.FAILED, DocumentTier.NEWER_VERSION)
+            or tracking.foreign_field_count > 0)
+        exportable = ((all_done and total > 0) or (tracked and all_done)) and not read_only
         self.export_btn.setEnabled(exportable)
         if exportable:
             self.export_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
@@ -833,7 +836,7 @@ class ReviewTab(QWidget):
             ins, upd = self._ref_library.upsert_candidate(
                 enriched,
                 source=f"manual_add_{source}",
-                merge=(source == "embedded"),
+                merge=bool(citation.record_uuid),
             )
             if ins:
                 imported += 1

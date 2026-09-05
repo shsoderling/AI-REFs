@@ -702,6 +702,12 @@ class InputsTab(QWidget):
             self.insert_mode_label.setVisible(False)
             return
         text, level = texts[mode]
+        issues = list(getattr(report, "reconcile", None) or [])
+        if issues:
+            shown = [f"• {i.message}" for i in issues[:4]]
+            if len(issues) > 4:
+                shown.append(f"• … and {len(issues) - 4} more")
+            text += "\n" + "\n".join(shown)
         bg, border, fg = self._MODE_STYLES[level]
         self.insert_mode_label.setStyleSheet(
             "QLabel {"
@@ -715,10 +721,6 @@ class InputsTab(QWidget):
         )
         self.insert_mode_label.setText(text)
         self.insert_mode_label.setVisible(True)
-
-    def set_insert_mode(self, enabled: bool, num_existing: int):
-        """Backward-compatible wrapper around :meth:`set_document_mode`."""
-        self.set_document_mode("legacy" if enabled else "fresh", None, num_existing)
 
     # ── Settings persistence ──────────────────────────────────────────
 

@@ -240,6 +240,10 @@ class FieldIndex:
         self.fields = iter_complex_fields(doc.element.body)
         self._role: dict[int, str] = {}
         self._field_of: dict[int, ComplexField] = {}
+        # Membership is keyed on element identity: keep every field run alive
+        # for as long as the index lives, so a removed run's id can never be
+        # recycled by a new run and mistaken for a field run.
+        self._pinned = [r for f in self.fields for r in f.all_runs if r is not None]
         for f in self.fields:
             for r in f.all_runs:
                 self._field_of.setdefault(id(r), f)
@@ -418,6 +422,22 @@ def rewrite_result(field: ComplexField, text: str, *, superscript: Optional[bool
             rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
     field.result_runs = [keep]
     return keep
+
+
+def unwrap_field(field: ComplexField):
+    """Remove a field's markers and code, keeping its visible result runs as
+    plain text (the inverse of wrapping). Used when the user typed a marker
+    into an unresolved [?] field: the marker is then processed like any other."""
+    from docx.oxml.ns import qn
+    for r in [field.begin, *field.code_runs, field.separate, field.end]:
+        if r is not None and r.getparent() is not None:
+            r.getparent().remove(r)
+    for r in field.result_runs:
+        rpr = r.find(qn('w:rPr'))
+        if rpr is not None:
+            for np_ in rpr.findall(qn('w:noProof')):
+                rpr.remove(np_)
+    field.complete = False
 
 
 def rewrite_code(field: ComplexField, code: str):

@@ -197,11 +197,9 @@ def test_pasted_duplicate_gets_new_cid_and_same_number(session1, tmp_path):
 
 def test_hand_edited_number_is_overwritten_and_author_date_preserved(session1, tmp_path):
     project, out = session1
-    h = DocxHandler(str(out))
-    rewrite_result(_cite_fields(out)[0], "42", superscript=True)
     h_edit = DocxHandler(str(out))
     f = [f for f in h_edit.fields.fields if f.kind == "airefs_cite"][0]
-    rewrite_result(f, "42", superscript=True)
+    rewrite_result(f, "42", superscript=True)          # the user retyped a number in Word
     h_edit.save(str(out))
     p2 = _reopen(project, out)
     out2 = tmp_path / "s2.docx"

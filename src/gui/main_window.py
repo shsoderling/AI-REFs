@@ -11,7 +11,6 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QMessageBox, QFileDialog,
-    QMenuBar, QStatusBar
 )
 from PySide6.QtCore import Slot, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence
@@ -241,6 +240,9 @@ class MainWindow(QMainWindow):
         mode = self._apply_document_mode(existing)
         self._project.is_insert_mode = (mode in ("legacy", "foreign", "tracked", "stripped")
                                         and existing.has_existing_citations)
+        # A tracked document can be exported (renumbered) without running
+        # the pipeline: refresh the review tab so its export button follows.
+        self.review_tab.load_project(self._project)
         if mode == "analysis-failed":
             logger.warning(f"Existing-citation analysis failed: {existing.tracking.problems}")
             return existing
@@ -264,6 +266,13 @@ class MainWindow(QMainWindow):
         if not self._project.input_docx_path:
             QMessageBox.warning(self, "No Document",
                               "Please load a DOCX file in the Input tab first.")
+            return
+
+        tracking = self._project.doc_tracking
+        if tracking is not None and tracking.tier == DocumentTier.NEWER_VERSION:
+            QMessageBox.warning(self, "Read-Only Document",
+                                "This document was created by a newer version of AI REFs and "
+                                "is opened read-only. Update AI REFs to work on it.")
             return
 
         # Collect settings
@@ -510,7 +519,8 @@ class MainWindow(QMainWindow):
                     # stored citation map (and any paragraph indices in it)
                     # can no longer be trusted.
                     self._project.input_docx_hash = current_hash
-                    self._analyze_document(docx_path)
+                    self._analyze_document(docx_path, self._project.output_docx_path,
+                                           list(self._project.entry_hashes))
                     self.review_tab.load_project(self._project)
                     self._mark_dirty()
                     message += " — document changed since the project was saved; re-analysed"

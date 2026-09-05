@@ -56,15 +56,15 @@ def test_apply_renumbering_skips_fields_and_maps_ranges(tmp_path):
 
 def test_split_range_run_is_scanned_and_renumbered(tmp_path):
     """Word may split a superscript "3-5" into "3-" + "5" at an rsid
-    boundary. Neither piece is a well-formed range, yet every number written
-    must be reported (a dropped 3 would later be seeded as uncited) and the
-    range must be renumbered as a whole: 10-12, not 3-12."""
+    boundary. Per run neither piece is a well-formed range, but the parser
+    reads consecutive superscript runs as one list, so 3, 4 and 5 are all
+    reported, and the range is renumbered as a whole: 10-12, not 3-12."""
     h = _cited_doc(tmp_path, split_range=True)
     runs = h.find_superscript_citation_runs()
-    assert [r["numbers"] for r in runs] == [[3], [5]]      # field result "6" skipped
+    assert [r["numbers"] for r in runs] == [[3], [5]]      # per run; field result "6" skipped
     existing = ExistingCitationParser(h)._legacy_map()
     sups = [c.number for c in existing.in_text_citations[0] if c.is_superscript]
-    assert sups == [3, 5]
+    assert sups == [3, 4, 5]
     apply_renumbering(h, existing, {3: 10, 4: 11, 5: 12})
     para = h.get_paragraphs()[0]
     assert para.text == "First claim10-12. Second claim [1, 2]. 6 and [7]"

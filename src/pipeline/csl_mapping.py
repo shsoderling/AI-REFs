@@ -89,10 +89,11 @@ def to_csl_item(citation: CitationCandidate) -> dict:
             item[key] = value
     if citation.year:
         item["issued"] = {"date-parts": [[int(citation.year)]]}
+    author_count = max(int(citation.author_count or 0), len(citation.authors))
     item["custom"] = {"airefs": {
         "source": citation.source or "",
-        "authorCount": len(citation.authors),
-        "authorsTruncated": False,
+        "authorCount": author_count,
+        "authorsTruncated": author_count > len(citation.authors),
         "isReview": bool(citation.is_review),
         "retracted": bool(citation.is_retracted),
         "retractionNotice": citation.retraction_notice or "",
@@ -115,14 +116,21 @@ def _first_year(item: dict) -> int:
 
 def from_csl_item(item: dict) -> CitationCandidate:
     """CitationCandidate from a CSL-JSON item written by :func:`to_csl_item`
-    (unknown keys ignored, missing keys defaulted). ``source`` is
-    ``"embedded"``: the record came from the document, not from a search.
+    (unknown keys ignored, missing keys defaulted). The original ``source``
+    is restored when the item recorded it; ``"embedded"`` otherwise. A
+    candidate that came from a field always carries a ``record_uuid``.
     """
     airefs = (item.get("custom") or {}).get("airefs") or {}
+    authors = [_author_from_csl(a) for a in item.get("author") or [] if isinstance(a, dict)]
+    try:
+        author_count = int(airefs.get("authorCount") or 0)
+    except (TypeError, ValueError):
+        author_count = 0
     return CitationCandidate(
         record_uuid=str(item.get("id") or ""),
         title=item.get("title") or "",
-        authors=[_author_from_csl(a) for a in item.get("author") or [] if isinstance(a, dict)],
+        authors=authors,
+        author_count=author_count if author_count > len(authors) else 0,
         journal=item.get("container-title") or "",
         journal_abbrev=item.get("container-title-short") or "",
         volume=str(item.get("volume") or ""),
@@ -132,7 +140,7 @@ def from_csl_item(item: dict) -> CitationCandidate:
         pmid=str(item.get("PMID") or ""),
         pmcid=str(item.get("PMCID") or ""),
         year=_first_year(item),
-        source="embedded",
+        source=str(airefs.get("source") or "embedded"),
         is_review=bool(airefs.get("isReview", False)),
         is_retracted=bool(airefs.get("retracted", False)),
         retraction_notice=airefs.get("retractionNotice") or "",
@@ -146,7 +154,8 @@ def from_csl_item(item: dict) -> CitationCandidate:
 # ── identity URIs ────────────────────────────────────────────────────
 
 def _title_hash(citation: CitationCandidate) -> str:
-    norm = re.sub(r"[^a-z0-9]+", " ", (citation.title or "").lower()).strip()
+    basis = citation.title or citation.raw_entry or ""
+    norm = re.sub(r"[^a-z0-9]+", " ", basis.lower()).strip()
     return hashlib.sha1(f"{norm}|{citation.year or 0}".encode("utf-8")).hexdigest()
 
 

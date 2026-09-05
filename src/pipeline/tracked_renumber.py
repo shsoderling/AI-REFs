@@ -13,7 +13,7 @@ from typing import Optional
 from ..models.citation import CitationCandidate
 from ..models.existing_refs import ExistingBibEntry, ExistingCitationMap
 from ..models.project import CitationStyle
-from ..services.docx_fields import ComplexField, rewrite_code, rewrite_result
+from ..services.docx_fields import ComplexField, rewrite_code, rewrite_result, unwrap_field
 from ..services.docx_io import BIBLIOGRAPHY_HEADING_STYLE, DocxHandler
 from .bib_format import format_bib_entry
 from .citation_payload import (
@@ -35,15 +35,16 @@ class Cluster:
     payload: CitePayload
     cid: str
     items: list[CiteItem] = field(default_factory=list)
+    merge_into_previous: bool = False   # adjacent to the previous cluster (no text between)
 
 
 def collect_clusters(handler: DocxHandler, stats: ExportStats):
-    """Live citation fields of the body, in order, with adjacent fields merged.
+    """Live citation fields of the body, in order (read-only).
 
     Returns (body clusters, table fields). A field whose payload cannot be
-    read is left untouched and counted as damaged. Two fields with nothing
-    between them (``(REF)(REF)``, or a paste next to a citation) become one
-    cluster: the second field's runs are removed and its items appended.
+    read is counted as damaged (the guard refuses such documents). A field
+    with nothing between it and the previous one (``(REF)(REF)``, or a
+    paste next to a citation) is flagged for :func:`merge_adjacent_clusters`.
     """
     clusters: list[Cluster] = []
     table_fields: list[tuple[ComplexField, CitePayload]] = []
@@ -59,18 +60,30 @@ def collect_clusters(handler: DocxHandler, stats: ExportStats):
         if f.out_of_flow:
             table_fields.append((f, payload))
             continue
-        if clusters and _adjacent(clusters[-1].field, f):
-            clusters[-1].items.extend(payload.items)
-            for r in f.all_runs:
-                r.getparent().remove(r)
-            stats.duplicates_merged += 1
-            continue
         cid = payload.citation_id
         if cid in seen:
             cid = mint_citation_id()
         seen.add(cid)
-        clusters.append(Cluster(field=f, payload=payload, cid=cid, items=list(payload.items)))
+        clusters.append(Cluster(field=f, payload=payload, cid=cid, items=list(payload.items),
+                                merge_into_previous=bool(clusters) and _adjacent(clusters[-1].field, f)))
     return clusters, table_fields
+
+
+def merge_adjacent_clusters(clusters: list[Cluster], stats: ExportStats) -> list[Cluster]:
+    """Merge each flagged cluster into its predecessor: items appended, the
+    second field's runs removed. Call after the renumbering plan was built,
+    so the plan's offsets were read from the unmodified paragraph."""
+    merged: list[Cluster] = []
+    for cluster in clusters:
+        if cluster.merge_into_previous and merged:
+            merged[-1].items.extend(cluster.items)
+            for r in cluster.field.all_runs:
+                if r is not None and r.getparent() is not None:
+                    r.getparent().remove(r)
+            stats.duplicates_merged += 1
+            continue
+        merged.append(cluster)
+    return merged
 
 
 def _adjacent(prev: ComplexField, nxt: ComplexField) -> bool:
@@ -98,9 +111,18 @@ def candidates_for(items: list[CiteItem], existing: ExistingCitationMap) -> list
 
 def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
                      result: RenumberingResult, layout: CitationLayout, style: CitationStyle,
-                     stats: ExportStats):
-    """Give every cluster its new numbers, text and payload; rewrite only what changed."""
+                     stats: ExportStats) -> int:
+    """Give every cluster its new numbers, text and payload; rewrite only what
+    changed. An unresolved [?] field into which the user typed a (REF) or
+    (REFS) marker is unwrapped so the marker pass fills it like any other.
+    Returns the number of clusters unwrapped."""
+    from .existing_citation_parser import MARKER_PATTERN
+    unwrapped = 0
     for cluster in clusters:
+        if cluster.payload.unresolved and not cluster.items and MARKER_PATTERN.search(cluster.field.result_text):
+            unwrap_field(cluster.field)
+            unwrapped += 1
+            continue
         cands = candidates_for(cluster.items, existing)
         numbers = [n for n in (result.number_for_candidate(c) for c in cands) if n is not None]
         visible = cluster.field.result_text
@@ -123,6 +145,7 @@ def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
                                unresolved=unresolved)
         if code.strip() != cluster.field.code:
             rewrite_code(cluster.field, code)
+    return unwrapped
 
 
 def blocked_table_fields(table_fields, existing: ExistingCitationMap, result: RenumberingResult,
@@ -184,7 +207,8 @@ def render_tracked_bibliography(existing: ExistingCitationMap, result: Renumberi
 
 def orphan_heading(handler: DocxHandler):
     """The heading paragraph of a bibliography whose field was deleted: the
-    last paragraph styled as our heading, if no bibliography field follows it."""
+    last paragraph styled as our heading (callers check that no bibliography
+    field exists in the document)."""
     paragraphs = handler.get_paragraphs()
     for p in reversed(paragraphs):
         style = p.style

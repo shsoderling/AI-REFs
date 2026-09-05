@@ -64,6 +64,35 @@ def bibliography_bounds(paragraphs, heading_idx: int) -> tuple[int, int]:
     return first, last
 
 
+def superscript_groups(paragraph, fields) -> list[tuple[list, str, int]]:
+    """Consecutive superscript, citation-shaped runs of a paragraph, outside
+    fields, as (runs, concatenated text, char offset of the first run).
+
+    Word splits a superscript run at revision boundaries ("1-" + "3"), so a
+    citation list must be read from the group, never from a single run.
+    """
+    groups: list[tuple[list, str, int]] = []
+    current: list = []
+    current_text = ""
+    current_start = 0
+    char_offset = 0
+    for run in paragraph.runs:
+        is_cite = bool(run.font.superscript and not fields.in_field(run)
+                       and CITATION_SHAPE_PATTERN.match(run.text or ""))
+        if is_cite:
+            if not current:
+                current_start = char_offset
+            current.append(run)
+            current_text += run.text
+        elif current:
+            groups.append((current, current_text, current_start))
+            current, current_text = [], ""
+        char_offset += len(run.text)
+    if current:
+        groups.append((current, current_text, current_start))
+    return groups
+
+
 def in_field_result(match, result_spans) -> bool:
     """True when a regex *match* over ``paragraph.text`` overlaps one of the
     paragraph's field result spans (``FieldIndex.result_spans``).
@@ -262,23 +291,21 @@ class ExistingCitationParser:
 
             result_spans = fields.result_spans(para)
 
-            # Superscript runs. Every number of the run shares the run's
-            # start offset; a range "3-5" expands to 3, 4, 5, and a piece
-            # Word split off at a revision boundary ("3-") still reports
-            # its 3 (lenient expansion) instead of vanishing.
-            char_offset = 0
-            for run in para.runs:
-                if (run.font.superscript and not fields.in_field(run)
-                        and CITATION_SHAPE_PATTERN.match(run.text or "")
-                        and not _in_marker(char_offset)):
-                    for number in expand_bracket_numbers(run.text, lenient=True):
-                        if number in valid_numbers:
-                            citations.append(InTextCitation(
-                                char_offset=char_offset,
-                                number=number,
-                                is_superscript=True,
-                            ))
-                char_offset += len(run.text)
+            # Superscript groups: consecutive superscript runs are one list
+            # (Word splits "1-3" into "1-" + "3" at revision boundaries).
+            # Every number of a group shares the group's start offset; a
+            # range "3-5" expands to 3, 4, 5, and a malformed piece still
+            # reports the numbers written in it (lenient expansion).
+            for _runs, group_text, group_start in superscript_groups(para, fields):
+                if _in_marker(group_start):
+                    continue
+                for number in expand_bracket_numbers(group_text, lenient=True):
+                    if number in valid_numbers:
+                        citations.append(InTextCitation(
+                            char_offset=group_start,
+                            number=number,
+                            is_superscript=True,
+                        ))
 
             # Bracketed citations
             for m in BRACKET_CITE_PATTERN.finditer(para.text):

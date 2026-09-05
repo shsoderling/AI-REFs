@@ -165,6 +165,8 @@ def build_events(
         if heading >= 0 and para_idx >= heading:
             continue
         for c in cites:
+            if getattr(c, 'unresolved', False) or c.number <= 0:
+                continue                       # a [?] field cites nothing yet
             events.append(CitationEvent(
                 para_idx, c.char_offset, 'existing', number=c.number,
                 record_uuid=getattr(c, 'record_uuid', ''),

@@ -152,8 +152,8 @@ class ReferenceLibrary:
             current = self._row_to_candidate(row)
             current_source = row[16] or ""
             citation = self._merged(current, citation)
-            if current_source and current_source != "embedded":
-                source = current_source
+            if current_source and "embedded" not in current_source:
+                source = current_source          # a richer origin is kept
 
         values = (
             key,

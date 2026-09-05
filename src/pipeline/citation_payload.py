@@ -126,6 +126,7 @@ def _guarded_item(citation: CitationCandidate) -> dict:
     if len(_dumps(item).encode("utf-8")) > MAX_ITEM_BYTES and len(item.get("author", [])) > MAX_AUTHORS_WHEN_TRUNCATED:
         item["author"] = item["author"][:MAX_AUTHORS_WHEN_TRUNCATED]
         item["custom"]["airefs"]["authorsTruncated"] = True
+        # authorCount already holds the real count (to_csl_item)
     return item
 
 

@@ -230,14 +230,3 @@ def test_never_clears_paragraph_content(tmp_path, monkeypatch):
     h.replace_marker_by_regex(para, "(REF)", "[4]")
     assert called == []
     assert para.text == "only a link [4]"
-
-
-def test_collapse_refuses_fielded_paragraph(tmp_path):
-    def build(b):
-        p = b.paragraph("A ")
-        b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="1")
-        b.add_text(p, " (REF)")
-    h = _handler(tmp_path, build)
-    para = h.get_paragraphs()[0]
-    with pytest.raises(FieldBoundaryError):
-        h._collapse_and_replace_superscript(para, "(REF)", "9")

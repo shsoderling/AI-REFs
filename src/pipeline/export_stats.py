@@ -27,6 +27,7 @@ class ExportStats:
     damaged_fields: int = 0            # fields whose payload could not be read
     bibliography_regenerated: bool = False
     tables_citations: int = 0          # citation fields in tables / text boxes (not renumbered)
+    unadoptable_sites: int = 0         # legacy citation sites that could not be matched to entries
 
     def summary_lines(self) -> list[str]:
         lines = [
@@ -67,8 +68,11 @@ class ExportStats:
             lines.append(f"Hand-edited citation numbers regenerated: {self.hand_edits_overwritten}")
         if self.hand_edits_preserved:
             lines.append(f"Hand-edited author-date citations preserved: {self.hand_edits_preserved}")
+        if self.unadoptable_sites:
+            lines.append(f"Not tracked: {self.unadoptable_sites} citation site(s) could not be "
+                         "matched to a reference entry")
         if self.damaged_fields:
-            lines.append(f"Damaged citation fields skipped: {self.damaged_fields}")
+            lines.append(f"Damaged citation fields: {self.damaged_fields}")
         if self.bibliography_regenerated:
             lines.append("Bibliography field was missing and has been regenerated")
         if self.tables_citations:

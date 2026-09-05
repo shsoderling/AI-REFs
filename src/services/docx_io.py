@@ -11,7 +11,7 @@ from typing import NamedTuple, Optional
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from docx.enum.style import WD_STYLE_TYPE
@@ -472,6 +472,15 @@ class DocxHandler:
                 return i
         return -1
 
+    def insert_bibliography_after(self, heading_paragraph, entries: list[str], bibl_code: str):
+        """Write the bibliography field right after an existing heading paragraph."""
+        self.ensure_bibliography_styles()
+        self._insert_anchor = heading_paragraph._p.getnext()
+        if self._insert_anchor is not None and self._insert_anchor.tag == f'{{{W_NS}}}sectPr':
+            self._insert_anchor = None
+        self._place_new_paragraphs(self._new_entry_paragraphs(entries, bibl_code))
+        self.invalidate_fields()
+
     def locate_bibliography_heading(self, field, heading_text: str) -> int:
         """Body index of the heading paragraph belonging to a bibliography
         *field*, or -1.
@@ -531,67 +540,6 @@ class DocxHandler:
         if expected_cite_fields is not None and idx.airefs_cite != expected_cite_fields:
             problems.append(f"expected {expected_cite_fields} citation fields, found {idx.airefs_cite}")
         return problems
-
-    def _collapse_and_replace_superscript(self, paragraph, marker_text: str,
-                                           replacement: str):
-        """Legacy fallback: collapse the paragraph into three fresh runs,
-        before | cite^ | after. Not reachable from ``replace_marker_by_regex``.
-
-        Refuses paragraphs holding a field: rebuilding their runs would strip
-        the field characters and code.
-        """
-        if paragraph._p.findall(f'.//{{{W_NS}}}fldChar'):
-            raise FieldBoundaryError("paragraph contains fields; refusing to collapse runs")
-        full_text = paragraph.text
-        idx = full_text.find(marker_text)
-        before = full_text[:idx]
-        after = full_text[idx + len(marker_text):]
-
-        # Capture formatting from the first run
-        font_name = font_size = font_bold = font_italic = font_color = None
-        if paragraph.runs:
-            first_run = paragraph.runs[0]
-            font_name = first_run.font.name
-            font_size = first_run.font.size
-            font_bold = first_run.font.bold
-            font_italic = first_run.font.italic
-            try:
-                font_color = first_run.font.color.rgb if first_run.font.color and first_run.font.color.rgb else None
-            except Exception:
-                font_color = None
-
-        # Remove all existing runs from the XML
-        p_elem = paragraph._element
-        w_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-        for r_el in list(p_elem.findall(f'{{{w_ns}}}r')):
-            p_elem.remove(r_el)
-
-        # Helper to apply captured formatting
-        def _apply_fmt(run, make_super=False):
-            if font_name:
-                run.font.name = font_name
-            if font_size:
-                run.font.size = font_size
-            if font_bold is not None:
-                run.font.bold = font_bold
-            if font_italic is not None:
-                run.font.italic = font_italic
-            if font_color:
-                run.font.color.rgb = font_color
-            if make_super:
-                run.font.superscript = True
-
-        if before:
-            r = paragraph.add_run(before)
-            _apply_fmt(r)
-
-        r_cite = paragraph.add_run(replacement)
-        _apply_fmt(r_cite, make_super=True)
-
-        if after:
-            r = paragraph.add_run(after)
-            _apply_fmt(r)
-        self.invalidate_fields()
 
     # ── Insert-mode helpers ─────────────────────────────────────────
 

@@ -27,8 +27,9 @@ def test_merge_never_degrades_a_rich_row(tmp_path):
                              authors=[Author(last_name=f"A{i}") for i in range(12)], source="pubmed")
     assert lib.upsert_candidate(rich, source="accepted_pubmed") == (True, False)
     thin = CitationCandidate(pmid="1", title="T", authors=[Author(last_name="A0")], source="embedded",
-                             is_retracted=True, journal_abbrev="J Abbr")
-    assert lib.upsert_candidate(thin, source="embedded", merge=True) == (False, True)
+                             is_retracted=True, journal_abbrev="J Abbr", record_uuid="u1")
+    # the review tab passes "accepted_<source>"; any embedded origin is the weakest
+    assert lib.upsert_candidate(thin, source="accepted_embedded", merge=True) == (False, True)
     title, authors_json, abstract, mesh, pubtypes, retracted, review, source, abbr = _row(lib, "1")
     assert abstract == "ABS" and '"M1"' in mesh and "Journal Article" in pubtypes
     assert authors_json.count("last_name") == 12
@@ -40,7 +41,7 @@ def test_merge_never_degrades_a_rich_row(tmp_path):
 def test_merge_into_embedded_row_upgrades_it(tmp_path):
     lib = _lib(tmp_path)
     thin = CitationCandidate(pmid="2", title="T", source="embedded")
-    lib.upsert_candidate(thin, source="embedded")
+    lib.upsert_candidate(thin, source="manual_add_embedded")
     rich = CitationCandidate(pmid="2", title="T full", abstract="ABS", source="pubmed",
                              authors=[Author(last_name="A"), Author(last_name="B")])
     assert lib.upsert_candidate(rich, source="accepted_pubmed", merge=True) == (False, True)

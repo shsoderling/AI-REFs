@@ -22,15 +22,15 @@ from .bib_format import format_bib_entry
 from .citation_numbers import expand_bracket_numbers
 from .csl_mapping import ensure_record_uuid
 from .existing_citation_parser import (
-    BRACKET_CITE_PATTERN, CITATION_SHAPE_PATTERN, in_field_result,
+    BRACKET_CITE_PATTERN, in_field_result, superscript_groups,
 )
 from .renumber_apply import apply_renumbering
 from .citation_payload import build_bibl_code, build_cite_code, entry_hash
 from .citation_render import layout_for_existing_shape
 from .field_citation_reader import build_tracked_map
 from .tracked_renumber import (
-    blocked_table_fields, collect_clusters, orphan_heading, render_tracked_bibliography,
-    rewrite_clusters,
+    blocked_table_fields, collect_clusters, merge_adjacent_clusters, orphan_heading,
+    render_tracked_bibliography, rewrite_clusters,
 )
 from .citation_render import UNRESOLVED_TEXT, CitationLayout, parse_csl_layout, render_cluster
 from .export_stats import ExportStats
@@ -85,6 +85,17 @@ def check_export_guard(existing: Optional[ExistingCitationMap], mode: str,
         reasons.append("Analysis of the document's existing citations failed: "
                        + "; ".join(tracking.problems))
         return reasons
+    if tracking is not None and tracking.tier == DocumentTier.NEWER_VERSION:
+        reasons.append("This document was created by a newer version of AI REFs and is "
+                       "opened read-only. Update AI REFs to edit it.")
+        return reasons
+    if tracking is not None:
+        damaged = sum(1 for i in tracking.reconcile if i.kind == 'damaged')
+        if damaged:
+            reasons.append(
+                f"{damaged} citation field(s) are damaged: their hidden data could not be read, "
+                "so AI REFs cannot tell which reference they cite. In Word, show the field codes "
+                "(Alt+F9), delete those citations and insert (REF) markers instead, then export.")
     if tracking is not None and tracking.foreign_field_count:
         reasons.append(
             f"{tracking.foreign_field_count} citation field(s) from another reference "
@@ -101,7 +112,7 @@ def check_export_guard(existing: Optional[ExistingCitationMap], mode: str,
                 "can read. Exporting would append a second bibliography; confirm to "
                 "treat the document as uncited.")
     if mode == "legacy" and tracking is not None and tracking.problems:
-        blocking = [p for p in tracking.problems if not p.startswith(STRIPPED_NOTE[:25])]
+        blocking = [p for p in tracking.problems if p != STRIPPED_NOTE]
         if blocking:
             reasons.append("The existing citations could not be read reliably: "
                            + "; ".join(blocking))
@@ -156,12 +167,19 @@ def _write_cluster(handler: DocxHandler, paragraph, marker_text: str, candidates
         stored_numbers = [] if layout.is_author_date else numbers
         code = build_cite_code(candidates, numbers=stored_numbers, render=layout.render_kind,
                                style=style.value, plain=text, unresolved=unresolved)
-        handler.insert_citation_field(paragraph, marker_text, code, text, superscript=superscript)
+        written = handler.insert_citation_field(paragraph, marker_text, code, text,
+                                                superscript=superscript)
+        if written is None:
+            raise ExportBlocked([f"The marker {marker_text} could not be found in its paragraph "
+                                 f"(\"{paragraph.text[:60]}\"); the document may have changed "
+                                 "since the pipeline ran. Reload it and run again."])
         stats.fields_written += 1
         if unresolved:
             stats.unresolved_fields += 1
     else:
-        handler.replace_marker_by_regex(paragraph, marker_text, text, superscript=superscript)
+        if handler.replace_marker_by_regex(paragraph, marker_text, text, superscript=superscript) is None:
+            raise ExportBlocked([f"The marker {marker_text} could not be found in its paragraph "
+                                 f"(\"{paragraph.text[:60]}\"). Reload the document and run again."])
     return text
 
 
@@ -250,6 +268,7 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
     clusters, table_fields = collect_clusters(handler, stats)
     stats.tables_citations = len(table_fields)
     plan = build_renumber_plan(handler, project)
+    clusters = merge_adjacent_clusters(clusters, stats)   # after the plan read the offsets
     result = plan.renumber_result
     stats.total_markers = len(plan.markers)
     logger.info(f"Tracked export: style={style.value} clusters={len(clusters)} "
@@ -260,7 +279,8 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
         raise ExportBlocked(blocked)
 
     # 1. existing citations: new numbers, text and payload
-    rewrite_clusters(clusters, existing, result, layout, style, stats)
+    unwrapped = rewrite_clusters(clusters, existing, result, layout, style, stats)
+    handler.invalidate_fields()          # runs were replaced: rebuild the identity index
 
     # 2. new markers
     for i, marker_info in enumerate(plan.markers):
@@ -290,17 +310,18 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
         else:
             heading = orphan_heading(handler)
             if heading is not None:
-                handler._insert_anchor = heading._p.getnext()
-                handler.ensure_bibliography_styles()
-                handler._place_new_paragraphs(handler._new_entry_paragraphs(entries, code))
-                handler.invalidate_fields()
+                handler.insert_bibliography_after(heading, entries, code)
             else:
                 handler.write_bibliography_field(entries, code, heading_text=BIBLIOGRAPHY_HEADING)
             stats.bibliography_regenerated = True
-    elif bibl_field is not None:
-        handler.remove_references_section(*existing.bibliography_span) if existing.bibliography_span[0] >= 0 else None
+    elif bibl_field is not None and existing.bibliography_span[0] >= 0:
+        # Every citation is gone: remove the now-empty bibliography and its heading
+        start = existing.references_heading_para_idx
+        if start < 0:
+            start = existing.bibliography_span[0]
+        handler.remove_references_section(start, existing.bibliography_span[1])
 
-    expected = len(clusters) + len(table_fields) + len(plan.markers) + sum(
+    expected = len(clusters) - unwrapped + len(table_fields) + len(plan.markers) + sum(
         1 for f in handler.fields.fields if f.kind == 'airefs_cite' and f.deleted)
     problems = handler.validate_before_save(expected_cite_fields=expected)
     if problems:
@@ -380,13 +401,55 @@ def _identify_existing_entries(existing: ExistingCitationMap) -> dict[int, Citat
     return by_old
 
 
+def _strict_numbers(text: str):
+    """Numbers of a citation list, or None when the text is malformed."""
+    strict = expand_bracket_numbers(text)
+    if not strict or strict != expand_bracket_numbers(text, lenient=True):
+        return None
+    return strict
+
+
+def _legacy_sites(handler: DocxHandler, existing: ExistingCitationMap):
+    """Every plain-text citation site of the body: ('sup', paragraph, runs,
+    text, start) for superscript groups and ('bracket', paragraph, None,
+    token, start) for bracket groups, in document order."""
+    heading = existing.references_heading_para_idx
+    sites = []
+    for para_idx, para in enumerate(handler.get_paragraphs()):
+        if heading >= 0 and para_idx >= heading:
+            break
+        fields = handler.fields
+        for runs, text, start in superscript_groups(para, fields):
+            sites.append(('sup', para, runs, text, start))
+        if "[" in para.text:
+            spans = fields.result_spans(para)
+            for m in BRACKET_CITE_PATTERN.finditer(para.text):
+                if not in_field_result(m, spans):
+                    sites.append(('bracket', para, None, m.group(0), m.start()))
+    return sites
+
+
+def unadoptable_sites(handler: DocxHandler, existing: ExistingCitationMap) -> int:
+    """Citation sites (before renumbering) whose numbers are malformed or do
+    not all belong to a parsed bibliography entry. Adoption is all or
+    nothing: one such site keeps the whole document untracked."""
+    count = 0
+    for kind, _para, _runs, text, _start in _legacy_sites(handler, existing):
+        inner = text[1:-1] if kind == 'bracket' else text
+        numbers = _strict_numbers(inner)
+        if numbers is None or any(n not in existing.bib_entries for n in numbers):
+            count += 1
+    return count
+
+
 def adopt_existing_sites(handler: DocxHandler, existing: ExistingCitationMap,
                          result: RenumberingResult, layout: CitationLayout,
                          style: CitationStyle, stats: ExportStats) -> int:
     """Wrap every plain-text numeric citation of the body (already renumbered)
     into an AIREFS field, so the next session reads the document exactly.
-    Sites whose numbers do not all map to a known record are left as text.
-    Returns the number of sites adopted."""
+    Call only when :func:`unadoptable_sites` returned 0. A superscript list
+    Word had split into several runs is joined into one run first. Returns
+    the number of sites adopted."""
     cand_by_old = _identify_existing_entries(existing)
     new_to_old = {a.final_number: a.original_number
                   for a in result.assignments.values() if not a.is_new}
@@ -400,44 +463,31 @@ def adopt_existing_sites(handler: DocxHandler, existing: ExistingCitationMap,
             cands.append(cand_by_old[old])
         return cands or None
 
-    heading = existing.references_heading_para_idx
     adopted = 0
-    for info in handler.find_superscript_citation_runs():
-        if heading >= 0 and info['para_index'] >= heading:
-            continue
-        run = info['run']
-        if not CITATION_SHAPE_PATTERN.match(run.text or ""):
-            continue
-        cands = cands_for(info['numbers'])
+    for kind, para, runs, text, start in _legacy_sites(handler, existing):
+        inner = text[1:-1] if kind == 'bracket' else text
+        numbers = _strict_numbers(inner)
+        cands = cands_for(numbers) if numbers else None
         if cands is None:
-            continue
-        code = build_cite_code(cands, numbers=sorted(set(info['numbers'])), render=layout.render_kind,
-                               style=style.value, plain=run.text)
-        handler.wrap_run_in_field(run._r, code, run.text, superscript=True)
+            raise ExportBlocked([f"citation '{text}' could not be matched to a reference while "
+                                 "adopting the document; export aborted before any write"])
+        code = build_cite_code(cands, numbers=sorted(set(numbers)), render=layout.render_kind,
+                               style=style.value, plain=text)
+        if kind == 'sup':
+            first = runs[0]._r
+            if len(runs) > 1:                     # join the split list into one run
+                from docx.oxml.ns import qn
+                for extra in runs[1:]:
+                    extra._r.getparent().remove(extra._r)
+                for child in list(first):
+                    if child.tag != qn('w:rPr'):
+                        first.remove(child)
+                from src.services.docx_fields import _text_elem
+                first.append(_text_elem(text))
+            handler.wrap_run_in_field(first, code, text, superscript=True)
+        else:
+            handler.insert_citation_field(para, text, code, text, superscript=False, start=start)
         adopted += 1
-    for para_idx, para in enumerate(handler.get_paragraphs()):
-        if heading >= 0 and para_idx >= heading:
-            break
-        if "[" not in para.text:
-            continue
-        start = 0
-        while True:
-            spans = handler.fields.result_spans(para)
-            match = next((m for m in BRACKET_CITE_PATTERN.finditer(para.text)
-                          if m.start() >= start and not in_field_result(m, spans)), None)
-            if match is None:
-                break
-            numbers = expand_bracket_numbers(match.group(1))
-            cands = cands_for(numbers)
-            start = match.end()
-            if cands is None:
-                continue
-            token = match.group(0)
-            code = build_cite_code(cands, numbers=sorted(set(numbers)), render=layout.render_kind,
-                                   style=style.value, plain=token)
-            handler.insert_citation_field(para, token, code, token, superscript=False,
-                                          start=match.start())
-            adopted += 1
     stats.fields_written += adopted
     return adopted
 
@@ -484,15 +534,19 @@ def export_legacy(project: ProjectState, output_path: str,
     if not is_author_date:
         # New numeric citations follow the document's existing shape
         layout = layout_for_existing_shape(layout, existing.detected_style_is_superscript)
-    adopt = settings.embed_citation_fields and not is_author_date
+    stats_unadoptable = unadoptable_sites(handler, existing) if not is_author_date else 0
+    # All or nothing: a document is tracked only if every citation site can be
+    adopt = settings.embed_citation_fields and not is_author_date and stats_unadoptable == 0
 
     plan = build_renumber_plan(handler, project)
     result = plan.renumber_result
     renumber_map = result.renumber_map
     stats = ExportStats(total_markers=len(plan.markers), output_path=output_path)
     stats.entries_seeded_uncited = len(result.seeded_uncited)
+    stats.unadoptable_sites = stats_unadoptable
     logger.info(f"Legacy export: style={style.value} existing={len(existing.bib_entries)} "
-                f"markers={len(plan.markers)} author_date={is_author_date} adopt={adopt}")
+                f"markers={len(plan.markers)} author_date={is_author_date} adopt={adopt} "
+                f"unadoptable={stats_unadoptable}")
 
     # 1. existing in-text citations (before the new markers, so the inserted
     #    text is never re-processed)

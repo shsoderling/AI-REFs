@@ -52,6 +52,8 @@ class CitationCandidate(BaseModel):
                                                      "carried in the document's citation fields")
     raw_entry: str = Field(default="", description="Verbatim bibliography text for records adopted "
                                                    "from a plain-text document")
+    author_count: int = Field(default=0, description="Real number of authors when the stored list "
+                                                     "was truncated (0: len(authors))")
     title: str = Field(default="")
     source: str = Field(default="literature", description="Origin: pubmed, europepmc, biorxiv, user_library, ...")
     authors: list[Author] = Field(default_factory=list)
