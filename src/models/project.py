@@ -142,6 +142,17 @@ class ProjectSettings(BaseModel):
                     "on PubMed so they can be deduplicated against new finds",
     )
 
+    # Export safety
+    min_match_ratio: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Insert mode refuses to rebuild the bibliography when fewer than "
+                    "this fraction of parsed entries were matched to in-text citations",
+    )
+    allow_export_with_tracked_changes: bool = Field(
+        default=False,
+        description="Export a document whose citations carry pending tracked changes",
+    )
+
     # User reference library
     reference_library_enabled: bool = Field(
         default=True,

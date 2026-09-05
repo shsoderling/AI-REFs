@@ -441,21 +441,40 @@ class DocxHandler:
                 char_offset += len(run.text)
         return results
 
-    def remove_references_section(self, start_para_idx: int):
-        """Remove the existing References section (heading + all entries).
+    def remove_references_section(self, start_para_idx: int,
+                                  end_para_idx: Optional[int] = None) -> int:
+        """Remove the References section: the heading paragraph and its entries.
 
-        Removes all paragraphs from start_para_idx to end of document.
-        They will be replaced with a rebuilt bibliography.
+        Without *end_para_idx* the section is bounded: it ends at the last
+        paragraph after the heading that is blank or entry-shaped
+        (``BIB_ENTRY_PATTERN``), so an appendix, acknowledgements or any
+        other text that follows the bibliography is left alone. Blank
+        paragraphs trailing the last entry are kept. With *end_para_idx*
+        exactly ``[start_para_idx, end_para_idx]`` is removed.
+
+        Returns the number of paragraphs removed.
         """
+        from ..pipeline.existing_citation_parser import BIB_ENTRY_PATTERN
         paragraphs = self.doc.paragraphs
+        if end_para_idx is None:
+            end_para_idx = start_para_idx
+            for i in range(start_para_idx + 1, len(paragraphs)):
+                text = paragraphs[i].text.strip()
+                if not text or BIB_ENTRY_PATTERN.match(text):
+                    end_para_idx = i
+                    continue
+                break
+            while (end_para_idx > start_para_idx
+                   and not paragraphs[end_para_idx].text.strip()):
+                end_para_idx -= 1
         body_elem = self.doc.element.body
-        # Remove from end backwards to avoid index shifting
-        for i in range(len(paragraphs) - 1, start_para_idx - 1, -1):
-            p_elem = paragraphs[i]._element
-            body_elem.remove(p_elem)
-        logger.info(f"Removed {len(paragraphs) - start_para_idx} paragraphs "
-                     f"(References section from para {start_para_idx})")
+        for i in range(end_para_idx, start_para_idx - 1, -1):
+            body_elem.remove(paragraphs[i]._element)
+        removed = end_para_idx - start_para_idx + 1
+        logger.info(f"Removed {removed} paragraphs "
+                    f"(References section from para {start_para_idx} to {end_para_idx})")
         self.invalidate_fields()
+        return removed
 
     def append_bibliography(self, entries: list[str]):
         """Append a bibliography section to the end of the document."""
