@@ -43,3 +43,9 @@ def format_bib_entry(citation: CitationCandidate, number: int,
     if style not in AUTHOR_DATE_STYLES:
         return f"{number}. {base}"
     return base
+
+
+def format_bib_entry_from_item(item: dict, number: int, style: CitationStyle) -> str:
+    """Bibliography entry for a CSL-JSON item read back from a citation field."""
+    from .csl_mapping import from_csl_item
+    return format_bib_entry(from_csl_item(item), number, style)

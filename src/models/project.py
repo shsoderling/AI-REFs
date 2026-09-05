@@ -142,6 +142,17 @@ class ProjectSettings(BaseModel):
                     "on PubMed so they can be deduplicated against new finds",
     )
 
+    # Tracked documents
+    embed_citation_fields: bool = Field(
+        default=True,
+        description="Write each citation as a hidden Word field carrying its record, so a "
+                    "later session reopens the document exactly (EndNote-style tracking)",
+    )
+    keep_uncited_entries: bool = Field(
+        default=False,
+        description="Keep bibliography entries whose citations were all deleted",
+    )
+
     # Export safety
     min_match_ratio: float = Field(
         default=0.5, ge=0.0, le=1.0,
@@ -215,6 +226,11 @@ class ProjectState(BaseModel):
     # Insert mode: adding references to a pre-cited document
     is_insert_mode: bool = Field(default=False, description="True when adding refs to a pre-cited document")
     existing_citations: Optional[ExistingCitationMap] = Field(default=None, description="Parsed pre-existing citations (insert mode only)")
+
+    # Tracked document mirror (written at export; the document is the source of truth)
+    doc_id: str = Field(default="", description="Identity of the tracked document, carried in its bibliography field")
+    record_order: list[str] = Field(default_factory=list, description="Record uuids in bibliography order at the last export")
+    uncited: list[str] = Field(default_factory=list, description="Record uuids kept without a citation at the last export")
 
     @property
     def total_markers(self) -> int:

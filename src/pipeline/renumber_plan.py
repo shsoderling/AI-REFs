@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..models.citation import CitationCandidate, is_valid_citation
+from ..models.existing_refs import ExistingCitationMap
 from ..models.evidence import ReviewDecision
 from ..models.project import ProjectState
 from ..models.sentence import SentenceRecord
@@ -31,15 +32,17 @@ class RenumberPlan:
     renumber_result: RenumberingResult = field(default_factory=RenumberingResult)
 
 
-def build_renumber_plan(handler, project: ProjectState) -> RenumberPlan:
+def build_renumber_plan(handler, project: ProjectState,
+                        seed_entries: bool = True) -> RenumberPlan:
     """Match DOCX markers to evidence and compute the merged renumbering.
 
     The marker→sentence matching is structural: markers are matched to
-    sentence-marker slots in document order within each paragraph, mirroring
-    the fresh-export logic.
+    sentence-marker slots in document order within each paragraph. A project
+    without an existing-citation map (fresh export) numbers the markers
+    alone, in first-appearance order.
     """
     plan = RenumberPlan()
-    existing = project.existing_citations
+    existing = project.existing_citations or ExistingCitationMap()
 
     plan.markers = handler.find_markers()
 
@@ -93,5 +96,5 @@ def build_renumber_plan(handler, project: ProjectState) -> RenumberPlan:
             citations=resolved_citations,
         ))
 
-    plan.renumber_result = compute_renumbering(existing, new_marker_infos)
+    plan.renumber_result = compute_renumbering(existing, new_marker_infos, seed_entries)
     return plan

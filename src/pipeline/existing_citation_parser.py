@@ -125,6 +125,13 @@ class ExistingCitationParser:
         self._analyze_legacy(result)
         return result
 
+    def _legacy_map(self) -> ExistingCitationMap:
+        """The plain-text reading of the document, regardless of fields
+        (fields are transparent to it). For tests and agreement checks."""
+        result = ExistingCitationMap(tracking=TrackingReport())
+        self._analyze_legacy(result)
+        return result
+
     def _analyze_legacy(self, result: ExistingCitationMap) -> None:
         """Plain-text path: detect heading, parse bib, scan in-text numbers."""
         paragraphs = self.handler.get_paragraphs()

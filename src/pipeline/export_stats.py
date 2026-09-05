@@ -16,6 +16,17 @@ class ExportStats:
     citations_converted: int = 0  # numeric sites converted to author-date
     bibliography_size: int = 0
     output_path: str = ""
+    # Tracked-document counters (embedded citation fields)
+    fields_written: int = 0            # citation fields written (resolved + unresolved)
+    unresolved_fields: int = 0         # fields left as [?] pending a citation
+    legacy_adopted: int = 0            # plain-text citation sites wrapped into fields (-1: not tracked)
+    entries_seeded_uncited: int = 0    # parsed entries nothing cited, kept anyway
+    uncited_dropped: int = 0           # records whose every citation was deleted
+    hand_edits_overwritten: int = 0    # numeric results the user had edited, regenerated
+    hand_edits_preserved: int = 0      # author-date results the user had edited, kept
+    damaged_fields: int = 0            # fields whose payload could not be read
+    bibliography_regenerated: bool = False
+    tables_citations: int = 0          # citation fields in tables / text boxes (not renumbered)
 
     def summary_lines(self) -> list[str]:
         lines = [
@@ -40,4 +51,26 @@ class ExportStats:
                 f"Duplicates merged with existing references: {self.duplicates_merged}"
             )
         lines.append(f"Bibliography entries: {self.bibliography_size}")
+        if self.fields_written:
+            lines.append(f"Citations tracked as embedded fields: {self.fields_written}")
+        elif self.legacy_adopted == -1:
+            lines.append("Document not tracked (plain-text citations)")
+        if self.unresolved_fields:
+            lines.append(f"  • Unresolved fields ([?]) to fill later: {self.unresolved_fields}")
+        if self.legacy_adopted > 0:
+            lines.append(f"Existing citations adopted into tracked fields: {self.legacy_adopted}")
+        if self.entries_seeded_uncited:
+            lines.append(f"Entries kept although nothing cites them: {self.entries_seeded_uncited}")
+        if self.uncited_dropped:
+            lines.append(f"References dropped (no citation left): {self.uncited_dropped}")
+        if self.hand_edits_overwritten:
+            lines.append(f"Hand-edited citation numbers regenerated: {self.hand_edits_overwritten}")
+        if self.hand_edits_preserved:
+            lines.append(f"Hand-edited author-date citations preserved: {self.hand_edits_preserved}")
+        if self.damaged_fields:
+            lines.append(f"Damaged citation fields skipped: {self.damaged_fields}")
+        if self.bibliography_regenerated:
+            lines.append("Bibliography field was missing and has been regenerated")
+        if self.tables_citations:
+            lines.append(f"Citations in tables/text boxes (left as they were): {self.tables_citations}")
         return lines

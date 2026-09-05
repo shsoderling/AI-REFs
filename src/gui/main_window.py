@@ -25,7 +25,7 @@ from ..models.evidence import ReviewDecision
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.docx_export import (
-    ExportBlocked, check_export_guard, fresh_append_needs_confirmation,
+    ExportBlocked, check_export_guard, export_fresh, fresh_append_needs_confirmation,
 )
 from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
@@ -403,136 +403,8 @@ class MainWindow(QMainWindow):
         return self._do_fresh_export(output_path)
 
     def _do_fresh_export(self, output_path: str) -> ExportStats:
-        """Export a fresh document (no pre-existing citations).
-
-        Matches DOCX markers to sentence evidence using paragraph_index
-        (structural matching) instead of text-content heuristics.  Within a
-        paragraph that contains multiple markers, markers are matched to
-        sentences in document order.
-        """
-        handler = DocxHandler(self._project.input_docx_path)
-        style = self._project.settings.citation_style
-
-        # Parse the CSL file once for in-text citation formatting
-        layout = parse_csl_layout(style)
-        is_author_date = layout.is_author_date
-        cite_prefix = layout.prefix
-        cite_suffix = layout.suffix
-        cite_delim = layout.delimiter
-
-        use_superscript = style in SUPERSCRIPT_STYLES
-
-        logger.info(f"Export style: {style.value}  author-date={is_author_date}  "
-                     f"superscript={use_superscript}  "
-                     f"prefix={cite_prefix!r}  suffix={cite_suffix!r}  delim={cite_delim!r}")
-
-        # Build bibliography
-        bib_entries = []
-        bib_number = {}
-        key_index = CitationKeyIndex()
-        current_num = 1
-
-        # ── Build a lookup: paragraph_index → expanded list of (sentence, evidence, ref_index) ──
-        para_to_markers: dict[int, list[tuple]] = defaultdict(list)
-        for sent in self._project.sentences:
-            if sent.marker_type is not None:
-                ev = self._project.evidence_map.get(sent.id)
-                count = max(sent.marker_count, 1)
-                # Per-marker slots whenever the orchestrator ran independent
-                # per-marker searches (SentenceRecord.searched_per_marker).
-                if sent.searched_per_marker:
-                    for ref_idx in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
-                else:
-                    for _ in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, None))
-
-        # ── Collect all markers from the DOCX ──
-        markers = handler.find_markers()
-        para_marker_counter: dict[int, int] = defaultdict(int)
-
-        total_expanded = sum(len(v) for v in para_to_markers.values())
-        logger.info(f"Export: {len(markers)} DOCX markers, "
-                     f"{total_expanded} expanded sentence-marker slots")
-
-        stats = ExportStats(total_markers=len(markers), output_path=output_path)
-
-        for marker_info in markers:
-            para = marker_info['paragraph']
-            para_idx = marker_info['para_index']
-            marker_type = marker_info['marker_type']
-            marker_text = f"({marker_type})"
-
-            expanded_list = para_to_markers.get(para_idx, [])
-            marker_order = para_marker_counter[para_idx]
-            para_marker_counter[para_idx] += 1
-
-            matching_ev = None
-            matching_sent = None
-            ref_index = None
-
-            if marker_order < len(expanded_list):
-                matching_sent, ev, ref_index = expanded_list[marker_order]
-                if ev and ev.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED):
-                    matching_ev = ev
-
-            sent_id = matching_sent.id if matching_sent else "???"
-            sent_preview = (matching_sent.clean_text[:50] + "...") if matching_sent else "NO MATCH"
-            if matching_ev and matching_ev.selected:
-                ref_titles = "; ".join(s.title[:40] for s in matching_ev.selected)
-                logger.info(f"  Marker para={para_idx}[{marker_order}] ref_index={ref_index} -> {sent_id} "
-                            f"({sent_preview}) -> refs=[{ref_titles}]")
-            else:
-                logger.info(f"  Marker para={para_idx}[{marker_order}] -> {sent_id} "
-                            f"({sent_preview}) -> NO EVIDENCE")
-
-            refs_for_marker = []
-            if matching_ev and matching_ev.selected:
-                if ref_index is not None:
-                    if ref_index < len(matching_ev.selected):
-                        refs_for_marker = [matching_ev.selected[ref_index]]
-                else:
-                    refs_for_marker = matching_ev.selected
-                # Placeholder slots ("No citation found") must never become
-                # bibliography entries — drop them so the marker gets [?].
-                refs_for_marker = [c for c in refs_for_marker if is_valid_citation(c)]
-
-            if refs_for_marker:
-                citation_parts = []
-                for sel in refs_for_marker:
-                    bib_key = key_index.key_for_candidate(sel)
-                    if bib_key not in bib_number:
-                        bib_number[bib_key] = current_num
-                        bib_entries.append(self._format_bib_entry(sel, current_num, style))
-                        current_num += 1
-
-                    num = bib_number[bib_key]
-                    if is_author_date:
-                        citation_parts.append(sel.first_author_year)
-                    else:
-                        citation_parts.append(str(num))
-
-                inner = cite_delim.join(citation_parts)
-                replacement = f"{cite_prefix}{inner}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=use_superscript)
-                stats.resolved_markers += 1
-            else:
-                handler.replace_marker_by_regex(para, marker_text, "[?]")
-                stats.unresolved_markers += 1
-                if matching_sent and matching_sent.id not in stats.unresolved_sentence_ids:
-                    stats.unresolved_sentence_ids.append(matching_sent.id)
-                logger.warning(f"  Marker para={para_idx}[{marker_order}] exported as [?]")
-
-        if bib_entries:
-            handler.append_bibliography(bib_entries)
-
-        handler.save(output_path)
-        self._project.output_docx_path = output_path
-        stats.new_refs_added = len(bib_entries)
-        stats.bibliography_size = len(bib_entries)
-        logger.info(f"Exported document with {len(bib_entries)} bibliography entries: {output_path}")
-        return stats
+        """Export a fresh document (no pre-existing citations); headless in docx_export."""
+        return export_fresh(self._project, output_path)
 
     # ── Insert-mode export ────────────────────────────────────────────
 
