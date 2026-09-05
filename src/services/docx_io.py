@@ -2,6 +2,7 @@
 
 import re
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,76 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 logger = logging.getLogger(__name__)
 
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+
+W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
+
+
+def run_text(r_elem) -> str:
+    """Visible text of a ``w:r`` element, matching python-docx's ``CT_R.text``.
+
+    Field code (``w:instrText``) and deleted text (``w:delText``) contribute
+    nothing, exactly as in ``paragraph.text``. Works on any lxml ``w:r``,
+    including nested ones that python-docx's ``Run`` wrapper never exposes.
+    """
+    parts = []
+    for child in r_elem:
+        tag = child.tag
+        if tag == f'{{{W_NS}}}t':
+            parts.append(child.text or '')
+        elif tag in (f'{{{W_NS}}}tab', f'{{{W_NS}}}ptab'):
+            parts.append('\t')
+        elif tag == f'{{{W_NS}}}br':
+            # Only text-wrapping line breaks are text; page and column
+            # breaks are invisible to paragraph.text.
+            if child.get(f'{{{W_NS}}}type', 'textWrapping') == 'textWrapping':
+                parts.append('\n')
+        elif tag == f'{{{W_NS}}}cr':
+            parts.append('\n')
+        elif tag == f'{{{W_NS}}}noBreakHyphen':
+            parts.append('-')
+    return ''.join(parts)
+
+
+def iter_text_runs(paragraph) -> list:
+    """Runs that contribute to ``paragraph.text``, in order.
+
+    python-docx computes ``paragraph.text`` from ``w:r | w:hyperlink`` children,
+    so this is exactly ``./w:r | ./w:hyperlink/w:r``. Use it (and only it) for
+    character-offset arithmetic; a test asserts equality with paragraph.text.
+    """
+    return paragraph._p.xpath('./w:r | ./w:hyperlink/w:r')
+
+
+@dataclass
+class RunInfo:
+    elem: object            # the w:r element
+    deleted: bool           # inside a w:del (tracked deletion)
+    inserted: bool          # inside a w:ins
+
+
+def iter_all_runs(paragraph):
+    """Every ``w:r`` under the paragraph except ``mc:Fallback`` duplicates.
+
+    Reaches runs nested in hyperlinks, tracked changes, content controls and
+    text boxes. For field awareness only -- never for character offsets.
+    """
+    p_elem = paragraph._p
+    for r in p_elem.iter(f'{{{W_NS}}}r'):
+        deleted = inserted = False
+        skip = False
+        anc = r.getparent()
+        while anc is not None and anc is not p_elem:
+            if anc.tag == f'{{{MC_NS}}}Fallback':
+                skip = True
+                break
+            if anc.tag == f'{{{W_NS}}}del':
+                deleted = True
+            elif anc.tag == f'{{{W_NS}}}ins':
+                inserted = True
+            anc = anc.getparent()
+        if not skip:
+            yield RunInfo(elem=r, deleted=deleted, inserted=inserted)
 
 
 class DocxHandler:
