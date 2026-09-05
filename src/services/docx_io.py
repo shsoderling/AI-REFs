@@ -23,6 +23,32 @@ W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
 
 
+def _child_text(child) -> str:
+    """Text one child of a ``w:r`` contributes to ``paragraph.text``, by
+    python-docx's ``CT_R.text`` rules.
+
+    '' for everything that renders without text -- page and column breaks,
+    ``w:sym``, drawings, footnote references, ``w:lastRenderedPageBreak`` --
+    and for field code (``w:instrText``) and deleted text (``w:delText``).
+    """
+    tag = child.tag
+    if tag == f'{{{W_NS}}}t':
+        return child.text or ''
+    if tag in (f'{{{W_NS}}}tab', f'{{{W_NS}}}ptab'):
+        return '\t'
+    if tag == f'{{{W_NS}}}br':
+        # Only text-wrapping line breaks are text; page and column
+        # breaks are invisible to paragraph.text.
+        if child.get(f'{{{W_NS}}}type', 'textWrapping') == 'textWrapping':
+            return '\n'
+        return ''
+    if tag == f'{{{W_NS}}}cr':
+        return '\n'
+    if tag == f'{{{W_NS}}}noBreakHyphen':
+        return '-'
+    return ''
+
+
 def run_text(r_elem) -> str:
     """Visible text of a ``w:r`` element, matching python-docx's ``CT_R.text``.
 
@@ -30,23 +56,7 @@ def run_text(r_elem) -> str:
     nothing, exactly as in ``paragraph.text``. Works on any lxml ``w:r``,
     including nested ones that python-docx's ``Run`` wrapper never exposes.
     """
-    parts = []
-    for child in r_elem:
-        tag = child.tag
-        if tag == f'{{{W_NS}}}t':
-            parts.append(child.text or '')
-        elif tag in (f'{{{W_NS}}}tab', f'{{{W_NS}}}ptab'):
-            parts.append('\t')
-        elif tag == f'{{{W_NS}}}br':
-            # Only text-wrapping line breaks are text; page and column
-            # breaks are invisible to paragraph.text.
-            if child.get(f'{{{W_NS}}}type', 'textWrapping') == 'textWrapping':
-                parts.append('\n')
-        elif tag == f'{{{W_NS}}}cr':
-            parts.append('\n')
-        elif tag == f'{{{W_NS}}}noBreakHyphen':
-            parts.append('-')
-    return ''.join(parts)
+    return ''.join(_child_text(child) for child in r_elem)
 
 
 def iter_text_runs(paragraph) -> list:
@@ -157,9 +167,12 @@ class DocxHandler:
         """Replace the first occurrence of *marker_text* in *paragraph*.
 
         Locates the marker over the text runs, then replaces the touched runs
-        with up to three new ones (before-text | citation | after-text) that
-        carry only their neighbours' ``w:rPr``; every other run is untouched.
-        When *superscript* is True the citation run is superscript and the
+        with up to three new ones (before | citation | after). The before- and
+        after-runs keep their neighbours' ``w:rPr`` and every content child
+        outside the marker (tabs, breaks, symbols, drawings... included, as
+        the elements they are); the citation run is one ``w:t`` under the
+        first touched run's ``w:rPr``. Every other run is untouched. When
+        *superscript* is True the citation run is superscript and the
         after-run loses any superscript; when False the citation run carries
         no vertical alignment.
 
@@ -205,9 +218,9 @@ class DocxHandler:
         return span
 
     @staticmethod
-    def _clone_rpr_only(template_r, text: str, superscript: Optional[bool]):
-        """New ``w:r`` holding a copy of *template_r*'s ``w:rPr`` (and nothing
-        else of it) plus exactly one ``w:t``.
+    def _run_with_rpr(template_r, superscript: Optional[bool]):
+        """New, otherwise empty ``w:r`` carrying a copy of *template_r*'s
+        ``w:rPr`` -- the one child that formatting lives in.
 
         *superscript*: None keeps the template's vertical alignment, True makes
         the run superscript, False removes any vertical alignment.
@@ -225,33 +238,83 @@ class DocxHandler:
                 if rpr is None:
                     rpr = new_r.get_or_add_rPr()
                 rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
+        return new_r
+
+    @staticmethod
+    def _text_elem(text: str):
+        """A ``w:t`` with *text*, whitespace preserved."""
         t = OxmlElement('w:t')
         t.set(qn('xml:space'), 'preserve')
         t.text = text
-        new_r.append(t)
-        return new_r
+        return t
+
+    @staticmethod
+    def _slice_children(r_elem, lo: int, hi: Optional[int]) -> list:
+        """Deep copies of the content children of *r_elem* (everything but
+        ``w:rPr``) that lie within characters [lo, hi] of ``run_text(r_elem)``;
+        *hi* None means the end of the run.
+
+        A ``w:t`` straddling a bound is cut to the part inside; a tab, break
+        or hyphen is one character and so wholly in or out. Children that
+        contribute no text (page breaks, ``w:sym``, drawings, footnote
+        references...) are kept when they sit anywhere in the range, bounds
+        included: a page break right after a marker stays with the text after
+        it, a symbol right before stays with the text before.
+        """
+        out, pos = [], 0
+        for child in r_elem:
+            if child.tag == qn('w:rPr'):
+                continue
+            start = pos
+            end = pos = start + len(_child_text(child))
+            if start == end:                                    # zero-width
+                if lo <= start and (hi is None or start <= hi):
+                    out.append(copy.deepcopy(child))
+                continue
+            cut_lo = max(start, lo)
+            cut_hi = end if hi is None else min(end, hi)
+            if cut_lo >= cut_hi:
+                continue
+            piece = copy.deepcopy(child)
+            if (cut_lo, cut_hi) != (start, end):                # only a w:t can straddle
+                piece.text = (child.text or '')[cut_lo - start:cut_hi - start]
+                piece.set(qn('xml:space'), 'preserve')
+            out.append(piece)
+        return out
 
     def _split_and_emit(self, span: MarkerSpan, replacement: str, superscript: bool):
         """Replace the runs of *span* with before | citation | after runs.
 
-        The before-run keeps the first touched run's formatting. The citation
-        run is superscript iff *superscript*, never inheriting vertical
-        alignment from its neighbour. The after-run keeps the last touched
-        run's formatting, except that a superscript citation must not bleed
-        into it. Returns the citation run element.
+        The touched runs are split at the child level. The before-run carries
+        the first touched run's ``w:rPr`` and every content child of it up to
+        the marker; the after-run carries the last touched run's ``w:rPr`` and
+        every content child of it from the marker on. A ``w:t`` is cut at the
+        marker; a ``w:tab``, ``w:br``, ``w:sym``, ``w:drawing``... survives as
+        the element it is, in place. Only the marker text -- and any textless
+        child strictly inside it -- is replaced. Whole runs between the first
+        and the last touched run lie entirely inside the marker.
+
+        The citation run holds exactly one ``w:t`` and is superscript iff
+        *superscript*, never inheriting vertical alignment from its
+        neighbour; a superscript citation must not bleed into the after-run,
+        which then loses any superscript. Returns the citation run element.
         """
         runs, first, first_off, last, last_off = span
         first_r, last_r = runs[first], runs[last]
-        text_before = run_text(first_r)[:first_off]
-        text_after = run_text(last_r)[last_off:]
+        before = self._slice_children(first_r, 0, first_off)
+        after = self._slice_children(last_r, last_off, None)
         new_runs = []
-        if text_before:
-            new_runs.append(self._clone_rpr_only(first_r, text_before, None))
-        cite = self._clone_rpr_only(first_r, replacement, bool(superscript))
+        if before:
+            before_r = self._run_with_rpr(first_r, None)
+            before_r.extend(before)
+            new_runs.append(before_r)
+        cite = self._run_with_rpr(first_r, bool(superscript))
+        cite.append(self._text_elem(replacement))
         new_runs.append(cite)
-        if text_after:
-            new_runs.append(self._clone_rpr_only(last_r, text_after,
-                                                 False if superscript else None))
+        if after:
+            after_r = self._run_with_rpr(last_r, False if superscript else None)
+            after_r.extend(after)
+            new_runs.append(after_r)
         # Insert after the last touched run (inside its hyperlink, if any),
         # then drop the touched runs from wherever each of them lives.
         for r in reversed(new_runs):

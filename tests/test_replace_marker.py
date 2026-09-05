@@ -2,11 +2,14 @@
 runs into before | cite | after, and never touch a run that belongs to a field."""
 
 import pytest
-from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from src.services.docx_io import DocxHandler, FieldBoundaryError, W_NS
-from tests.fixture_builders import DocBuilder
+from tests.fixture_builders import DocBuilder, run_texts, special
+
+
+def _tags(r_elem) -> list[str]:
+    return [c.tag for c in r_elem]
 
 
 def _handler(tmp_path, build):
@@ -47,26 +50,74 @@ def test_multi_wt_run_is_not_duplicated(tmp_path):
     para = h.get_paragraphs()[0]
     h.replace_marker_by_regex(para, "(REF)", "[1]")
     assert para.text == "Alpha [1] omega"
-    # one w:t per new run
-    for r in para.runs:
-        assert len(r._r.findall(f"{{{W_NS}}}t")) == 1
+    # the untouched w:t of the split run appear once, in their own runs
+    assert run_texts(para) == ["Alpha ", "[1]", " omega"]
 
 
-def test_new_runs_clone_only_rpr(tmp_path):
-    """Formatting travels via w:rPr alone; other run children never do."""
+def test_new_runs_carry_rpr_and_keep_neighbour_children(tmp_path):
+    """Formatting travels via w:rPr; the citation run holds nothing but its
+    w:t; the neighbours keep the non-text children that were theirs."""
     def build(b):
         p = b.paragraph("")
         r = p.add_run("bold (REF) tail")
         r.font.bold = True
-        r._r.append(OxmlElement("w:lastRenderedPageBreak"))
+        r._r.append(special("w:lastRenderedPageBreak"))
     h = _handler(tmp_path, build)
     para = h.get_paragraphs()[0]
     cite = h.replace_marker_by_regex(para, "(REF)", "5", superscript=True)
     assert para.text == "bold 5 tail"
     assert cite is para.runs[1]._r
-    for r in para.runs:
-        assert [c.tag for c in r._r] == [qn("w:rPr"), qn("w:t")]
-        assert r.font.bold is True
+    before, cite_r, after = (r._r for r in para.runs)
+    assert _tags(before) == [qn("w:rPr"), qn("w:t")]
+    assert _tags(cite_r) == [qn("w:rPr"), qn("w:t")]
+    assert _tags(after) == [qn("w:rPr"), qn("w:t"), qn("w:lastRenderedPageBreak")]
+    assert [r.font.bold for r in para.runs] == [True, True, True]
+    assert [r.font.superscript for r in para.runs] == [None, True, None]
+
+
+def test_special_children_of_the_marker_run_survive_in_place(tmp_path):
+    """Word packs tabs, soft line breaks, page breaks and symbols into the
+    same run as neighbouring text. Splitting that run must keep each of them
+    as the element it was -- never flattened into w:t text, never dropped."""
+    def build(b):
+        p = b.paragraph("")
+        b.add_mixed_run(p, ["Aim 1", special("w:tab"), "We show X (REF).",
+                            special("w:br"), "Next line",
+                            special("w:br", type="page"),
+                            special("w:sym", font="Symbol", char="F061")])
+    h = _handler(tmp_path, build)
+    para = h.get_paragraphs()[0]
+    h.replace_marker_by_regex(para, "(REF)", "[1]")
+    assert para.text == "Aim 1\tWe show X [1].\nNext line"
+    assert run_texts(para) == ["Aim 1\tWe show X ", "[1]", ".\nNext line"]
+    before, cite, after = para._p.findall(qn("w:r"))
+    assert _tags(before) == [qn("w:t"), qn("w:tab"), qn("w:t")]
+    assert _tags(cite) == [qn("w:t")]
+    assert _tags(after) == [qn("w:t"), qn("w:br"), qn("w:t"), qn("w:br"), qn("w:sym")]
+    assert after[1].get(qn("w:type")) is None                 # soft line break
+    assert after[3].get(qn("w:type")) == "page"
+    assert (after[4].get(qn("w:font")), after[4].get(qn("w:char"))) == ("Symbol", "F061")
+    for t in para._p.iter(qn("w:t")):                          # no literal controls
+        assert "\t" not in t.text and "\n" not in t.text
+
+
+def test_zero_width_children_at_the_marker_bounds_are_kept(tmp_path):
+    """A symbol right before the marker and a page break right after it
+    contribute no text, so they sit exactly on the span bounds; they belong
+    to the neighbours. The after-run is emitted even when it has no text."""
+    def build(b):
+        p = b.paragraph("")
+        b.add_mixed_run(p, ["Text ", special("w:sym", font="Symbol", char="F061"), "(RE"])
+        b.add_mixed_run(p, ["F)", special("w:br", type="page")], superscript=True)
+    h = _handler(tmp_path, build)
+    para = h.get_paragraphs()[0]
+    h.replace_marker_by_regex(para, "(REF)", "3", superscript=True)
+    assert para.text == "Text 3"
+    before, cite, after = para._p.findall(qn("w:r"))
+    assert _tags(before) == [qn("w:t"), qn("w:sym")]
+    assert _tags(cite) == [qn("w:rPr"), qn("w:t")]
+    assert _tags(after) == [qn("w:rPr"), qn("w:br")]
+    assert after.find(qn("w:rPr")).find(qn("w:vertAlign")) is None   # superscript stripped
     assert [r.font.superscript for r in para.runs] == [None, True, None]
 
 

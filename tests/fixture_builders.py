@@ -26,6 +26,17 @@ def run_texts(paragraph) -> list[str]:
     return [r.text for r in paragraph.runs]
 
 
+def special(tag: str, **attrs):
+    """A non-text run child, the kind Word packs into the same run as its
+    neighbouring text: ``special("w:tab")``, ``special("w:br")`` (soft line
+    break), ``special("w:br", type="page")``, ``special("w:sym", font="Symbol",
+    char="F061")``. Attributes are ``w:``-namespaced."""
+    el = OxmlElement(tag)
+    for name, value in attrs.items():
+        el.set(qn(f"w:{name}"), value)
+    return el
+
+
 def make_run(text: str | None = None, *, instr: str | None = None,
              fldchar: str | None = None, superscript: bool = False,
              deleted: bool = False, fld_lock: bool = False):
@@ -82,12 +93,22 @@ class DocBuilder:
         return r
 
     def add_multi_wt_run(self, paragraph, texts: list[str]):
-        r = OxmlElement("w:r")
-        for tx in texts:
-            t = OxmlElement("w:t")
-            t.set(qn("xml:space"), "preserve")
-            t.text = tx
-            r.append(t)
+        return self.add_mixed_run(paragraph, texts)
+
+    def add_mixed_run(self, paragraph, parts: list, *, superscript: bool = False):
+        """Append one run whose children are, in order, a ``w:t`` for every
+        str in *parts* and the element itself for anything else (see
+        ``special``) -- a tab, soft line break, page break or symbol sharing
+        a run with its neighbouring text, as Word writes them."""
+        r = make_run(superscript=superscript)
+        for part in parts:
+            if isinstance(part, str):
+                t = OxmlElement("w:t")
+                t.set(qn("xml:space"), "preserve")
+                t.text = part
+                r.append(t)
+            else:
+                r.append(part)
         paragraph._p.append(r)
         return r
 

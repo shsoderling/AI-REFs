@@ -893,7 +893,7 @@ git commit -m "feat(docx): complex-field reader and FieldIndex"
 
 **Behaviour:**
 - `DocxHandler.fields` is a lazily built `FieldIndex`; `DocxHandler.invalidate_fields()` clears it. Every structural edit method calls `invalidate_fields()`.
-- `replace_marker_by_regex(paragraph, marker_text, replacement, superscript=False)` keeps its signature (call sites: `main_window.py`, `renumber_apply.py`, `author_date_convert.py`) but is now: `_locate_span(paragraph, marker_text)` → `(first_run, first_offset_in_run, last_run, last_offset_in_run)` over `iter_text_runs`; raise `FieldBoundaryError` if any touched run is `fields.in_field`; then `_split_and_emit(...)` builds up to three new runs cloning **only** `w:rPr` (never other children) with exactly one `w:t`, inserts them after the last touched run and removes the touched runs. Returns the new citation run element. The `if not runs` and the run-scanning fallbacks are deleted — if `marker_text in paragraph.text`, `_locate_span` always finds it.
+- `replace_marker_by_regex(paragraph, marker_text, replacement, superscript=False)` keeps its signature (call sites: `main_window.py`, `renumber_apply.py`, `author_date_convert.py`) but is now: `_locate_span(paragraph, marker_text)` → `(first_run, first_offset_in_run, last_run, last_offset_in_run)` over `iter_text_runs`; raise `FieldBoundaryError` if any touched run is `fields.in_field`; then `_split_and_emit(...)` builds up to three new runs (before | citation | after), each carrying a copy of its neighbour's `w:rPr` (formatting travels through `w:rPr` alone). The before-run keeps every content child of the first touched run up to the marker and the after-run every content child of the last touched run from the marker on: a straddling `w:t` is cut, while `w:tab`, `w:br` (soft and page), `w:sym`, `w:drawing`, footnote references... are deep-copied as the elements they are (Word packs them into the same run as adjacent same-formatted text; flattening them through `run_text()` would turn tabs and line breaks into literal control characters and drop everything else). The citation run holds exactly one `w:t`. Insert the new runs after the last touched run and remove the touched runs. Returns the new citation run element. The `if not runs` and the run-scanning fallbacks are deleted — if `marker_text in paragraph.text`, `_locate_span` always finds it.
 - `_collapse_and_replace_superscript` raises `FieldBoundaryError` if the paragraph contains any `w:fldChar`; otherwise unchanged. It is no longer reachable from `replace_marker_by_regex` (kept only for backward compatibility of tests; delete if no test uses it).
 
 **Step 1: Write the failing test**
@@ -945,9 +945,33 @@ def test_multi_wt_run_is_not_duplicated(tmp_path):
     para = h.get_paragraphs()[0]
     h.replace_marker_by_regex(para, "(REF)", "[1]")
     assert para.text == "Alpha [1] omega"
-    # one w:t per new run
-    for r in para.runs:
-        assert len(r._r.findall("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")) == 1
+    # the untouched w:t of the split run appear once, in their own runs
+    assert run_texts(para) == ["Alpha ", "[1]", " omega"]
+
+
+def test_special_children_of_the_marker_run_survive_in_place(tmp_path):
+    # `special(tag, **w_attrs)` and `DocBuilder.add_mixed_run(p, parts)` live
+    # in tests/fixture_builders.py: parts are str (-> w:t) or special() elements.
+    from docx.oxml.ns import qn
+    from tests.fixture_builders import special
+
+    def build(b):
+        p = b.paragraph("")
+        b.add_mixed_run(p, ["Aim 1", special("w:tab"), "We show X (REF).",
+                            special("w:br"), "Next line",
+                            special("w:br", type="page"),
+                            special("w:sym", font="Symbol", char="F061")])
+    h = _handler(tmp_path, build)
+    para = h.get_paragraphs()[0]
+    h.replace_marker_by_regex(para, "(REF)", "[1]")
+    assert para.text == "Aim 1\tWe show X [1].\nNext line"
+    before, cite, after = para._p.findall(qn("w:r"))
+    assert [c.tag for c in before] == [qn("w:t"), qn("w:tab"), qn("w:t")]
+    assert [c.tag for c in cite] == [qn("w:t")]
+    assert [c.tag for c in after] == [qn("w:t"), qn("w:br"), qn("w:t"), qn("w:br"), qn("w:sym")]
+    assert after[3].get(qn("w:type")) == "page"
+    for t in para._p.iter(qn("w:t")):          # never literal control characters
+        assert "\t" not in t.text and "\n" not in t.text
 
 
 def test_refuses_to_touch_a_field_result(tmp_path):
@@ -1069,52 +1093,87 @@ Replace the body of `replace_marker_by_regex` with:
         return runs, first[0], first[1], last[0], last[1]
 
     @staticmethod
-    def _clone_rpr_only(template_r, text: str, superscript: bool | None):
-        """New w:r with a copy of template's rPr (only) and one w:t."""
+    def _run_with_rpr(template_r, superscript: bool | None):
+        """New, otherwise empty w:r with a copy of template's rPr (only).
+        superscript: None keeps vertAlign, True sets it, False strips it."""
         import copy
-        from lxml import etree
-        new_r = etree.SubElement(etree.Element(f'{{{W_NS}}}dummy'), f'{{{W_NS}}}r')
-        rpr = template_r.find(f'{{{W_NS}}}rPr')
+        new_r = OxmlElement('w:r')
+        rpr = template_r.find(qn('w:rPr'))
         if rpr is not None:
-            new_r.append(copy.deepcopy(rpr))
+            rpr = copy.deepcopy(rpr)
+            new_r.append(rpr)
         if superscript is not None:
-            rpr = new_r.find(f'{{{W_NS}}}rPr')
-            if rpr is None:
-                rpr = etree.SubElement(new_r, f'{{{W_NS}}}rPr')
-                new_r.insert(0, rpr)
-            for va in rpr.findall(f'{{{W_NS}}}vertAlign'):
-                rpr.remove(va)
+            if rpr is not None:
+                for va in rpr.findall(qn('w:vertAlign')):
+                    rpr.remove(va)
             if superscript:
-                etree.SubElement(rpr, f'{{{W_NS}}}vertAlign', {f'{{{W_NS}}}val': 'superscript'})
-        t = etree.SubElement(new_r, f'{{{W_NS}}}t')
-        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-        t.text = text
+                if rpr is None:
+                    rpr = new_r.get_or_add_rPr()
+                rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
         return new_r
 
-    def _split_and_emit(self, paragraph, span, replacement: str, superscript: bool):
+    @staticmethod
+    def _text_elem(text: str):
+        t = OxmlElement('w:t')
+        t.set(qn('xml:space'), 'preserve')
+        t.text = text
+        return t
+
+    @staticmethod
+    def _slice_children(r_elem, lo: int, hi: int | None) -> list:
+        """Deep copies of r_elem's content children (all but w:rPr) within
+        characters [lo, hi] of run_text(r_elem); hi None = end of run. A w:t
+        straddling a bound is cut to the part inside; a tab/break/hyphen is one
+        character and so wholly in or out; zero-width children (page breaks,
+        w:sym, drawings, footnote references...) are kept, bounds included."""
+        import copy
+        out, pos = [], 0
+        for child in r_elem:
+            if child.tag == qn('w:rPr'):
+                continue
+            start = pos
+            end = pos = start + len(_child_text(child))   # run_text's per-child rule
+            if start == end:
+                if lo <= start and (hi is None or start <= hi):
+                    out.append(copy.deepcopy(child))
+                continue
+            cut_lo = max(start, lo)
+            cut_hi = end if hi is None else min(end, hi)
+            if cut_lo >= cut_hi:
+                continue
+            piece = copy.deepcopy(child)
+            if (cut_lo, cut_hi) != (start, end):              # only a w:t can straddle
+                piece.text = (child.text or '')[cut_lo - start:cut_hi - start]
+                piece.set(qn('xml:space'), 'preserve')
+            out.append(piece)
+        return out
+
+    def _split_and_emit(self, span, replacement: str, superscript: bool):
         runs, fi, fo, li, lo = span
         first_r, last_r = runs[fi], runs[li]
-        text_before = run_text(first_r)[:fo]
-        text_after = run_text(last_r)[lo:]
+        before = self._slice_children(first_r, 0, fo)
+        after = self._slice_children(last_r, lo, None)
         new_runs = []
-        if text_before:
-            new_runs.append(self._clone_rpr_only(first_r, text_before, None))
-        cite = self._clone_rpr_only(first_r, replacement, True if superscript else (False if superscript is False and first_r.find(f'{{{W_NS}}}rPr') is not None and first_r.find(f'{{{W_NS}}}rPr').find(f'{{{W_NS}}}vertAlign') is not None else None))
+        if before:
+            r = self._run_with_rpr(first_r, None)
+            r.extend(before)
+            new_runs.append(r)
+        cite = self._run_with_rpr(first_r, bool(superscript))
+        cite.append(self._text_elem(replacement))
         new_runs.append(cite)
-        if text_after:
-            new_runs.append(self._clone_rpr_only(last_r, text_after, False if superscript else None))
-        anchor = last_r
+        if after:                       # emitted even when it holds no text (e.g. only a page break)
+            r = self._run_with_rpr(last_r, False if superscript else None)
+            r.extend(after)
+            new_runs.append(r)
         for r in reversed(new_runs):
-            anchor.addnext(r)
-        parent = None
-        for i in range(fi, li + 1):
-            parent = runs[i].getparent()
-            parent.remove(runs[i])
+            last_r.addnext(r)
+        for r in runs[fi:li + 1]:
+            r.getparent().remove(r)
         self.invalidate_fields()
         return cite
 ```
 
-Simplify the `cite` superscript expression to: `sup = True if superscript else None` and, when `superscript` is False and the template run has `vertAlign`, pass `False` so a citation inserted into a superscript template is not superscript. Keep the `text_after` rule from today: strip superscript from the after-run only when inserting a superscript citation.
+`_child_text(child)` is the per-child rule `run_text` (Task 2) is made of -- factor `run_text` as `''.join(_child_text(c) for c in r_elem)` so the slicer and `paragraph.text` can never disagree on offsets. Never rebuild the before/after runs from `run_text()` as a single `w:t`: that turns `w:tab` / `w:br` into literal `\t` / `\n` inside `w:t` (Word does not render them as tabs or line breaks; python-docx's own `Run.text` setter emits `w:tab` / `w:br` for exactly this reason) and silently drops page breaks, `w:sym`, drawings and footnote references that share the run. The citation run is superscript iff `superscript` (so a citation inserted into a superscript template with `superscript=False` is not superscript); keep the after-run rule from today: strip superscript from it only when inserting a superscript citation.
 
 `_collapse_and_replace_superscript`: add at the top
 
