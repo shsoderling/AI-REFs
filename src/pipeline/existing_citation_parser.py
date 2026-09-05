@@ -8,6 +8,7 @@ Detects and extracts:
 
 import re
 import logging
+from ..models.embedded import DocumentTier, TrackingReport
 from ..models.existing_refs import ExistingBibEntry, ExistingCitationMap, InTextCitation
 from ..services.docx_io import DocxHandler
 from .citation_numbers import expand_bracket_numbers
@@ -54,14 +55,57 @@ class ExistingCitationParser:
         self.handler = handler
 
     def analyze(self) -> ExistingCitationMap:
-        """Full analysis: detect heading, parse bib, scan in-text numbers."""
+        """Full analysis, reported through ``result.tracking``.
+
+        Never raises: a failure becomes a ``DocumentTier.FAILED`` report
+        whose ``problems`` carry the error, and nothing else in the map is
+        trusted. Fields are counted first (ours, foreign, out of flow); a
+        document with AIREFS.CITE fields goes to the tracked reader, any
+        other to the plain-text (legacy) path.
+        """
         result = ExistingCitationMap()
+        report = TrackingReport()
+        result.tracking = report
+        try:
+            idx = self.handler.fields
+            report.field_count = idx.airefs_cite
+            report.bibl_field_count = idx.airefs_bibl
+            report.foreign_field_count = idx.foreign
+            report.fields_in_tables = idx.out_of_flow    # tables and text boxes alike
+            result.pending_tracked_changes = idx.pending_tracked_changes
+            if report.foreign_field_count:
+                report.problems.append(
+                    f"{report.foreign_field_count} citation field(s) from another "
+                    "reference manager were found. They are left untouched; "
+                    "export is disabled.")
+            if idx.airefs_cite:
+                return self._analyze_tracked(result, idx)
+            self._analyze_legacy(result)
+            report.tier = DocumentTier.LEGACY
+        except Exception as exc:                          # never raise: report instead
+            logger.exception("Existing-citation analysis failed")
+            result = ExistingCitationMap(tracking=TrackingReport(
+                tier=DocumentTier.FAILED, problems=[f"{type(exc).__name__}: {exc}"]))
+        return result
+
+    def _analyze_tracked(self, result: ExistingCitationMap, idx) -> ExistingCitationMap:
+        """Read a document that carries AIREFS.CITE fields.
+
+        Placeholder until the field reader exists (Task 16): the document is
+        read the legacy way and keeps ``DocumentTier.LEGACY``.
+        """
+        self._analyze_legacy(result)
+        return result
+
+    def _analyze_legacy(self, result: ExistingCitationMap) -> None:
+        """Plain-text path: detect heading, parse bib, scan in-text numbers."""
         paragraphs = self.handler.get_paragraphs()
 
         # Step 1: Find the References heading
         refs_start_idx = self._find_references_heading(paragraphs)
+        result.heading_para_idx_found = refs_start_idx >= 0
         if refs_start_idx < 0:
-            return result
+            return
         result.references_heading_para_idx = refs_start_idx
 
         # Step 2: Parse bibliography entries
@@ -88,7 +132,6 @@ class ExistingCitationParser:
             f"max number={result.max_existing_number}, "
             f"superscript={result.detected_style_is_superscript}"
         )
-        return result
 
     def _find_references_heading(self, paragraphs) -> int:
         """Find the paragraph index of the References heading."""

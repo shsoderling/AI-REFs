@@ -5,6 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from .citation import CitationCandidate
+from .embedded import TrackingReport
 
 
 class ExistingBibEntry(BaseModel):
@@ -21,15 +22,6 @@ class ExistingBibEntry(BaseModel):
     pmid: str = Field(default="")
     # If matched to a CitationCandidate (e.g. via PubMed fetch)
     matched_candidate: Optional[CitationCandidate] = Field(default=None)
-
-    @property
-    def bib_key(self) -> str:
-        """Stable key for deduplication: PMID > DOI > positional fallback."""
-        if self.pmid:
-            return self.pmid
-        if self.doi:
-            return self.doi
-        return f"existing_{self.original_number}"
 
 
 class InTextCitation(BaseModel):
@@ -56,6 +48,20 @@ class ExistingCitationMap(BaseModel):
     # Detected style properties
     detected_style_is_superscript: bool = Field(default=True)
     detected_style_is_author_date: bool = Field(default=False)
+
+    # How the document was read: tier, field counts, problems.
+    # None only before analyze() has run.
+    tracking: Optional[TrackingReport] = Field(default=None)
+
+    # A citation field has a run under a tracked insertion, deletion or move
+    pending_tracked_changes: bool = Field(default=False)
+
+    # Body-paragraph indices (first, last) spanned by the AIREFS.BIBL field;
+    # (-1, -1) when there is none (legacy documents, missing field)
+    bibliography_span: tuple[int, int] = Field(default=(-1, -1))
+
+    # False when analysis ran but found no References heading
+    heading_para_idx_found: bool = Field(default=True)
 
     @property
     def has_existing_citations(self) -> bool:
