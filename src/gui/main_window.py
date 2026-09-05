@@ -1,7 +1,6 @@
 """Main window for AI REFs application."""
 
 import os
-import re
 import shutil
 import logging
 import hashlib
@@ -25,8 +24,8 @@ from ..models.evidence import ReviewDecision
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.docx_export import (
-    STRIPPED_NOTE, ExportBlocked, check_export_guard, export_fresh, export_tracked,
-    fresh_append_needs_confirmation, looks_stripped,
+    STRIPPED_NOTE, ExportBlocked, ExportDecisions, check_export_guard, export_fresh,
+    export_legacy, export_tracked, fresh_append_needs_confirmation, looks_stripped,
 )
 from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
@@ -35,10 +34,7 @@ from ..pipeline.renumber_plan import build_renumber_plan
 from ..pipeline.export_stats import ExportStats
 from ..pipeline.renumber_apply import apply_renumbering
 from ..pipeline.bib_format import format_bib_entry
-from ..pipeline.author_date_convert import (
-    build_author_date_labels, convert_in_text_to_author_date,
-    build_author_date_bibliography,
-)
+from ..pipeline.author_date_convert import build_author_date_labels
 from ..models.citation import is_valid_citation
 from ..storage.project_io import save_project, load_project
 from .inputs_tab import InputsTab
@@ -440,43 +436,22 @@ class MainWindow(QMainWindow):
     # ── Insert-mode export ────────────────────────────────────────────
 
     def _do_insert_export(self, output_path: str) -> Optional[ExportStats]:
-        """Export a document in insert mode: resolve new markers + renumber.
+        """Export a plain-text (legacy) document; headless in docx_export.
 
-        Steps:
-        1. Match new (REF)/(REFS) markers to their resolved citations
-        2. Compute merged renumbering across existing + new citations
-        3. Renumber all existing in-text citation numbers (before inserting new ones)
-        4. Replace new markers with assigned citation numbers
-        5. Remove old References section and append merged bibliography
-
-        Returns export statistics, or None if the user cancelled.
+        Only the questions the user must answer live here. Returns None if
+        the user cancelled.
         """
-        handler = DocxHandler(self._project.input_docx_path)
         existing = self._project.existing_citations
         style = self._project.settings.citation_style
-
-        layout = parse_csl_layout(style)
-        is_author_date = layout.is_author_date
-        cite_prefix = layout.prefix
-        cite_suffix = layout.suffix
-        cite_delim = layout.delimiter
-        use_superscript = style in SUPERSCRIPT_STYLES
-
-        # An author-date style cannot coherently merge with a numerically-cited
-        # document unless the existing numeric citations are converted too.
-        # Offer the conversion when every cited entry has author/year info
-        # (best with PubMed enrichment); otherwise fall back to numeric.
-        convert_existing_to_author_date = False
-        author_date_labels = None
-        if is_author_date and existing.in_text_citations:
-            author_date_labels = build_author_date_labels(existing)
-            if author_date_labels.missing:
-                n_missing = len(author_date_labels.missing)
+        decisions = ExportDecisions()
+        if parse_csl_layout(style).is_author_date and existing.in_text_citations:
+            labels = build_author_date_labels(existing)
+            if labels.missing:
                 choice = QMessageBox.question(
                     self, "Citation Style Mismatch",
                     "This document uses numbered citations and the selected "
                     "style is author-date, but author/year information could "
-                    f"not be determined for {n_missing} existing reference(s) "
+                    f"not be determined for {len(labels.missing)} existing reference(s) "
                     "(enable 'Enrich existing' and re-run the pipeline to "
                     "improve this).\n\n"
                     "Export using the document's numeric style instead?",
@@ -484,15 +459,16 @@ class MainWindow(QMainWindow):
                 )
                 if choice != QMessageBox.StandardButton.Yes:
                     return None
-                is_author_date = False
+                decisions.convert_to_author_date = False
             else:
                 choice = QMessageBox.question(
                     self, "Convert to Author-Date?",
                     "This document uses numbered citations. Convert all "
-                    f"{len(author_date_labels.labels)} existing in-text "
+                    f"{len(labels.labels)} existing in-text "
                     "citations to author-date format (e.g. \"Smith et al., "
                     "2020\")?\n\n"
-                    "Yes: convert everything to author-date.\n"
+                    "Yes: convert everything to author-date (the document will "
+                    "not be tracked).\n"
                     "No: keep the document's numeric style.",
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.No
@@ -500,152 +476,8 @@ class MainWindow(QMainWindow):
                 )
                 if choice == QMessageBox.StandardButton.Cancel:
                     return None
-                if choice == QMessageBox.StandardButton.Yes:
-                    convert_existing_to_author_date = True
-                else:
-                    is_author_date = False
-
-        # Author-date in-text citations need parenthesized, "; "-joined text;
-        # fall back to that when the CSL layout gives empty delimiters.
-        if is_author_date and not (cite_prefix or cite_suffix):
-            cite_prefix, cite_suffix, cite_delim = "(", ")", "; "
-
-        # New citations must match the EXISTING document's in-text style, not
-        # the nominal CSL delimiters — otherwise renumbered existing citations
-        # (which keep their original brackets/superscript) and freshly inserted
-        # ones would look different (e.g. existing "[3]" next to new "(2)").
-        if not is_author_date:
-            use_superscript = existing.detected_style_is_superscript
-            if use_superscript:
-                cite_prefix, cite_suffix, cite_delim = "", "", ","
-            else:
-                cite_prefix, cite_suffix, cite_delim = "[", "]", ", "
-
-        logger.info(f"Insert-mode export: style={style.value}  "
-                     f"existing_refs={len(existing.bib_entries)}  "
-                     f"superscript={use_superscript}")
-
-        # ── Steps 1+2: Match markers to evidence and compute renumbering ──
-        plan = build_renumber_plan(handler, self._project)
-        markers = plan.markers
-        marker_resolved_map = plan.marker_resolved_map
-        marker_sentences = plan.marker_sentences
-        renumber_result = plan.renumber_result
-        renumber_map = renumber_result.renumber_map
-
-        stats = ExportStats(total_markers=len(markers), output_path=output_path)
-
-        logger.info(f"Renumbering: {len(renumber_result.assignments)} total citations, "
-                     f"renumber_map has {sum(1 for o, n in renumber_map.items() if o != n)} changes")
-
-        # ── Step 3: Update existing in-text citations ──
-        # Must happen BEFORE replacing new markers, otherwise the newly-inserted
-        # citation text would be caught and double-processed.
-        if convert_existing_to_author_date:
-            converted = convert_in_text_to_author_date(
-                handler, existing, author_date_labels.labels,
-                prefix=cite_prefix, suffix=cite_suffix, delimiter=cite_delim,
-            )
-            stats.citations_converted = converted
-        elif not is_author_date and any(o != n for o, n in renumber_map.items()):
-            self._renumber_existing_citations(handler, existing, renumber_map)
-
-        # ── Step 4: Replace new (REF)/(REFS) markers ──
-        merged_duplicate_numbers: set[int] = set()
-        for i, marker_info in enumerate(markers):
-            para = marker_info['paragraph']
-            marker_type = marker_info['marker_type']
-            marker_text = f"({marker_type})"
-            resolved = marker_resolved_map[i]
-
-            if resolved and not is_author_date:
-                citation_numbers = []
-                for cand in resolved:
-                    num = renumber_result.number_for_candidate(cand)
-                    if num is not None:
-                        citation_numbers.append(num)
-                        if not renumber_result.assignments[num].is_new:
-                            merged_duplicate_numbers.add(num)
-
-                inner = cite_delim.join(str(n) for n in citation_numbers)
-                replacement = f"{cite_prefix}{inner}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=use_superscript)
-                stats.resolved_markers += 1
-            elif resolved and is_author_date:
-                parts = [cand.first_author_year for cand in resolved]
-                replacement = f"{cite_prefix}{cite_delim.join(parts)}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=False)
-                stats.resolved_markers += 1
-            else:
-                handler.replace_marker_by_regex(para, marker_text, "[?]")
-                stats.unresolved_markers += 1
-                sent = marker_sentences[i]
-                if sent and sent.id not in stats.unresolved_sentence_ids:
-                    stats.unresolved_sentence_ids.append(sent.id)
-                logger.warning(f"  Insert-mode marker {i} exported as [?]")
-
-        # ── Step 5: Remove old References section, build merged bibliography ──
-        span_end = existing.bibliography_span[1]
-        removed = handler.remove_references_section(
-            existing.references_heading_para_idx,
-            span_end if span_end >= 0 else None)
-        logger.info(f"Removed {removed} References paragraphs for "
-                    f"{len(existing.bib_entries)} parsed entries")
-        if is_author_date:
-            merged_bib = build_author_date_bibliography(
-                existing, renumber_result, style)
-        else:
-            merged_bib = self._build_merged_bibliography(
-                existing, renumber_result, style)
-        if merged_bib:
-            handler.append_bibliography(merged_bib)
-
-        handler.save(output_path)
-        self._project.output_docx_path = output_path
-        stats.new_refs_added = sum(
-            1 for a in renumber_result.assignments.values() if a.is_new)
-        stats.existing_refs_renumbered = sum(
-            1 for o, n in renumber_map.items() if o != n)
-        stats.duplicates_merged = len(merged_duplicate_numbers)
-        stats.bibliography_size = len(merged_bib)
-        logger.info(f"Insert-mode export complete: {len(merged_bib)} bibliography entries: {output_path}")
-        return stats
-
-    def _renumber_existing_citations(self, handler: DocxHandler,
-                                      existing, renumber_map: dict[int, int]):
-        """Update existing in-text citation numbers (delegates to pipeline)."""
-        apply_renumbering(handler, existing, renumber_map)
-
-    def _build_merged_bibliography(self, existing, renumber_result, style: CitationStyle) -> list[str]:
-        """Build the final merged bibliography in correct number order.
-
-        Combines existing entries (with updated numbers) and new entries.
-        """
-        entries = []
-        for num in sorted(renumber_result.assignments.keys()):
-            assignment = renumber_result.assignments[num]
-            if assignment.is_new and assignment.candidate:
-                entry = self._format_bib_entry(assignment.candidate, num, style)
-            else:
-                # Re-use existing entry text with updated number
-                old_entry = existing.bib_entries.get(assignment.original_number)
-                if old_entry:
-                    # The parser stored the entry body (text after the number);
-                    # for older saved projects fall back to stripping the
-                    # number prefix, handling "1.", "1)" and "[1]" formats.
-                    body = old_entry.body or re.sub(
-                        r'^\[?\d+[.\s)\]]*\s*', '', old_entry.raw_text, count=1)
-                    entry = f"{num}. {body}"
-                else:
-                    entry = f"{num}. [Missing reference]"
-            entries.append(entry)
-        return entries
-
-    def _format_bib_entry(self, citation, number, style: CitationStyle):
-        """Format a single bibliography entry (delegates to pipeline)."""
-        return format_bib_entry(citation, number, style)
+                decisions.convert_to_author_date = (choice == QMessageBox.StandardButton.Yes)
+        return export_legacy(self._project, output_path, decisions)
 
     def _new_project(self):
         self._project = ProjectState()

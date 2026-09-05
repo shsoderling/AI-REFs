@@ -203,8 +203,9 @@ class DocxHandler:
             return None
         return self._split_and_emit(span, replacement, superscript)
 
-    def _locate_span(self, paragraph, marker_text: str) -> Optional[MarkerSpan]:
-        """Where the first *marker_text* sits among ``iter_text_runs(paragraph)``.
+    def _locate_span(self, paragraph, marker_text: str, start: int = 0) -> Optional[MarkerSpan]:
+        """Where the first *marker_text* at or after *start* sits among
+        ``iter_text_runs(paragraph)``.
 
         Offsets are computed over the very runs that make up ``paragraph.text``,
         so a marker present in the text is always found. Raises
@@ -212,7 +213,7 @@ class DocxHandler:
         cached field result must be rewritten through the field API instead.
         """
         full_text = paragraph.text
-        start = full_text.find(marker_text)
+        start = full_text.find(marker_text, start)
         if start < 0:
             return None
         end = start + len(marker_text)
@@ -354,8 +355,9 @@ class DocxHandler:
         return cite
 
     def insert_citation_field(self, paragraph, marker_text: str, code: str,
-                              result_text: str, superscript: bool):
-        """Replace the first *marker_text* with an AIREFS citation field.
+                              result_text: str, superscript: bool, start: int = 0):
+        """Replace the first *marker_text* (at or after *start*) with an
+        AIREFS citation field.
 
         Same run surgery as :meth:`replace_marker_by_regex`, but the marker
         becomes the five runs of a complex field whose cached result shows
@@ -364,7 +366,7 @@ class DocxHandler:
         when the marker is not in the paragraph. Raises
         :class:`FieldBoundaryError` if the marker overlaps a field.
         """
-        span = self._locate_span(paragraph, marker_text)
+        span = self._locate_span(paragraph, marker_text, start)
         if span is None:
             return None
         runs, first, first_off, last, last_off = span
@@ -387,6 +389,19 @@ class DocxHandler:
         for r in runs[first:last + 1]:
             r.getparent().remove(r)
         self.invalidate_fields()          # a new field: the identity index must learn it
+        return result_run
+
+    def wrap_run_in_field(self, run_elem, code: str, result_text: str, superscript: bool):
+        """Turn one whole run (a superscript citation number list) into an
+        AIREFS citation field showing *result_text*. Raises
+        :class:`FieldBoundaryError` if the run already belongs to a field."""
+        if self.fields.in_field(run_elem):
+            raise FieldBoundaryError("run already belongs to a field")
+        result_run = make_result_run(result_text, run_elem, superscript=superscript)
+        for r in reversed(build_field_runs(code, result_run)):
+            run_elem.addnext(r)
+        run_elem.getparent().remove(run_elem)
+        self.invalidate_fields()
         return result_run
 
     # ── Bibliography field ───────────────────────────────────────────

@@ -142,8 +142,13 @@ def blocked_table_fields(table_fields, existing: ExistingCitationMap, result: Re
 
 
 def render_tracked_bibliography(existing: ExistingCitationMap, result: RenumberingResult,
-                                style: CitationStyle, layout: CitationLayout):
-    """Entries, record uuids (rendered order), kept-uncited uuids and hashes."""
+                                style: CitationStyle, layout: CitationLayout,
+                                verbatim_existing: bool = False):
+    """Entries, record uuids (rendered order), kept-uncited uuids and hashes.
+
+    Existing entries are re-rendered from their record unless they were
+    hand-edited, came from a plain-text document (``raw_entry``), or
+    *verbatim_existing* asks to keep every existing entry's wording."""
     import re
     rows = []          # (text, record_uuid, is_uncited)
     for num in sorted(result.assignments):
@@ -160,8 +165,11 @@ def render_tracked_bibliography(existing: ExistingCitationMap, result: Renumberi
         edited = bool(entry.raw_text and entry.entry_hash
                       and entry_hash(entry.raw_text) != entry.entry_hash)
         cand = entry.matched_candidate
-        if edited or cand is None:
-            body = entry.body or entry.raw_text
+        adopted_text = cand.raw_entry if cand is not None else ""
+        if edited or cand is None or verbatim_existing or adopted_text:
+            # Hand-edited, adopted from a plain-text document, or text-only:
+            # the entry's own wording is kept, only the number changes.
+            body = entry.body or entry.raw_text or adopted_text
             text = body if layout.is_author_date else f"{num}. {body}"
         else:
             text = format_bib_entry(cand, num, style)
