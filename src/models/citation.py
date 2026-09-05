@@ -47,6 +47,11 @@ class CitationCandidate(BaseModel):
     """A candidate reference retrieved from PubMed or bioRxiv."""
     pmid: str = Field(default="", description="PubMed ID")
     doi: str = Field(default="")
+    pmcid: str = Field(default="", description="PubMed Central ID, e.g. PMC7000000")
+    record_uuid: str = Field(default="", description="Stable opaque identity minted at first export; "
+                                                     "carried in the document's citation fields")
+    raw_entry: str = Field(default="", description="Verbatim bibliography text for records adopted "
+                                                   "from a plain-text document")
     title: str = Field(default="")
     source: str = Field(default="literature", description="Origin: pubmed, europepmc, biorxiv, user_library, ...")
     authors: list[Author] = Field(default_factory=list)
