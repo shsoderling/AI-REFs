@@ -1,6 +1,8 @@
 """Main window for AI REFs application."""
 
+import os
 import re
+import shutil
 import logging
 import hashlib
 from typing import Optional
@@ -23,6 +25,8 @@ from ..models.evidence import ReviewDecision
 from ..models.sentence import MarkerType
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
+from ..pipeline.docx_export import ExportBlocked, check_export_guard
+from ..models.embedded import DocumentTier
 from ..pipeline.renumbering import CitationKeyIndex
 from ..pipeline.renumber_plan import build_renumber_plan
 from ..pipeline.export_stats import ExportStats
@@ -152,44 +156,69 @@ class MainWindow(QMainWindow):
         self.review_tab.load_project(None)
 
         # Compute hash for change detection
-        with open(path, 'rb') as f:
-            self._project.input_docx_hash = hashlib.sha256(f.read()).hexdigest()
+        self._project.input_docx_hash = self._hash_file(path)
 
-        # Auto-detect insert mode (document with existing citations)
-        try:
-            handler = DocxHandler(path)
-            parser = ExistingCitationParser(handler)
-            existing = parser.analyze()
-            if existing.has_existing_citations:
-                self._project.is_insert_mode = True
-                self._project.existing_citations = existing
-                n = len(existing.bib_entries)
-                self.inputs_tab.set_insert_mode(True, n)
-                logger.info(f"Insert mode auto-detected: {n} existing references")
-
-                # Leftover [?] tokens mean a previous export had unresolved
-                # markers — those citations are still missing.
-                leftover = sum(p.text.count("[?]") for p in handler.get_paragraphs())
-                if leftover:
-                    QMessageBox.warning(
-                        self, "Unresolved Placeholders Found",
-                        f"This document contains {leftover} unresolved [?] "
-                        "placeholder(s) from a previous export.\n\n"
-                        "They will be left as-is. To fill them, replace each "
-                        "[?] with a (REF) marker before running the pipeline.",
-                    )
-            else:
-                self._project.is_insert_mode = False
-                self._project.existing_citations = None
-                self.inputs_tab.set_insert_mode(False, 0)
-        except Exception as e:
-            logger.warning(f"Insert mode detection failed: {e}")
-            self._project.is_insert_mode = False
-            self.inputs_tab.set_insert_mode(False, 0)
+        self._analyze_document(path)
 
         self._mark_dirty()
         self.statusBar().showMessage(f"Loaded: {Path(path).name}")
         logger.info(f"Document loaded: {path}")
+
+    @staticmethod
+    def _hash_file(path: str) -> str:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    @staticmethod
+    def _document_mode(existing) -> str:
+        """Banner mode for an analysed document (see InputsTab.set_document_mode)."""
+        if existing is None:
+            return "fresh"
+        tracking = existing.tracking
+        if tracking is not None:
+            if tracking.tier == DocumentTier.FAILED:
+                return "analysis-failed"
+            if tracking.foreign_field_count:
+                return "foreign"
+        return "legacy" if existing.has_existing_citations else "fresh"
+
+    def _apply_document_mode(self, existing):
+        mode = self._document_mode(existing)
+        n = len(existing.bib_entries) if existing is not None else 0
+        report = existing.tracking if existing is not None else None
+        self.inputs_tab.set_document_mode(mode, report, n)
+        return mode
+
+    def _analyze_document(self, path: str):
+        """Analyse the document's existing citations and set the project mode.
+
+        ``analyze()`` never raises: a failure comes back as a FAILED tracking
+        report, which is kept on the project so the export guard can refuse
+        to write, and shown in the banner instead of silently treating the
+        document as uncited.
+        """
+        handler = DocxHandler(path)
+        existing = ExistingCitationParser(handler).analyze()
+        self._project.existing_citations = existing
+        mode = self._apply_document_mode(existing)
+        self._project.is_insert_mode = mode in ("legacy", "foreign") and existing.has_existing_citations
+        if mode == "analysis-failed":
+            logger.warning(f"Existing-citation analysis failed: {existing.tracking.problems}")
+            return existing
+        if existing.has_existing_citations:
+            logger.info(f"Insert mode auto-detected: {len(existing.bib_entries)} existing references")
+            # Leftover [?] tokens mean a previous export had unresolved
+            # markers — those citations are still missing.
+            leftover = sum(p.text.count("[?]") for p in handler.get_paragraphs())
+            if leftover:
+                QMessageBox.warning(
+                    self, "Unresolved Placeholders Found",
+                    f"This document contains {leftover} unresolved [?] "
+                    "placeholder(s) from a previous export.\n\n"
+                    "They will be left as-is. To fill them, replace each "
+                    "[?] with a (REF) marker before running the pipeline.",
+                )
+        return existing
 
     def _start_pipeline(self):
         """Validate and start the pipeline."""
@@ -266,6 +295,23 @@ class MainWindow(QMainWindow):
         if not output_path:
             return
 
+        # Exporting onto the input file: keep a backup of the original.
+        if Path(output_path).resolve() == input_path.resolve():
+            backup = f"{input_path}.bak"
+            shutil.copy2(str(input_path), backup)
+            QMessageBox.warning(
+                self, "Overwriting the Input Document",
+                f"You chose to overwrite the input document.\n\n"
+                f"The original was backed up to:\n{backup}")
+
+        mode = "legacy" if (self._project.is_insert_mode
+                            and self._project.existing_citations) else "fresh"
+        reasons = check_export_guard(
+            self._project.existing_citations, mode, self._project.settings)
+        if reasons:
+            QMessageBox.critical(self, "Export Blocked", "\n\n".join(reasons))
+            return
+
         try:
             stats = self._do_export(output_path)
             if stats is None:
@@ -282,6 +328,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Export Complete (with gaps)", message)
             else:
                 QMessageBox.information(self, "Export Complete", message)
+        except ExportBlocked as e:
+            QMessageBox.critical(self, "Export Blocked", "\n\n".join(e.reasons))
+            logger.warning(f"Export blocked: {e.reasons}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
             logger.error(f"Export error: {e}")
@@ -710,16 +759,26 @@ class MainWindow(QMainWindow):
             self.review_tab.load_project(self._project)
             self.inputs_tab.set_settings(self._project.settings)
             self.library_tab.apply_project_settings(self._project.settings)
-            if self._project.input_docx_path:
-                self.inputs_tab.drop_zone.set_file(self._project.input_docx_path)
-            if self._project.is_insert_mode and self._project.existing_citations:
-                self.inputs_tab.set_insert_mode(
-                    True, len(self._project.existing_citations.bib_entries),
-                )
+            message = f"Opened: {Path(path).name}"
+            docx_path = self._project.input_docx_path
+            if docx_path:
+                self.inputs_tab.drop_zone.set_file(docx_path)
+            if docx_path and os.path.exists(docx_path):
+                current_hash = self._hash_file(docx_path)
+                if current_hash != self._project.input_docx_hash:
+                    # The document changed since the project was saved: the
+                    # stored citation map (and any paragraph indices in it)
+                    # can no longer be trusted.
+                    self._project.input_docx_hash = current_hash
+                    self._analyze_document(docx_path)
+                    self._mark_dirty()
+                    message += " — document changed since the project was saved; re-analysed"
+                else:
+                    self._apply_document_mode(self._project.existing_citations)
             else:
-                self.inputs_tab.set_insert_mode(False, 0)
+                self._apply_document_mode(self._project.existing_citations)
             self._update_title()
-            self.statusBar().showMessage(f"Opened: {Path(path).name}")
+            self.statusBar().showMessage(message)
         except Exception as e:
             QMessageBox.critical(self, "Open Error", f"Failed to open project:\n{e}")
 

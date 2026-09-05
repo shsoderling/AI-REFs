@@ -1,6 +1,7 @@
 """DOCX document I/O: reading, marker detection, replacement, and bibliography."""
 
 import copy
+import os
 import re
 import logging
 from dataclasses import dataclass
@@ -493,6 +494,19 @@ class DocxHandler:
         self.invalidate_fields()
 
     def save(self, output_path: str):
-        """Save the document to a new path."""
-        self.doc.save(output_path)
+        """Save the document atomically.
+
+        Writes ``<output_path>.tmp`` beside the target and renames it into
+        place, so a failed save (disk full, invalid XML) never leaves a
+        half-written or truncated document at *output_path* -- which may be
+        the input file itself.
+        """
+        tmp = f"{output_path}.tmp"
+        try:
+            self.doc.save(tmp)
+            os.replace(tmp, output_path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
         logger.info(f"Document saved to {output_path}")

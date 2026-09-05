@@ -655,17 +655,70 @@ class InputsTab(QWidget):
         }
         self.model_combo.setCurrentIndex(model_to_index.get(model_id, 0))
 
-    def set_insert_mode(self, enabled: bool, num_existing: int):
-        """Show or hide the insert-mode indicator."""
-        if enabled:
-            self.insert_mode_label.setText(
+    # Banner text and colour per document mode (see MainWindow._document_mode)
+    _MODE_STYLES = {
+        "ok": ("#e8f5e9", "#a5d6a7", "#2e7d32"),        # green
+        "warn": ("#fff8e1", "#ffe082", "#8d6e00"),      # amber
+        "error": ("#ffebee", "#ef9a9a", "#b71c1c"),     # red
+    }
+
+    def set_document_mode(self, mode: str, report=None, num_existing: int = 0):
+        """Show what AI REFs found in the loaded document.
+
+        mode: 'fresh' (no banner), 'legacy' (plain-text citations found),
+        'foreign' (another manager's fields; export disabled),
+        'analysis-failed' (nothing trusted; export disabled). Later modes:
+        'tracked', 'stripped', 'newer-version'.
+        """
+        first_problem = ""
+        if report is not None and getattr(report, "problems", None):
+            first_problem = report.problems[0]
+        texts = {
+            "legacy": (
                 f"Insert mode: {num_existing} existing references detected. "
-                f"Only new (REF)/(REFS) markers will be processed. "
-                f"Existing citations will be renumbered automatically."
-            )
-            self.insert_mode_label.setVisible(True)
-        else:
+                "Only new (REF)/(REFS) markers will be processed. "
+                "Existing citations will be renumbered automatically.", "ok"),
+            "tracked": (
+                f"Tracked document: {num_existing} references recognised from embedded "
+                "AI REFs data. New (REF)/(REFS) markers will be added and everything "
+                "renumbered.", "ok"),
+            "foreign": (
+                "This document contains citation fields from another reference manager "
+                "(EndNote/Zotero/Mendeley). AI REFs will not modify it; export is disabled.",
+                "warn"),
+            "stripped": (
+                "This document was exported by AI REFs but its tracking data is gone "
+                "(edited in Google Docs or Pages?). Falling back to text-based detection.",
+                "warn"),
+            "analysis-failed": (
+                "AI REFs could not analyse the existing citations"
+                + (f": {first_problem}" if first_problem else "")
+                + ". Export is disabled.", "error"),
+            "newer-version": (
+                "This document was created by a newer version of AI REFs; it is opened "
+                "read-only. Export is disabled.", "error"),
+        }
+        if mode not in texts:
             self.insert_mode_label.setVisible(False)
+            return
+        text, level = texts[mode]
+        bg, border, fg = self._MODE_STYLES[level]
+        self.insert_mode_label.setStyleSheet(
+            "QLabel {"
+            f"  background-color: {bg};"
+            f"  border: 1px solid {border};"
+            "  border-radius: 6px;"
+            "  padding: 8px 12px;"
+            f"  color: {fg};"
+            "  font-size: 13px;"
+            "}"
+        )
+        self.insert_mode_label.setText(text)
+        self.insert_mode_label.setVisible(True)
+
+    def set_insert_mode(self, enabled: bool, num_existing: int):
+        """Backward-compatible wrapper around :meth:`set_document_mode`."""
+        self.set_document_mode("legacy" if enabled else "fresh", None, num_existing)
 
     # ── Settings persistence ──────────────────────────────────────────
 
