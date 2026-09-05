@@ -5,7 +5,8 @@ from src.models.existing_refs import (
     ExistingBibEntry, ExistingCitationMap, InTextCitation,
 )
 from src.pipeline.renumbering import (
-    CitationKeyIndex, NewMarkerInfo, compute_renumbering,
+    CitationKeyIndex, NewMarkerInfo, build_events, compute_renumbering,
+    compute_renumbering_from_events,
 )
 
 
@@ -128,3 +129,65 @@ class TestComputeRenumbering:
         existing = make_existing(num_entries=1, citations={0: [(0, 1)]})
         result = compute_renumbering(existing, [])
         assert result.number_for_candidate(cand(pmid="nope")) is None
+
+
+class TestEventsEngine:
+    def test_marker_after_heading_gets_a_number(self):
+        existing = make_existing(num_entries=1, refs_heading=2, citations={0: [(0, 1)]})
+        new = [NewMarkerInfo(para_index=5, char_offset=0, citations=[cand(pmid="9")])]
+        result = compute_renumbering(existing, new)
+        assert result.number_for_candidate(cand(pmid="9")) == 2
+
+    def test_uncited_parsed_entries_are_seeded_and_reported(self):
+        existing = make_existing(num_entries=4, refs_heading=3, citations={0: [(0, 2)]})
+        result = compute_renumbering(existing, [])
+        assert sorted(result.assignments) == [1, 2, 3, 4]
+        assert result.assignments[1].original_number == 2       # cited first
+        assert [result.assignments[n].original_number for n in (2, 3, 4)] == [1, 3, 4]
+        assert result.seeded_uncited == [1, 3, 4]
+        # Seeded entries are existing citations too: their old -> new mapping
+        # is recorded so the preview and export stats see where they moved.
+        assert result.renumber_map == {2: 1, 1: 2, 3: 3, 4: 4}
+        assert result.next_number == 5
+
+    def test_seeding_can_be_disabled(self):
+        existing = make_existing(num_entries=3, refs_heading=3, citations={0: [(0, 1)]})
+        result = compute_renumbering(existing, [], seed_entries=False)
+        assert sorted(result.assignments) == [1]
+        assert result.seeded_uncited == []
+
+    def test_uncited_duplicate_of_a_cited_paper_is_merged_not_seeded(self):
+        """An uncited entry with a cited entry's DOI maps to that number."""
+        existing = make_existing(num_entries=2, refs_heading=3, citations={0: [(0, 1)]})
+        existing.bib_entries[2].doi = existing.bib_entries[1].doi
+        result = compute_renumbering(existing, [])
+        assert sorted(result.assignments) == [1]
+        assert result.renumber_map == {1: 1, 2: 1}
+        assert result.seeded_uncited == []
+
+    def test_events_are_ordered_and_existing_wins_ties(self):
+        existing = make_existing(num_entries=2, refs_heading=4, citations={1: [(5, 2)], 0: [(0, 1)]})
+        new = [NewMarkerInfo(para_index=1, char_offset=5, citations=[cand(pmid="7")])]
+        ev = build_events(existing, new)
+        assert [(e.para_index, e.char_offset, e.kind) for e in ev] == [
+            (0, 0, "existing"), (1, 5, "existing"), (1, 5, "new")]
+        assert [e.number for e in ev[:2]] == [1, 2]
+        assert ev[2].citations == [cand(pmid="7")]
+
+    def test_existing_events_stop_at_the_heading(self):
+        existing = make_existing(num_entries=2, refs_heading=1,
+                                 citations={0: [(0, 1)], 1: [(0, 2)], 3: [(0, 2)]})
+        assert [(e.para_index, e.number) for e in build_events(existing, [])] == [(0, 1)]
+
+    def test_no_heading_walks_every_paragraph(self):
+        existing = make_existing(num_entries=2, refs_heading=-1,
+                                 citations={0: [(0, 1)], 7: [(0, 2)]})
+        assert [(e.para_index, e.number) for e in build_events(existing, [])] == [(0, 1), (7, 2)]
+
+    def test_from_events_matches_wrapper(self):
+        existing = make_existing(num_entries=2, refs_heading=4, citations={0: [(0, 2), (3, 1)]})
+        new = [NewMarkerInfo(para_index=0, char_offset=1, citations=[cand(doi="10.1/n")])]
+        a = compute_renumbering(existing, new)
+        b = compute_renumbering_from_events(existing, build_events(existing, new))
+        assert a.renumber_map == b.renumber_map
+        assert {n: x.bib_key for n, x in a.assignments.items()} == {n: x.bib_key for n, x in b.assignments.items()}
