@@ -1,7 +1,7 @@
 """Expand and collapse numeric citation lists: "1, 3-5" <-> [1, 3, 4, 5].
 
-Deliberately import-free so the existing-citation parser and the renumbering
-writer can share one definition without a circular import.
+Imports nothing from the project, so the existing-citation parser and the
+renumbering writer can share one definition without a circular import.
 """
 
 import re

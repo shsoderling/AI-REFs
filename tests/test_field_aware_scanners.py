@@ -53,6 +53,24 @@ def test_bracket_regex_ignores_field_results(tmp_path):
     assert all(c.number != 7 for c in existing.in_text_citations[0])
 
 
+def test_bracket_group_straddling_a_field_result_is_left_alone(tmp_path):
+    """A bracket match that merely overlaps a field result (here it starts in
+    plain text and ends inside the result) is field text: not a citation for
+    the parser, and never rewritten by the renumbering writer."""
+    b = DocBuilder()
+    p = b.paragraph("Claim [1, ")
+    b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="2]")
+    b.add_text(p, " and [3].")
+    b.paragraph("References")
+    for i in range(1, 4):
+        b.paragraph(f"{i}. Author{i} A. Title {i}. J. 2020.")
+    h = DocxHandler(str(b.save(tmp_path / "s.docx")))
+    existing = ExistingCitationParser(h).analyze()
+    assert [c.number for c in existing.in_text_citations[0]] == [3]
+    apply_renumbering(h, existing, {1: 7, 2: 8, 3: 9})
+    assert h.get_paragraphs()[0].text == "Claim [1, 2] and [9]."
+
+
 def test_author_date_conversion_skips_fields_and_expands_ranges(tmp_path):
     h = _cited_doc(tmp_path)
     existing = ExistingCitationParser(h).analyze()
