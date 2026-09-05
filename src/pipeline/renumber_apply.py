@@ -3,65 +3,15 @@
 Headless (no Qt) so it can be exercised by tests and reused by previews.
 """
 
-import re
 import logging
 
 from ..models.existing_refs import ExistingCitationMap
-from .existing_citation_parser import BRACKET_CITE_PATTERN, CITATION_SHAPE_PATTERN
+from .citation_numbers import expand_bracket_numbers, format_bracket_numbers  # noqa: F401  (re-exported)
+from .existing_citation_parser import (
+    BRACKET_CITE_PATTERN, CITATION_SHAPE_PATTERN, in_field_result,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def expand_bracket_numbers(group_text: str) -> list[int]:
-    """Expand citation list/range text into explicit numbers."""
-    numbers: list[int] = []
-    for part in re.split(r'[;,]\s*', group_text):
-        token = part.strip()
-        if not token:
-            continue
-
-        bounds = re.split(r'\s*[-–]\s*', token)
-        if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
-            start = int(bounds[0])
-            end = int(bounds[1])
-            if start <= end:
-                numbers.extend(range(start, end + 1))
-            else:
-                numbers.extend(range(start, end - 1, -1))
-        elif token.isdigit():
-            numbers.append(int(token))
-
-    return numbers
-
-
-def format_bracket_numbers(numbers: list[int]) -> str:
-    """Format a list of citation numbers as compact ranges."""
-    if not numbers:
-        return ""
-
-    chunks = []
-    start = prev = numbers[0]
-    for n in numbers[1:]:
-        if n == prev + 1:
-            prev = n
-            continue
-
-        if start == prev:
-            chunks.append(str(start))
-        elif prev - start >= 2:
-            chunks.append(f"{start}-{prev}")
-        else:
-            chunks.extend([str(start), str(prev)])
-        start = prev = n
-
-    if start == prev:
-        chunks.append(str(start))
-    elif prev - start >= 2:
-        chunks.append(f"{start}-{prev}")
-    else:
-        chunks.extend([str(start), str(prev)])
-
-    return ", ".join(chunks)
 
 
 def renumber_bracket_group(group_text: str, renumber_map: dict[int, int]) -> str:
@@ -87,24 +37,25 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
     """Update all existing in-text citation numbers using the renumber_map.
 
     Walks superscript runs in body paragraphs (before the References heading)
-    and replaces each citation number according to the map, then renumbers
-    bracketed citation groups.
+    and rewrites each citation-shaped run as its mapped, re-collapsed group
+    (a range "3-5" expands to 3, 4, 5 first, so its middle number is mapped
+    too), then renumbers bracketed citation groups.
 
-    Superscript runs use a single-pass re.sub with a callback to avoid
-    cascading collisions (e.g. 7->10 then a later run containing 10 being
-    re-mapped).  Bracket groups are replaced in two phases via unique
-    sentinels for the same reason: replacing [1]->[2] directly would let a
-    later [2]->[3] replacement match the freshly inserted token.
+    Runs that belong to a Word field and bracket groups inside a field's
+    cached result are left alone: a field result is rewritten through the
+    field API, never as plain text.
+
+    Each superscript run is rewritten in one pass, so collisions cannot
+    cascade (e.g. 7->10 then a later run containing 10 being re-mapped).
+    Bracket groups are replaced in two phases via unique sentinels for the
+    same reason: replacing [1]->[2] directly would let a later [2]->[3]
+    replacement match the freshly inserted token.
     """
     refs_start = existing.references_heading_para_idx
-    cite_runs = handler.find_superscript_citation_runs()
+    cite_runs = handler.find_superscript_citation_runs()    # skips in-field runs
 
     # Filter to only body paragraphs
     body_runs = [r for r in cite_runs if r['para_index'] < refs_start]
-
-    def _replace_num(m):
-        old_num = int(m.group())
-        return str(renumber_map.get(old_num, old_num))
 
     for run_info in body_runs:
         run = run_info['run']
@@ -113,7 +64,11 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
         # superscripts like the "2+" in Ca2+ from being renumbered.
         if not CITATION_SHAPE_PATTERN.match(text or ""):
             continue
-        new_text = re.sub(r'\d+', _replace_num, text)
+        new_text = renumber_bracket_group(text, renumber_map)
+        # format_bracket_numbers separates with ", "; keep the run's own
+        # tight "1,2" shape unless it already used ", ".
+        if ", " not in text:
+            new_text = new_text.replace(", ", ",")
         if new_text != text:
             run.text = new_text
 
@@ -129,8 +84,11 @@ def apply_renumbering(handler, existing: ExistingCitationMap,
         if "[" not in para_text:
             continue
 
+        result_spans = handler.fields.result_spans(para)
         replacements: list[tuple[str, str, str]] = []
         for i, match in enumerate(BRACKET_CITE_PATTERN.finditer(para_text)):
+            if in_field_result(match, result_spans):
+                continue
             old_token = match.group(0)
             inner = match.group(1)
             new_inner = renumber_bracket_group(inner, renumber_map)

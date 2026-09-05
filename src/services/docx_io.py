@@ -404,19 +404,27 @@ class DocxHandler:
 
     # ── Insert-mode helpers ─────────────────────────────────────────
 
-    def find_superscript_citation_runs(self) -> list[dict]:
-        """Find all superscript runs that contain citation numbers.
+    def find_superscript_citation_runs(self, skip_fields: bool = True) -> list[dict]:
+        """Find all superscript runs whose text is a citation number list.
+
+        ``numbers`` is the run's text expanded, so a range ``3-5`` yields
+        ``[3, 4, 5]``. With ``skip_fields`` (the default) a run that belongs
+        to a Word field -- a cached result such as an AIREFS.CITE number --
+        is omitted: field results are rewritten through the field API.
 
         Returns list of dicts with keys:
             paragraph, para_index, run, run_index, numbers (list[int]),
             char_start (int), char_end (int).
         """
+        # Local import: the pipeline package depends on this module.
+        from ..pipeline.citation_numbers import expand_bracket_numbers
         results = []
         for para_idx, para in enumerate(self.doc.paragraphs):
             char_offset = 0
             for run_idx, run in enumerate(para.runs):
-                if run.font.superscript:
-                    nums = [int(n) for n in re.findall(r'\d+', run.text)]
+                if run.font.superscript and not (
+                        skip_fields and self.fields.in_field(run)):
+                    nums = expand_bracket_numbers(run.text)
                     if nums:
                         results.append({
                             'paragraph': para,

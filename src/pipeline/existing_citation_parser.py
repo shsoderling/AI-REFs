@@ -10,6 +10,7 @@ import re
 import logging
 from ..models.existing_refs import ExistingBibEntry, ExistingCitationMap, InTextCitation
 from ..services.docx_io import DocxHandler
+from .citation_numbers import expand_bracket_numbers
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,18 @@ CITATION_SHAPE_PATTERN = re.compile(r'^[\d\s,;\-\u2013]+$')
 
 # Pattern for (REF) / (REFS) markers — used to detect char offsets
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+
+
+def in_field_result(match, result_spans) -> bool:
+    """True when a regex *match* over ``paragraph.text`` overlaps one of the
+    paragraph's field result spans (``FieldIndex.result_spans``).
+
+    Such text is a field's cached result, not plain citation text: the
+    scanners must not report it and the writers must not rewrite it.
+    Shared by the parser, ``apply_renumbering`` and the author-date converter
+    so the three can never disagree on what counts as a field result.
+    """
+    return any(s < match.end() and match.start() < e for s, e in result_spans)
 
 
 class ExistingCitationParser:
@@ -132,10 +145,14 @@ class ExistingCitationParser:
 
         Finds both superscript number runs and bracketed citations like [1,2,3].
         Skips any numbers that fall inside (REF)/(REFS) markers, superscript
-        runs that are not citation-shaped (e.g. "2+" in Ca2+), and numbers
-        with no matching bibliography entry.
+        runs that are not citation-shaped (e.g. "2+" in Ca2+), numbers with
+        no matching bibliography entry, and anything that belongs to a Word
+        field (a run of the field, or a bracket group inside its cached
+        result): field results are read through the field API, never as
+        plain text.
         """
         cite_map: dict[int, list[InTextCitation]] = {}
+        fields = self.handler.fields
         for idx, para in enumerate(paragraphs):
             citations: list[InTextCitation] = []
 
@@ -147,16 +164,19 @@ class ExistingCitationParser:
             def _in_marker(offset: int) -> bool:
                 return any(s <= offset < e for s, e in marker_ranges)
 
-            # Superscript runs
+            result_spans = fields.result_spans(para)
+
+            # Superscript runs. Every number of the run shares the run's
+            # start offset; a range "3-5" expands to 3, 4, 5.
             char_offset = 0
             for run in para.runs:
-                if run.font.superscript and CITATION_SHAPE_PATTERN.match(run.text or ""):
-                    for m in re.finditer(r'\d+', run.text):
-                        abs_offset = char_offset + m.start()
-                        number = int(m.group())
-                        if number in valid_numbers and not _in_marker(abs_offset):
+                if (run.font.superscript and not fields.in_field(run)
+                        and CITATION_SHAPE_PATTERN.match(run.text or "")
+                        and not _in_marker(char_offset)):
+                    for number in expand_bracket_numbers(run.text):
+                        if number in valid_numbers:
                             citations.append(InTextCitation(
-                                char_offset=abs_offset,
+                                char_offset=char_offset,
                                 number=number,
                                 is_superscript=True,
                             ))
@@ -164,14 +184,15 @@ class ExistingCitationParser:
 
             # Bracketed citations
             for m in BRACKET_CITE_PATTERN.finditer(para.text):
-                if not _in_marker(m.start()):
-                    for num in self._expand_citation_range(m.group(1)):
-                        if num in valid_numbers:
-                            citations.append(InTextCitation(
-                                char_offset=m.start(),
-                                number=num,
-                                is_superscript=False,
-                            ))
+                if _in_marker(m.start()) or in_field_result(m, result_spans):
+                    continue
+                for num in expand_bracket_numbers(m.group(1)):
+                    if num in valid_numbers:
+                        citations.append(InTextCitation(
+                            char_offset=m.start(),
+                            number=num,
+                            is_superscript=False,
+                        ))
 
             if citations:
                 # Sort by position to enable sequential processing
@@ -179,27 +200,6 @@ class ExistingCitationParser:
                 cite_map[idx] = citations
 
         return cite_map
-
-    @staticmethod
-    def _expand_citation_range(range_str: str) -> list[int]:
-        """Expand '1,2,3' or '1-3' into [1, 2, 3]."""
-        numbers = []
-        parts = re.split(r'[,;\s]+', range_str)
-        for part in parts:
-            if '-' in part or '\u2013' in part:
-                bounds = re.split(r'[-\u2013]', part)
-                if len(bounds) == 2:
-                    try:
-                        start, end = int(bounds[0]), int(bounds[1])
-                        numbers.extend(range(start, end + 1))
-                    except ValueError:
-                        pass
-            else:
-                try:
-                    numbers.append(int(part))
-                except ValueError:
-                    pass
-        return numbers
 
     def _detect_superscript(self, paragraphs) -> bool:
         """Detect whether the document uses superscript or bracketed citations."""

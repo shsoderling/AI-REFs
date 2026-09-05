@@ -15,7 +15,10 @@ from dataclasses import dataclass, field
 
 from ..models.existing_refs import ExistingCitationMap
 from .bib_format import format_bib_entry
-from .existing_citation_parser import BRACKET_CITE_PATTERN, CITATION_SHAPE_PATTERN
+from .citation_numbers import expand_bracket_numbers
+from .existing_citation_parser import (
+    BRACKET_CITE_PATTERN, CITATION_SHAPE_PATTERN, in_field_result,
+)
 from .existing_enrichment import parse_entry_fields
 from .renumbering import RenumberingResult
 
@@ -75,7 +78,9 @@ def convert_in_text_to_author_date(handler, existing: ExistingCitationMap,
 
     Handles bracket groups ([1], [2-4]) and superscript runs.  Superscript
     citation runs lose their superscript formatting (author-date citations
-    are normal text).  Returns the number of citation sites converted.
+    are normal text).  Runs that belong to a Word field and bracket groups
+    inside a field's cached result are left alone.  Returns the number of
+    citation sites converted.
     """
     refs_start = existing.references_heading_para_idx
     converted = 0
@@ -90,15 +95,15 @@ def convert_in_text_to_author_date(handler, existing: ExistingCitationMap,
                 ordered.append(p)
         return f"{prefix}{delimiter.join(ordered)}{suffix}"
 
-    # Superscript runs first: they are simple run-text swaps.
+    # Superscript runs first: they are simple run-text swaps. The scanner
+    # skips in-field runs and expands ranges ("3-5" -> 3, 4, 5).
     for run_info in handler.find_superscript_citation_runs():
         if run_info['para_index'] >= refs_start:
             continue
         run = run_info['run']
         if not CITATION_SHAPE_PATTERN.match(run.text or ""):
             continue
-        numbers = [int(m.group()) for m in re.finditer(r'\d+', run.text)]
-        numbers = [n for n in numbers if n in existing.bib_entries]
+        numbers = [n for n in run_info['numbers'] if n in existing.bib_entries]
         if not numbers:
             continue
         run.text = _group_label(numbers)
@@ -106,15 +111,19 @@ def convert_in_text_to_author_date(handler, existing: ExistingCitationMap,
         converted += 1
 
     # Bracket groups. The replacement text contains no [N] token, so a
-    # sequential per-match replacement cannot cascade.
-    from .renumber_apply import expand_bracket_numbers
+    # sequential per-match replacement cannot cascade. Matches and result
+    # spans are both taken from the paragraph before any replacement, so
+    # their offsets agree.
     for para_idx, para in enumerate(handler.get_paragraphs()):
         if para_idx >= refs_start:
             break
         para_text = para.text
         if "[" not in para_text:
             continue
+        result_spans = handler.fields.result_spans(para)
         for match in BRACKET_CITE_PATTERN.finditer(para_text):
+            if in_field_result(match, result_spans):
+                continue
             numbers = [n for n in expand_bracket_numbers(match.group(1))
                        if n in existing.bib_entries]
             if not numbers:
