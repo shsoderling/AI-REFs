@@ -113,12 +113,25 @@ class ReferenceLibrary:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    _ROW_COLUMNS = (
+        "key, pmid, doi, title, authors_json, year, journal, journal_abbrev, "
+        "volume, issue, pages, abstract, mesh_terms_json, publication_types_json, "
+        "is_retracted, is_review, source, updated_at"
+    )
+
     def upsert_candidate(
         self,
         citation: CitationCandidate,
         source: str = "literature",
+        merge: bool = False,
     ) -> tuple[bool, bool]:
         """Upsert a citation.
+
+        With *merge* an existing row is never degraded: empty columns are
+        filled, the longer author list wins, abstract / MeSH / publication
+        types are kept when present, a retraction flag only turns on, and a
+        weaker origin (``embedded``: a record read back from a document)
+        never replaces a richer one. Without it the row is overwritten.
 
         Returns `(inserted, updated)`.
         """
@@ -131,9 +144,16 @@ class ReferenceLibrary:
 
         now = time.time()
         row = self._conn.execute(
-            "SELECT key FROM references_library WHERE key = ?",
+            f"SELECT {self._ROW_COLUMNS} FROM references_library WHERE key = ?",
             (key,),
         ).fetchone()
+
+        if row is not None and merge:
+            current = self._row_to_candidate(row)
+            current_source = row[16] or ""
+            citation = self._merged(current, citation)
+            if current_source and current_source != "embedded":
+                source = current_source
 
         values = (
             key,
@@ -201,6 +221,26 @@ class ReferenceLibrary:
         )
         self._conn.commit()
         return False, True
+
+    @staticmethod
+    def _merged(current: CitationCandidate, incoming: CitationCandidate) -> CitationCandidate:
+        """*current* completed with what *incoming* adds; nothing is shortened."""
+        merged = current.model_copy()
+        for name in ("pmid", "doi", "title", "journal", "journal_abbrev", "volume", "issue",
+                     "pages", "abstract", "pmcid", "record_uuid"):
+            if not getattr(merged, name) and getattr(incoming, name):
+                setattr(merged, name, getattr(incoming, name))
+        if not merged.year and incoming.year:
+            merged.year = incoming.year
+        if len(incoming.authors) > len(merged.authors):
+            merged.authors = list(incoming.authors)
+        if not merged.mesh_terms and incoming.mesh_terms:
+            merged.mesh_terms = list(incoming.mesh_terms)
+        if not merged.publication_types and incoming.publication_types:
+            merged.publication_types = list(incoming.publication_types)
+        merged.is_retracted = merged.is_retracted or incoming.is_retracted
+        merged.is_review = merged.is_review or incoming.is_review
+        return merged
 
     def add_candidates(
         self,

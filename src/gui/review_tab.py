@@ -568,6 +568,7 @@ class ReviewTab(QWidget):
                 continue
             ins, upd = self._ref_library.upsert_candidate(
                 citation, source=f"accepted_{source}",
+                merge=(source == "embedded"),   # a record read from a document never degrades a row
             )
             if ins:
                 imported += 1
@@ -832,6 +833,7 @@ class ReviewTab(QWidget):
             ins, upd = self._ref_library.upsert_candidate(
                 enriched,
                 source=f"manual_add_{source}",
+                merge=(source == "embedded"),
             )
             if ins:
                 imported += 1
