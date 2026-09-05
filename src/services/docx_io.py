@@ -1,16 +1,19 @@
 """DOCX document I/O: reading, marker detection, replacement, and bibliography."""
 
+import copy
 import re
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from .docx_fields import run_ancestry
+from .docx_fields import FieldIndex, run_ancestry
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +84,41 @@ def iter_all_runs(paragraph):
             yield RunInfo(elem=r, deleted=a.deleted, inserted=a.inserted)
 
 
+class FieldBoundaryError(RuntimeError):
+    """Raised when an edit would split or rewrite runs that belong to a field."""
+
+
+class MarkerSpan(NamedTuple):
+    """Where a marker sits among a paragraph's text runs (``_locate_span``)."""
+    runs: list          # iter_text_runs(paragraph)
+    first: int          # index in runs of the first run the marker touches
+    first_off: int      # marker start as an offset into runs[first]
+    last: int           # index in runs of the last run the marker touches
+    last_off: int       # marker end as an offset into runs[last]
+
+
 class DocxHandler:
     """Read and manipulate DOCX documents for reference insertion."""
 
     def __init__(self, path: str):
         self.path = path
         self.doc = Document(path)
+        self._fields: Optional[FieldIndex] = None
+
+    @property
+    def fields(self) -> FieldIndex:
+        """Field membership for the current document tree, built on demand.
+
+        Keyed on run element identity, so every method that adds or removes
+        runs calls :meth:`invalidate_fields` afterwards.
+        """
+        if self._fields is None:
+            self._fields = FieldIndex(self.doc)
+        return self._fields
+
+    def invalidate_fields(self):
+        """Forget the cached :attr:`fields`; call after any structural edit."""
+        self._fields = None
 
     def get_paragraphs(self) -> list:
         """Return all paragraphs in the document."""
@@ -124,130 +156,121 @@ class DocxHandler:
                                 superscript: bool = False):
         """Replace the first occurrence of *marker_text* in *paragraph*.
 
-        Walks the existing runs to locate the one(s) that contain the marker,
-        splits into up to three new runs (before-text | citation | after-text),
-        and preserves all other runs untouched.  When *superscript* is True the
-        citation run gets superscript formatting; when False it keeps the
-        surrounding run's formatting as-is.
+        Locates the marker over the text runs, then replaces the touched runs
+        with up to three new ones (before-text | citation | after-text) that
+        carry only their neighbours' ``w:rPr``; every other run is untouched.
+        When *superscript* is True the citation run is superscript and the
+        after-run loses any superscript; when False the citation run carries
+        no vertical alignment.
+
+        Returns the new citation ``w:r`` element, or None when the marker is
+        not in the paragraph. Raises :class:`FieldBoundaryError` rather than
+        rewriting a run that belongs to a field.
         """
-        import copy
-        from lxml import etree
+        span = self._locate_span(paragraph, marker_text)
+        if span is None:
+            return None
+        return self._split_and_emit(span, replacement, superscript)
 
+    def _locate_span(self, paragraph, marker_text: str) -> Optional[MarkerSpan]:
+        """Where the first *marker_text* sits among ``iter_text_runs(paragraph)``.
+
+        Offsets are computed over the very runs that make up ``paragraph.text``,
+        so a marker present in the text is always found. Raises
+        :class:`FieldBoundaryError` if any touched run belongs to a field: a
+        cached field result must be rewritten through the field API instead.
+        """
         full_text = paragraph.text
-        if marker_text not in full_text:
-            return  # Marker not found in this paragraph
-
-        w_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-        target_start = full_text.find(marker_text)
-        target_end = target_start + len(marker_text)
-
-        runs = paragraph.runs
-        if not runs:
-            if superscript:
-                self._collapse_and_replace_superscript(paragraph, marker_text, replacement)
-            else:
-                paragraph.text = full_text[:target_start] + replacement + full_text[target_end:]
-            return
-
-        # Build (run_index, run_char_start, run_char_end) for every run
-        run_spans = []
+        start = full_text.find(marker_text)
+        if start < 0:
+            return None
+        end = start + len(marker_text)
+        runs = iter_text_runs(paragraph)
+        first = last = None
         offset = 0
-        for i, run in enumerate(runs):
-            run_end = offset + len(run.text)
-            run_spans.append((i, offset, run_end))
+        for i, r in enumerate(runs):
+            run_start, run_end = offset, offset + len(run_text(r))
+            if run_start < end and run_end > start:
+                if first is None:
+                    first = (i, start - run_start)
+                last = (i, end - run_start)
             offset = run_end
+        if first is None:
+            return None
+        span = MarkerSpan(runs, first[0], first[1], last[0], last[1])
+        for r in runs[span.first:span.last + 1]:
+            if self.fields.in_field(r):
+                raise FieldBoundaryError(
+                    f"marker {marker_text!r} overlaps a field; refusing to rewrite its runs")
+        return span
 
-        # Find the first and last run touched by the marker
-        first_run_idx = None
-        last_run_idx = None
-        for i, rs, re_ in run_spans:
-            if rs < target_end and re_ > target_start:
-                if first_run_idx is None:
-                    first_run_idx = i
-                last_run_idx = i
+    @staticmethod
+    def _clone_rpr_only(template_r, text: str, superscript: Optional[bool]):
+        """New ``w:r`` holding a copy of *template_r*'s ``w:rPr`` (and nothing
+        else of it) plus exactly one ``w:t``.
 
-        if first_run_idx is None:
+        *superscript*: None keeps the template's vertical alignment, True makes
+        the run superscript, False removes any vertical alignment.
+        """
+        new_r = OxmlElement('w:r')
+        rpr = template_r.find(qn('w:rPr'))
+        if rpr is not None:
+            rpr = copy.deepcopy(rpr)
+            new_r.append(rpr)
+        if superscript is not None:
+            if rpr is not None:
+                for va in rpr.findall(qn('w:vertAlign')):
+                    rpr.remove(va)
             if superscript:
-                self._collapse_and_replace_superscript(paragraph, marker_text, replacement)
-            else:
-                # Fallback: do a safe text-only replacement on the first run containing it
-                for run in runs:
-                    if marker_text in run.text:
-                        run.text = run.text.replace(marker_text, replacement, 1)
-                        return
-            return
+                if rpr is None:
+                    rpr = new_r.get_or_add_rPr()
+                rpr.get_or_add_vertAlign().set(qn('w:val'), 'superscript')
+        t = OxmlElement('w:t')
+        t.set(qn('xml:space'), 'preserve')
+        t.text = text
+        new_r.append(t)
+        return new_r
 
-        p_elem = paragraph._element
+    def _split_and_emit(self, span: MarkerSpan, replacement: str, superscript: bool):
+        """Replace the runs of *span* with before | citation | after runs.
 
-        # Text before the marker (portion of the first hit run before the marker starts)
-        first_rs = run_spans[first_run_idx][1]
-        text_before = runs[first_run_idx].text[:target_start - first_rs]
-
-        # Text after the marker (portion of the last hit run after the marker ends)
-        last_rs = run_spans[last_run_idx][1]
-        text_after = runs[last_run_idx].text[target_end - last_rs:]
-
-        # We use the first hit run as the formatting template
-        template_elem = runs[first_run_idx]._element
-
-        new_xml_runs = []
-
-        # 1) "before" portion — same formatting as template run
+        The before-run keeps the first touched run's formatting. The citation
+        run is superscript iff *superscript*, never inheriting vertical
+        alignment from its neighbour. The after-run keeps the last touched
+        run's formatting, except that a superscript citation must not bleed
+        into it. Returns the citation run element.
+        """
+        runs, first, first_off, last, last_off = span
+        first_r, last_r = runs[first], runs[last]
+        text_before = run_text(first_r)[:first_off]
+        text_after = run_text(last_r)[last_off:]
+        new_runs = []
         if text_before:
-            r_before = copy.deepcopy(template_elem)
-            for t_el in r_before.findall(f'{{{w_ns}}}t'):
-                t_el.text = text_before
-                t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            new_xml_runs.append(r_before)
-
-        # 2) Citation run — clone formatting
-        r_cite = copy.deepcopy(template_elem)
-        for t_el in r_cite.findall(f'{{{w_ns}}}t'):
-            t_el.text = replacement
-            t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-
-        if superscript:
-            # Add superscript vertAlign
-            rPr = r_cite.find(f'{{{w_ns}}}rPr')
-            if rPr is None:
-                rPr = etree.SubElement(r_cite, f'{{{w_ns}}}rPr')
-                r_cite.insert(0, rPr)
-            for va in rPr.findall(f'{{{w_ns}}}vertAlign'):
-                rPr.remove(va)
-            etree.SubElement(rPr, f'{{{w_ns}}}vertAlign',
-                             {f'{{{w_ns}}}val': 'superscript'})
-
-        new_xml_runs.append(r_cite)
-
-        # 3) "after" portion — uses the LAST hit run's formatting (no superscript)
+            new_runs.append(self._clone_rpr_only(first_r, text_before, None))
+        cite = self._clone_rpr_only(first_r, replacement, bool(superscript))
+        new_runs.append(cite)
         if text_after:
-            r_after = copy.deepcopy(runs[last_run_idx]._element)
-            for t_el in r_after.findall(f'{{{w_ns}}}t'):
-                t_el.text = text_after
-                t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            if superscript:
-                rPr_after = r_after.find(f'{{{w_ns}}}rPr')
-                if rPr_after is not None:
-                    for va in rPr_after.findall(f'{{{w_ns}}}vertAlign'):
-                        rPr_after.remove(va)
-            new_xml_runs.append(r_after)
-
-        # Insert the new runs right after the LAST hit run, then remove
-        # all original runs that the marker touched.
-        anchor = runs[last_run_idx]._element
-        for new_r in reversed(new_xml_runs):
-            anchor.addnext(new_r)
-
-        for i in range(first_run_idx, last_run_idx + 1):
-            p_elem.remove(runs[i]._element)
+            new_runs.append(self._clone_rpr_only(last_r, text_after,
+                                                 False if superscript else None))
+        # Insert after the last touched run (inside its hyperlink, if any),
+        # then drop the touched runs from wherever each of them lives.
+        for r in reversed(new_runs):
+            last_r.addnext(r)
+        for r in runs[first:last + 1]:
+            r.getparent().remove(r)
+        self.invalidate_fields()
+        return cite
 
     def _collapse_and_replace_superscript(self, paragraph, marker_text: str,
                                            replacement: str):
-        """Fallback when the marker straddles multiple runs.
+        """Legacy fallback: collapse the paragraph into three fresh runs,
+        before | cite^ | after. Not reachable from ``replace_marker_by_regex``.
 
-        Collapses the paragraph into three fresh runs: before | cite^ | after.
+        Refuses paragraphs holding a field: rebuilding their runs would strip
+        the field characters and code.
         """
+        if paragraph._p.findall(f'.//{{{W_NS}}}fldChar'):
+            raise FieldBoundaryError("paragraph contains fields; refusing to collapse runs")
         full_text = paragraph.text
         idx = full_text.find(marker_text)
         before = full_text[:idx]
@@ -297,6 +320,7 @@ class DocxHandler:
         if after:
             r = paragraph.add_run(after)
             _apply_fmt(r)
+        self.invalidate_fields()
 
     # ── Insert-mode helpers ─────────────────────────────────────────
 
@@ -340,6 +364,7 @@ class DocxHandler:
             body_elem.remove(p_elem)
         logger.info(f"Removed {len(paragraphs) - start_para_idx} paragraphs "
                      f"(References section from para {start_para_idx})")
+        self.invalidate_fields()
 
     def append_bibliography(self, entries: list[str]):
         """Append a bibliography section to the end of the document."""
@@ -355,6 +380,7 @@ class DocxHandler:
             p = self.doc.add_paragraph()
             run = p.add_run(entry)
             run.font.size = Pt(10)
+        self.invalidate_fields()
 
     def save(self, output_path: str):
         """Save the document to a new path."""
