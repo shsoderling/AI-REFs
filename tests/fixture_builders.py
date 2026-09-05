@@ -54,7 +54,7 @@ def make_run(text: str | None = None, *, instr: str | None = None,
 class DocBuilder:
     def __init__(self):
         self.doc = Document()
-        self._ins_id = 100
+        self._rev_id = 100
 
     # ── paragraphs and plain runs ──────────────────────────────────
     def paragraph(self, text: str = ""):
@@ -198,8 +198,8 @@ class DocBuilder:
     def _tracked_change(self, kind: str):
         """Build an empty w:ins / w:del wrapper with a fresh revision id."""
         w = OxmlElement(f"w:{kind}")
-        self._ins_id += 1
-        w.set(qn("w:id"), str(self._ins_id))
+        self._rev_id += 1
+        w.set(qn("w:id"), str(self._rev_id))
         w.set(qn("w:author"), "tester")
         w.set(qn("w:date"), "2026-01-01T00:00:00Z")
         return w
