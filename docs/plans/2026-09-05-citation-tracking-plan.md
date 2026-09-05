@@ -433,8 +433,8 @@ def iter_text_runs(paragraph) -> list:
 @dataclass
 class RunInfo:
     elem: object            # the w:r element
-    deleted: bool           # inside a w:del (tracked deletion)
-    inserted: bool          # inside a w:ins
+    deleted: bool           # under w:del / w:moveFrom: gone in the final view
+    inserted: bool          # under w:ins / w:moveTo: present in the final view
 
 
 def iter_all_runs(paragraph):
@@ -484,7 +484,9 @@ git commit -m "feat(docx): add text-run and all-run walkers matching paragraph.t
 **Behaviour:**
 - `iter_complex_fields(body_elem)` walks every `w:r` under the body in document order (body paragraphs and table cells; `mc:Fallback` skipped), keeps a stack of open fields, concatenates `w:instrText` / `w:delInstrText` across runs and paragraphs, records `separate` and result runs, and closes on `end`. Nested fields are recorded with `depth`. An unmatched `begin` at the end of the document yields a field with `complete=False`. `w:fldSimple` elements are yielded as fields with `code = @w:instr` and their runs as result runs.
 - `classify_code(code)`: strip, then `"airefs_cite"` if it starts with `ADDIN AIREFS.CITE`, `"airefs_bibl"` for `ADDIN AIREFS.BIBL`, `"foreign"` for any other `ADDIN` whose code contains one of `EN.CITE`, `EN.REFLIST`, `CSL_CITATION`, `CSL_BIBLIOGRAPHY`, `ZOTERO_`, `Mendeley`, `CITATION`, `BIBLIOGRAPHY`; else `"other"` (page numbers, TOC, hyperlinks…).
-- `FieldIndex(doc)`: builds the field list once and answers `in_field(run_elem)`, `role(run_elem)` (`'marker'`, `'code'`, `'result'`, or `None`), `fields_in_paragraph(p_elem)`, `result_spans(paragraph)` (char spans over `paragraph.text` occupied by result runs of top-level fields), plus counters `airefs_cite`, `airefs_bibl`, `foreign`, `pending_tracked_changes` (any field with a run under `w:del` or `w:ins`), `in_tables` (fields whose begin run is inside a `w:tbl`).
+- `FieldIndex(doc)`: builds the field list once and answers `in_field(run_elem)`, `role(run_elem)` (`'marker'`, `'code'`, `'result'`, or `None`), `fields_in_paragraph(p_elem)`, `result_spans(paragraph)` (char spans over `paragraph.text` occupied by result runs of top-level fields), plus counters `airefs_cite`, `airefs_bibl`, `foreign`, `pending_tracked_changes` (any field with a run under `w:del`, `w:ins`, `w:moveFrom` or `w:moveTo`), `out_of_flow` (our fields whose begin run is inside a `w:tbl` **or** a `w:txbxContent`; `in_tables` is kept as an alias of it).
+- Final-view Track Changes semantics live in one helper, `run_ancestry(run, stop) -> RunAncestry` (`skip`, `deleted`, `inserted`, `in_table`, `in_text_box`, `tracked_change`): a run under `w:del` / `w:moveFrom` is `deleted` (gone), one under `w:ins` / `w:moveTo` is `inserted` (present). `docx_io.iter_all_runs` derives `RunInfo.deleted` / `.inserted` from the same helper, so the walker and the field reader never disagree on a tracked move (moved-from text keeps `w:t`, not `w:delText`, so text alone cannot reveal it).
+- `ComplexField.in_table` (under `w:tbl`) and `in_text_box` (under `w:txbxContent`) are separate flags; **`ComplexField.out_of_flow = in_table or in_text_box` is the flag every body-paragraph-index consumer must skip on** (Tasks 7, 16, 17): the paragraph of such a field is not in `doc.paragraphs`, and the design treats tables and text boxes alike. Keying on `in_table` alone would give text-box citations numbers.
 
 **Step 1: Write the failing test**
 
@@ -1486,7 +1488,7 @@ class TrackingReport(BaseModel):
             report.field_count = idx.airefs_cite
             report.bibl_field_count = idx.airefs_bibl
             report.foreign_field_count = idx.foreign
-            report.fields_in_tables = idx.in_tables
+            report.fields_in_tables = idx.out_of_flow     # tables and text boxes alike (Task 3)
             result.pending_tracked_changes = idx.pending_tracked_changes
             if report.foreign_field_count:
                 report.problems.append(
@@ -2645,7 +2647,7 @@ git commit -m "feat(export): headless fresh export writing citation and bibliogr
 **Behaviour of `build_tracked_map(handler, *, keep_uncited=False) -> ExistingCitationMap`:**
 1. `idx = handler.fields`; body paragraph index map `{id(p._p): i for i, p in enumerate(handler.get_paragraphs())}`.
 2. Walk `idx.fields` in order; keep `kind == 'airefs_cite'`, `depth == 0`, `not deleted`. Parse with `parse_cite_code`; `NewerSchemaError` → report tier `NEWER_VERSION` and return an empty map; `PayloadError` → `damaged` problem, skip the field.
-3. Records: first-appearance order over body citations → `record_uuid → number`. Fields in tables (`f.in_table`) are recorded in `tracking.fields_in_tables` and as `ReconcileIssue(kind="table")` but do not take part in numbering.
+3. Records: first-appearance order over body citations → `record_uuid → number`. Out-of-flow fields (`f.out_of_flow`, i.e. inside a table **or** a text box — never key on `f.in_table` alone, which would give text-box citations numbers) are recorded in `tracking.fields_in_tables` and as `ReconcileIssue(kind="table")` but do not take part in numbering; their `f.paragraphs[0]` is not in the body paragraph index map.
 4. For each body field: `para_idx = index of f.paragraphs[0]`; `char_offset` = offset of `f.result_runs[0]` inside `paragraph.text` computed over `iter_text_runs`; one `InTextCitation` per item with `number`, `is_superscript = payload.render == 'numeric-superscript'`, `cid`, `record_uuid`, `cluster_index`, `source='field'`, `unresolved`, `user_edited = (f.result_text != payload.plain)`. Unresolved fields (no items) get one entry with `number=0`, `unresolved=True`.
 5. Duplicate `citationID` → later occurrences get `mint_citation_id()` in memory and a `duplicate` issue; unknown cids are simply accepted (no registry yet) — no issue.
 6. `bib_entries[number] = ExistingBibEntry(original_number=number, record_uuid, item, uris, matched_candidate=from_csl_item(item) with record_uuid set, pmid/doi/title/year/journal copied from the candidate, entry_hash from BIBL when available)`.
@@ -2782,7 +2784,7 @@ git commit -m "feat: tracked reader — exact offline reopen from AIREFS fields"
 **Behaviour of `export_tracked(project, output_path, *, decisions=None) -> ExportStats`:**
 1. `handler = DocxHandler(input)`; `existing = project.existing_citations` (tracked map, re-read from `handler` when its hash differs); `layout = parse_csl_layout(settings.citation_style)`; if the style is numeric and the document's existing render is numeric, use `layout_for_existing_shape(layout, existing.detected_style_is_superscript)` unless the user switched style family (author-date ↔ numeric), in which case re-render every field.
 2. `plan = build_renumber_plan(handler, project)` (existing events come from field order; `seed_entries=settings.keep_uncited_entries`; entries flagged `is_uncited` in the map are seeded regardless).
-3. Table fields: for each `airefs_cite` field with `in_table`, compute its items' new numbers; if any differs from `payload.numbers` → `ExportBlocked(["Citations inside tables/text boxes would change number; …"])`.
+3. Out-of-flow fields: for each `airefs_cite` field with `out_of_flow` (table or text box), compute its items' new numbers; if any differs from `payload.numbers` → `ExportBlocked(["Citations inside tables/text boxes would change number; …"])`.
 4. Existing body fields (walk `handler.fields.fields` again, in order, matched to the map by `cid`): items → candidates (`bib_entries[n].matched_candidate` via `record_uuid`); `numbers = [renumber_result.number_for_candidate(c)]`; `text = render_cluster(cands, numbers, layout)`; `code = build_cite_code(cands, numbers=…, render=…, style=…, plain=text, citation_id=cid)`. If `text != f.result_text`: numeric → `rewrite_result` (count `hand_edits_overwritten` when the field was `user_edited`); author-date and `user_edited` → keep the text, `hand_edits_preserved += 1`, and put the current text as `plain`. If `code != f.code` → `rewrite_code`. `existing_refs_renumbered` counts fields whose numbers changed.
 5. Adjacent fields with no text between them (`f.end` immediately followed by the next field's `begin`): merge into one cluster (items concatenated, first cid kept, second field's runs removed) before step 4; `duplicates_merged += 1` per merge.
 6. New markers: as in `export_fresh` (numbers from the shared result; unresolved fields).

@@ -10,6 +10,8 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+from .docx_fields import run_ancestry
+
 logger = logging.getLogger(__name__)
 
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
@@ -57,8 +59,8 @@ def iter_text_runs(paragraph) -> list:
 @dataclass
 class RunInfo:
     elem: object            # the w:r element
-    deleted: bool           # inside a w:del (tracked deletion)
-    inserted: bool          # inside a w:ins
+    deleted: bool           # under w:del / w:moveFrom: gone in the final view
+    inserted: bool          # under w:ins / w:moveTo: present in the final view
 
 
 def iter_all_runs(paragraph):
@@ -66,23 +68,17 @@ def iter_all_runs(paragraph):
 
     Reaches runs nested in hyperlinks, tracked changes, content controls and
     text boxes. For field awareness only -- never for character offsets.
+
+    ``deleted`` / ``inserted`` follow final-view Track Changes semantics and
+    come from ``docx_fields.run_ancestry``, the same helper the field reader
+    uses, so a moved-from run (which keeps ``w:t``, unlike ``w:delText``) is
+    flagged deleted here exactly as its field is in ``FieldIndex``.
     """
     p_elem = paragraph._p
     for r in p_elem.iter(f'{{{W_NS}}}r'):
-        deleted = inserted = False
-        skip = False
-        anc = r.getparent()
-        while anc is not None and anc is not p_elem:
-            if anc.tag == f'{{{MC_NS}}}Fallback':
-                skip = True
-                break
-            if anc.tag == f'{{{W_NS}}}del':
-                deleted = True
-            elif anc.tag == f'{{{W_NS}}}ins':
-                inserted = True
-            anc = anc.getparent()
-        if not skip:
-            yield RunInfo(elem=r, deleted=deleted, inserted=inserted)
+        a = run_ancestry(r, p_elem)
+        if not a.skip:
+            yield RunInfo(elem=r, deleted=a.deleted, inserted=a.inserted)
 
 
 class DocxHandler:

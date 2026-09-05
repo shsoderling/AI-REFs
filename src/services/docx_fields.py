@@ -110,8 +110,8 @@ def _enclosing_paragraph(elem):
     return p
 
 
-class _Ancestry(NamedTuple):
-    """What the ancestors of a run say about it (see ``_ancestry``)."""
+class RunAncestry(NamedTuple):
+    """What the ancestors of a run say about it (see ``run_ancestry``)."""
     skip: bool          # under mc:Fallback: a duplicate of the mc:Choice content
     deleted: bool       # under w:del / w:moveFrom: gone in the final view
     inserted: bool      # under w:ins / w:moveTo: present in the final view
@@ -123,14 +123,19 @@ class _Ancestry(NamedTuple):
         return self.deleted or self.inserted
 
 
-def _ancestry(r, stop) -> _Ancestry:
-    """Inspect the ancestors of run *r* up to (not including) *stop*."""
+def run_ancestry(r, stop) -> RunAncestry:
+    """Inspect the ancestors of run *r* up to (not including) *stop*.
+
+    The single definition of final-view Track Changes semantics: both the
+    field reader here and ``docx_io.iter_all_runs`` derive their ``deleted``
+    / ``inserted`` flags from it, so they can never disagree on a run.
+    """
     deleted = inserted = in_table = in_text_box = False
     anc = r.getparent()
     while anc is not None and anc is not stop:
         tag = anc.tag
         if tag == _MC_FALLBACK:
-            return _Ancestry(True, deleted, inserted, in_table, in_text_box)
+            return RunAncestry(True, deleted, inserted, in_table, in_text_box)
         if tag in _REMOVED_WRAPPERS:
             deleted = True
         elif tag in _ADDED_WRAPPERS:
@@ -140,7 +145,7 @@ def _ancestry(r, stop) -> _Ancestry:
         elif tag == _w('txbxContent'):
             in_text_box = True
         anc = anc.getparent()
-    return _Ancestry(False, deleted, inserted, in_table, in_text_box)
+    return RunAncestry(False, deleted, inserted, in_table, in_text_box)
 
 
 def _instr_text(run) -> str:
@@ -162,7 +167,7 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
     fields: list[ComplexField] = []
     stack: list[ComplexField] = []
     for node in body_elem.iter(_w('r'), _w('fldSimple')):
-        a = _ancestry(node, body_elem)
+        a = run_ancestry(node, body_elem)
         if a.skip:
             continue
         if node.tag == _w('fldSimple'):
@@ -214,7 +219,7 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
     return fields
 
 
-def _note_run(f: ComplexField, p, a: _Ancestry):
+def _note_run(f: ComplexField, p, a: RunAncestry):
     """Record that a run in paragraph *p* with ancestry *a* belongs to *f*."""
     if p is not None and (not f.paragraphs or f.paragraphs[-1] is not p):
         f.paragraphs.append(p)

@@ -118,7 +118,7 @@ All export logic moves to headless `src/pipeline/docx_export.py` (`export_fresh`
 
 ### Read path (`ExistingCitationParser.analyze()` becomes a two-tier ladder)
 
-`src/services/docx_fields.py::iter_complex_fields(doc)` is a stack-based state machine over body paragraphs in document order: concatenates `w:instrText` across runs and paragraphs, honours `w:fldSimple`, `w:delInstrText`, and final-view Track Changes semantics (`w:del` ancestors = removed, `w:ins` = present, sets `pending_tracked_changes`).
+`src/services/docx_fields.py::iter_complex_fields(doc)` is a stack-based state machine over body paragraphs in document order: concatenates `w:instrText` across runs and paragraphs, honours `w:fldSimple`, `w:delInstrText`, and final-view Track Changes semantics (`w:del` / `w:moveFrom` ancestors = removed, `w:ins` / `w:moveTo` = present, sets `pending_tracked_changes`; the same `run_ancestry` helper feeds `docx_io.iter_all_runs`). Fields inside tables (`in_table`) and text boxes (`in_text_box`) are flagged `out_of_flow` — the flag body-paragraph-index consumers skip on.
 
 | Tier | Signal | Behaviour |
 |---|---|---|

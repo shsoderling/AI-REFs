@@ -78,3 +78,42 @@ def test_run_text_matches_python_docx_for_breaks_and_tabs(tmp_path):
     run = para.runs[0]._r
     assert run_text(run) == run.text == "a\t\nb"
     assert "".join(run_text(x) for x in iter_text_runs(para)) == para.text
+
+
+def test_all_runs_marks_tracked_moves(tmp_path):
+    """A move made with Track Changes on leaves the old copy under w:moveFrom
+    and the new copy under w:moveTo. Final view: moveFrom is gone (like
+    w:del), moveTo is present (like w:ins). Moved-from text keeps w:t, so
+    run_text alone cannot tell the stale copy from live text -- only the
+    deleted flag can."""
+    b = DocBuilder()
+    p = b.paragraph("A")
+    b.add_text(p, "B", wrap="moveFrom")
+    b.add_text(p, "C", wrap="moveTo")
+    para = Document(str(b.save(tmp_path / "mv.docx"))).paragraphs[0]
+    by_text = {run_text(i.elem): (i.deleted, i.inserted) for i in iter_all_runs(para)}
+    assert by_text == {"A": (False, False), "B": (True, False), "C": (False, True)}
+
+
+def test_all_runs_and_field_index_agree_on_final_view(tmp_path):
+    """There is one definition of 'gone in the final view': every run of a
+    field, as seen through iter_all_runs, carries the same deleted/inserted
+    flags as the field itself in FieldIndex, for all four wrapper kinds."""
+    from src.services.docx_fields import FieldIndex
+    from tests.fixture_builders import TRACKED_CHANGE_KINDS
+
+    b = DocBuilder()
+    paras = []
+    for kind in TRACKED_CHANGE_KINDS:
+        p = b.paragraph("")
+        b.add_field(p, code=f' ADDIN AIREFS.CITE {{"k":"{kind}"}} ', result="1", wrap=kind)
+        paras.append(p)
+    doc = Document(str(b.save(tmp_path / "agree.docx")))
+    idx = FieldIndex(doc)
+    assert [f.deleted for f in idx.fields] == [False, True, True, False]
+    assert [f.inserted for f in idx.fields] == [True, False, False, True]
+    for para, f in zip(doc.paragraphs, idx.fields):
+        infos = list(iter_all_runs(para))
+        assert infos, "field runs must be reachable through iter_all_runs"
+        assert all(idx.field_of(i.elem) is f for i in infos)
+        assert {(i.deleted, i.inserted) for i in infos} == {(f.deleted, f.inserted)}
