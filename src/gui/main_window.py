@@ -25,8 +25,8 @@ from ..models.evidence import ReviewDecision
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.docx_export import (
-    ExportBlocked, check_export_guard, export_fresh, export_tracked,
-    fresh_append_needs_confirmation,
+    STRIPPED_NOTE, ExportBlocked, check_export_guard, export_fresh, export_tracked,
+    fresh_append_needs_confirmation, looks_stripped,
 )
 from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
@@ -150,6 +150,11 @@ class MainWindow(QMainWindow):
         self._project.input_docx_path = path
         self._project.project_name = Path(path).stem
 
+        # What the last export of this project wrote: lets us recognise that
+        # export coming back without its citation fields.
+        previous_output = self._project.output_docx_path
+        previous_hashes = list(self._project.entry_hashes)
+
         # Discard results from any previously loaded document — sentence IDs
         # restart at S001 for every document, so stale evidence would attach
         # to the wrong sentences.
@@ -162,7 +167,7 @@ class MainWindow(QMainWindow):
         self._project.input_docx_hash = self._hash_file(path)
 
         try:
-            self._analyze_document(path)
+            self._analyze_document(path, previous_output, previous_hashes)
         except Exception as e:                     # unreadable / corrupt / not a DOCX
             logger.exception("Could not open document")
             self._project.input_docx_path = None
@@ -206,6 +211,8 @@ class MainWindow(QMainWindow):
                 return "foreign"
             if tracking.tier == DocumentTier.TRACKED:
                 return "tracked"
+            if tracking.tier == DocumentTier.STRIPPED:
+                return "stripped"
         return "legacy" if existing.has_existing_citations else "fresh"
 
     def _apply_document_mode(self, existing):
@@ -215,19 +222,28 @@ class MainWindow(QMainWindow):
         self.inputs_tab.set_document_mode(mode, report, n)
         return mode
 
-    def _analyze_document(self, path: str):
+    def _analyze_document(self, path: str, previous_output: Optional[str] = None,
+                          previous_hashes: Optional[list[str]] = None):
         """Analyse the document's existing citations and set the project mode.
 
         ``analyze()`` never raises: a failure comes back as a FAILED tracking
         report, which is kept on the project so the export guard can refuse
         to write, and shown in the banner instead of silently treating the
-        document as uncited.
+        document as uncited. A former export that lost its citation fields
+        (Google Docs, Pages...) is recognised from the project's mirror and
+        read from its text.
         """
         handler = DocxHandler(path)
-        existing = ExistingCitationParser(handler).analyze()
+        existing = ExistingCitationParser(
+            handler, keep_uncited=self._project.settings.keep_uncited_entries).analyze()
+        if looks_stripped(existing, path, previous_output, previous_hashes or []):
+            existing.tracking.tier = DocumentTier.STRIPPED
+            existing.tracking.problems.append(STRIPPED_NOTE)
+            logger.warning("Tracking data stripped from a former export: reading citations from text")
         self._project.existing_citations = existing
+        self._project.doc_tracking = existing.tracking
         mode = self._apply_document_mode(existing)
-        self._project.is_insert_mode = (mode in ("legacy", "foreign", "tracked")
+        self._project.is_insert_mode = (mode in ("legacy", "foreign", "tracked", "stripped")
                                         and existing.has_existing_citations)
         if mode == "analysis-failed":
             logger.warning(f"Existing-citation analysis failed: {existing.tracking.problems}")

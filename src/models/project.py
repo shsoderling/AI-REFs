@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from .sentence import SentenceRecord
 from .evidence import EvidenceRecord
 from .existing_refs import ExistingCitationMap
+from .embedded import TrackingReport
 
 
 class CitationStyle(str, Enum):
@@ -188,8 +189,13 @@ class ProjectSettings(BaseModel):
     generate_bibtex: bool = Field(default=False)
 
 
+PROJECT_SCHEMA_VERSION = 2
+
+
 class ProjectState(BaseModel):
     """Complete state of an AI REFs project, enabling save/load/resume."""
+    schema_version: int = Field(default=PROJECT_SCHEMA_VERSION)
+
     # Project metadata
     project_name: str = Field(default="Untitled Project")
     project_path: Optional[str] = Field(default=None, description="Path to .airefsproj file")
@@ -219,18 +225,16 @@ class ProjectState(BaseModel):
     inferred_domains: list[str] = Field(default_factory=list)
     document_keywords: list[str] = Field(default_factory=list)
 
-    # Bibliography tracking
-    bibliography_pmids: list[str] = Field(default_factory=list, description="Ordered list of PMIDs for bibliography")
-    pmid_to_bib_number: dict[str, int] = Field(default_factory=dict, description="PMID -> bibliography entry number")
-
     # Insert mode: adding references to a pre-cited document
     is_insert_mode: bool = Field(default=False, description="True when adding refs to a pre-cited document")
     existing_citations: Optional[ExistingCitationMap] = Field(default=None, description="Parsed pre-existing citations (insert mode only)")
 
     # Tracked document mirror (written at export; the document is the source of truth)
     doc_id: str = Field(default="", description="Identity of the tracked document, carried in its bibliography field")
+    doc_tracking: Optional[TrackingReport] = Field(default=None, description="How the loaded document was read")
     record_order: list[str] = Field(default_factory=list, description="Record uuids in bibliography order at the last export")
     uncited: list[str] = Field(default_factory=list, description="Record uuids kept without a citation at the last export")
+    entry_hashes: list[str] = Field(default_factory=list, description="Hashes of the bibliography entries written at the last export")
 
     @property
     def total_markers(self) -> int:

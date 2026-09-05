@@ -31,6 +31,8 @@ from .renumbering import RenumberingResult
 logger = logging.getLogger(__name__)
 
 BIBLIOGRAPHY_HEADING = "References"
+STRIPPED_NOTE = ("This document was exported by AI REFs but its citation tracking data is gone "
+                 "(edited in Google Docs or Pages?). Citations are read from the text.")
 
 
 @dataclass
@@ -90,8 +92,10 @@ def check_export_guard(existing: Optional[ExistingCitationMap], mode: str,
                 "can read. Exporting would append a second bibliography; confirm to "
                 "treat the document as uncited.")
     if mode == "legacy" and tracking is not None and tracking.problems:
-        reasons.append("The existing citations could not be read reliably: "
-                       + "; ".join(tracking.problems))
+        blocking = [p for p in tracking.problems if not p.startswith(STRIPPED_NOTE[:25])]
+        if blocking:
+            reasons.append("The existing citations could not be read reliably: "
+                           + "; ".join(blocking))
     if mode == "legacy" and existing.bib_entries:
         matched = len({c.number for cites in existing.in_text_citations.values()
                        for c in cites} & set(existing.bib_entries))
@@ -203,6 +207,7 @@ def export_fresh(project: ProjectState, output_path: str) -> ExportStats:
     project.output_docx_path = output_path
     project.record_order = list(order)
     project.uncited = []
+    project.entry_hashes = [entry_hash(e) for e in entries]
     stats.new_refs_added = len(entries)
     stats.bibliography_size = len(entries)
     logger.info(f"Exported document with {len(entries)} bibliography entries: {output_path}")
@@ -295,8 +300,34 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
     project.output_docx_path = output_path
     project.record_order = list(order)
     project.uncited = list(uncited)
+    project.entry_hashes = list(hashes)
     stats.new_refs_added = sum(1 for a in result.assignments.values() if a.is_new)
     stats.bibliography_size = len(entries)
     stats.entries_seeded_uncited = len(result.seeded_uncited)
     logger.info(f"Tracked export complete: {len(entries)} bibliography entries: {output_path}")
     return stats
+
+
+def looks_stripped(existing: Optional[ExistingCitationMap], path: str,
+                   previous_output_path: Optional[str], previous_entry_hashes: list[str]) -> bool:
+    """True when a document without citation fields is very likely a former
+    AI REFs export whose fields were stripped (Google Docs, Pages, RTF...):
+    it is the file the project last exported, or at least half of the
+    bibliography entries written then are still there verbatim."""
+    if existing is None or existing.tracking is None:
+        return False
+    if existing.tracking.tier not in (DocumentTier.LEGACY, DocumentTier.STRIPPED) \
+            or existing.tracking.field_count:
+        return False
+    if previous_output_path:
+        try:
+            from pathlib import Path
+            if Path(path).resolve() == Path(previous_output_path).resolve():
+                return True
+        except OSError:
+            pass
+    if not previous_entry_hashes or not existing.bib_entries:
+        return False
+    found = {entry_hash(e.raw_text) for e in existing.bib_entries.values()}
+    matched = sum(1 for h in previous_entry_hashes if h in found)
+    return matched * 2 >= len(previous_entry_hashes)
