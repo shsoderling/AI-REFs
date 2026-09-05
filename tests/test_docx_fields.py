@@ -37,6 +37,35 @@ def test_split_instr_text_is_concatenated(tmp_path):
     assert f.code == 'ADDIN AIREFS.CITE {"title":"a~b"}'
 
 
+def test_del_instr_text_is_concatenated(tmp_path):
+    """A field code partly under a tracked deletion (w:delInstrText) still
+    reads as one code string."""
+    def build(b):
+        p = b.paragraph("")
+        for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"t":'),
+                  make_run(instr='"a"} ', deleted=True), make_run(fldchar="separate"),
+                  make_run("1"), make_run(fldchar="end")):
+            p._p.append(r)
+    f = iter_complex_fields(_doc(tmp_path, build).element.body)[0]
+    assert f.code == 'ADDIN AIREFS.CITE {"t":"a"}'
+    assert len(f.code_runs) == 2
+
+
+def test_runs_without_instr_text_in_code_part_are_code_runs(tmp_path):
+    """Everything between begin and separate is inside the field, even a run
+    that carries no instrText; only the code string comes from instrText."""
+    def build(b):
+        p = b.paragraph("")
+        for r in (make_run(fldchar="begin"), make_run(), make_run(instr=" PAGE "),
+                  make_run(fldchar="separate"), make_run("7"), make_run(fldchar="end")):
+            p._p.append(r)
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    roles = [idx.role(r) for r in doc.paragraphs[0].runs]
+    assert roles == ["marker", "code", "code", "marker", "result", "marker"]
+    assert idx.fields[0].code == "PAGE"
+
+
 def test_field_spanning_paragraphs(tmp_path):
     def build(b):
         p = b.paragraph("")

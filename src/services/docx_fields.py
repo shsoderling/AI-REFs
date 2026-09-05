@@ -114,16 +114,19 @@ def _ancestor_flags(r, stop):
     return False, deleted, inserted, in_table
 
 
-def _instr_text(run) -> Optional[str]:
-    """Concatenated ``w:instrText`` / ``w:delInstrText`` of a run, or None if
-    the run carries no field code at all."""
-    parts = [child.text or '' for child in run
-             if child.tag in (_w('instrText'), _w('delInstrText'))]
-    return ''.join(parts) if parts else None
+def _instr_text(run) -> str:
+    """Concatenated ``w:instrText`` / ``w:delInstrText`` of a run ('' if none)."""
+    return ''.join(child.text or '' for child in run
+                   if child.tag in (_w('instrText'), _w('delInstrText')))
 
 
 def iter_complex_fields(body_elem) -> list[ComplexField]:
-    """All fields under *body_elem* in document order (stack-based)."""
+    """All fields under *body_elem* in document order (stack-based).
+
+    Reaches body paragraphs, table cells and text boxes (``mc:Fallback``
+    duplicates skipped). ``w:fldSimple`` elements are yielded as complete
+    fields whose child runs are the result.
+    """
     fields: list[ComplexField] = []
     stack: list[ComplexField] = []
     for node in body_elem.iter(_w('r'), _w('fldSimple')):
@@ -165,16 +168,15 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
             continue
         f = stack[-1]
         _note_run(f, p, deleted, inserted)
-        instr = _instr_text(node)
-        if instr is not None and f.separate is None:
+        if f.separate is None:          # between begin and separate: field code
             f.code_runs.append(node)
-            f.code += instr
-        elif f.separate is not None:
+            f.code += _instr_text(node)
+        else:                           # between separate and end: cached result
             f.result_runs.append(node)
     for f in stack:                       # unmatched begins
         f.code = f.code.strip()
         f.kind = classify_code(f.code)
-        logger.warning("Unmatched field begin (%s); document may be damaged", f.kind)
+        logger.warning("Field begin without a matching end (kind=%s)", f.kind)
     return fields
 
 
