@@ -7,6 +7,7 @@ in this module touches Qt, so every export path is testable end to end.
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 from ..models.citation import CitationCandidate
@@ -16,6 +17,12 @@ from ..models.project import CitationStyle, ProjectSettings, ProjectState
 from ..services.docx_io import DocxHandler
 from .bib_format import format_bib_entry
 from .citation_payload import build_bibl_code, build_cite_code, entry_hash
+from .citation_render import layout_for_existing_shape
+from .field_citation_reader import build_tracked_map
+from .tracked_renumber import (
+    blocked_table_fields, collect_clusters, orphan_heading, render_tracked_bibliography,
+    rewrite_clusters,
+)
 from .citation_render import UNRESOLVED_TEXT, CitationLayout, parse_csl_layout, render_cluster
 from .export_stats import ExportStats
 from .renumber_plan import build_renumber_plan
@@ -24,6 +31,12 @@ from .renumbering import RenumberingResult
 logger = logging.getLogger(__name__)
 
 BIBLIOGRAPHY_HEADING = "References"
+
+
+@dataclass
+class ExportDecisions:
+    """Answers the GUI collected before a legacy export (see export_legacy)."""
+    convert_to_author_date: Optional[bool] = None   # numeric document + author-date style
 
 
 class ExportBlocked(Exception):
@@ -193,4 +206,97 @@ def export_fresh(project: ProjectState, output_path: str) -> ExportStats:
     stats.new_refs_added = len(entries)
     stats.bibliography_size = len(entries)
     logger.info(f"Exported document with {len(entries)} bibliography entries: {output_path}")
+    return stats
+
+
+# ── tracked export ────────────────────────────────────────────────────
+
+def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
+    """Export a tracked document: renumber through its citation fields, add
+    fields for new markers and rebuild the bibliography field in place.
+
+    The document's fields are the source of truth, so the map is re-read
+    from the file being written (offline). Raises :class:`ExportBlocked`
+    when the guard refuses (pending tracked changes, damaged analysis), a
+    table citation would have to change, or validation fails; nothing is
+    written in those cases.
+    """
+    settings = project.settings
+    style = settings.citation_style
+    handler = DocxHandler(project.input_docx_path)
+    existing = build_tracked_map(handler, keep_uncited=settings.keep_uncited_entries)
+    project.existing_citations = existing
+    reasons = check_export_guard(existing, "tracked", settings)
+    if reasons:
+        raise ExportBlocked(reasons)
+    layout = parse_csl_layout(style)
+    stats = ExportStats(output_path=output_path)
+    stats.uncited_dropped = sum(1 for i in existing.tracking.reconcile if i.kind == 'uncited')
+
+    clusters, table_fields = collect_clusters(handler, stats)
+    stats.tables_citations = len(table_fields)
+    plan = build_renumber_plan(handler, project)
+    result = plan.renumber_result
+    stats.total_markers = len(plan.markers)
+    logger.info(f"Tracked export: style={style.value} clusters={len(clusters)} "
+                f"markers={len(plan.markers)} records={len(result.assignments)}")
+
+    blocked = blocked_table_fields(table_fields, existing, result, layout)
+    if blocked:
+        raise ExportBlocked(blocked)
+
+    # 1. existing citations: new numbers, text and payload
+    rewrite_clusters(clusters, existing, result, layout, style, stats)
+
+    # 2. new markers
+    for i, marker_info in enumerate(plan.markers):
+        candidates = plan.marker_resolved_map[i]
+        sentence = plan.marker_sentences[i]
+        numbers = [n for n in (result.number_for_candidate(c) for c in candidates) if n is not None]
+        _write_cluster(handler, marker_info['paragraph'], f"({marker_info['marker_type']})",
+                       candidates, numbers, layout, style, True, stats)
+        if candidates:
+            stats.resolved_markers += 1
+        else:
+            stats.unresolved_markers += 1
+            if sentence and sentence.id not in stats.unresolved_sentence_ids:
+                stats.unresolved_sentence_ids.append(sentence.id)
+
+    # 3. bibliography, replaced in place (or regenerated when its field is gone)
+    entries, order, uncited, hashes = render_tracked_bibliography(existing, result, style, layout)
+    project.doc_id = project.doc_id or existing.tracking.doc_id or str(uuid.uuid4())
+    bibl_field = next((f for f in handler.fields.fields
+                       if f.kind == 'airefs_bibl' and f.depth == 0 and not f.deleted), None)
+    if entries:
+        code = build_bibl_code(doc_id=project.doc_id, style=style.value, render=layout.render_kind,
+                               heading_text=BIBLIOGRAPHY_HEADING, order=order, uncited=uncited,
+                               entry_hashes=hashes)
+        if bibl_field is not None:
+            handler.replace_bibliography_field(bibl_field, entries, code)
+        else:
+            heading = orphan_heading(handler)
+            if heading is not None:
+                handler._insert_anchor = heading._p.getnext()
+                handler.ensure_bibliography_styles()
+                handler._place_new_paragraphs(handler._new_entry_paragraphs(entries, code))
+                handler.invalidate_fields()
+            else:
+                handler.write_bibliography_field(entries, code, heading_text=BIBLIOGRAPHY_HEADING)
+            stats.bibliography_regenerated = True
+    elif bibl_field is not None:
+        handler.remove_references_section(*existing.bibliography_span) if existing.bibliography_span[0] >= 0 else None
+
+    expected = len(clusters) + len(table_fields) + len(plan.markers) + sum(
+        1 for f in handler.fields.fields if f.kind == 'airefs_cite' and f.deleted)
+    problems = handler.validate_before_save(expected_cite_fields=expected)
+    if problems:
+        raise ExportBlocked(problems)
+    handler.save(output_path)
+    project.output_docx_path = output_path
+    project.record_order = list(order)
+    project.uncited = list(uncited)
+    stats.new_refs_added = sum(1 for a in result.assignments.values() if a.is_new)
+    stats.bibliography_size = len(entries)
+    stats.entries_seeded_uncited = len(result.seeded_uncited)
+    logger.info(f"Tracked export complete: {len(entries)} bibliography entries: {output_path}")
     return stats

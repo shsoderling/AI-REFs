@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Slot, Qt, QThread, QUrl
 from PySide6.QtGui import QColor, QFont, QDesktopServices
 
+from ..models.embedded import DocumentTier
 from ..models.project import ProjectState
 from ..models.sentence import SentenceRecord, MarkerType
 from ..models.evidence import (
@@ -613,8 +614,14 @@ class ReviewTab(QWidget):
             + (" — Ready to export!" if all_done and total > 0 else "")
         )
 
-        self.export_btn.setEnabled(all_done and total > 0)
-        if all_done and total > 0:
+        # A tracked document can be exported with no new markers at all:
+        # that renumbers it after edits made in Word.
+        tracked = (self._project.existing_citations is not None
+                   and self._project.existing_citations.tracking is not None
+                   and self._project.existing_citations.tracking.tier == DocumentTier.TRACKED)
+        exportable = (all_done and total > 0) or (tracked and all_done)
+        self.export_btn.setEnabled(exportable)
+        if exportable:
             self.export_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         else:
             self.export_btn.setStyleSheet("background-color: #ccc; color: #666;")

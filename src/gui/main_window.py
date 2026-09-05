@@ -25,7 +25,8 @@ from ..models.evidence import ReviewDecision
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.docx_export import (
-    ExportBlocked, check_export_guard, export_fresh, fresh_append_needs_confirmation,
+    ExportBlocked, check_export_guard, export_fresh, export_tracked,
+    fresh_append_needs_confirmation,
 )
 from ..pipeline.citation_render import parse_csl_layout
 from ..models.embedded import DocumentTier
@@ -199,8 +200,12 @@ class MainWindow(QMainWindow):
         if tracking is not None:
             if tracking.tier == DocumentTier.FAILED:
                 return "analysis-failed"
+            if tracking.tier == DocumentTier.NEWER_VERSION:
+                return "newer-version"
             if tracking.foreign_field_count:
                 return "foreign"
+            if tracking.tier == DocumentTier.TRACKED:
+                return "tracked"
         return "legacy" if existing.has_existing_citations else "fresh"
 
     def _apply_document_mode(self, existing):
@@ -222,7 +227,8 @@ class MainWindow(QMainWindow):
         existing = ExistingCitationParser(handler).analyze()
         self._project.existing_citations = existing
         mode = self._apply_document_mode(existing)
-        self._project.is_insert_mode = mode in ("legacy", "foreign") and existing.has_existing_citations
+        self._project.is_insert_mode = (mode in ("legacy", "foreign", "tracked")
+                                        and existing.has_existing_citations)
         if mode == "analysis-failed":
             logger.warning(f"Existing-citation analysis failed: {existing.tracking.problems}")
             return existing
@@ -317,7 +323,12 @@ class MainWindow(QMainWindow):
             return
 
         existing = self._project.existing_citations
-        mode = "legacy" if (self._project.is_insert_mode and existing) else "fresh"
+        is_tracked = (existing is not None and existing.tracking is not None
+                      and existing.tracking.tier == DocumentTier.TRACKED)
+        if is_tracked:
+            mode = "tracked"
+        else:
+            mode = "legacy" if (self._project.is_insert_mode and existing) else "fresh"
         allow_fresh_append = False
         if mode == "fresh" and fresh_append_needs_confirmation(existing):
             choice = QMessageBox.question(
@@ -398,7 +409,11 @@ class MainWindow(QMainWindow):
 
         Returns export statistics, or None if the user cancelled.
         """
-        if self._project.is_insert_mode and self._project.existing_citations:
+        existing = self._project.existing_citations
+        if (existing is not None and existing.tracking is not None
+                and existing.tracking.tier == DocumentTier.TRACKED):
+            return export_tracked(self._project, output_path)
+        if self._project.is_insert_mode and existing:
             return self._do_insert_export(output_path)
         return self._do_fresh_export(output_path)
 
