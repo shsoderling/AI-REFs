@@ -1,5 +1,6 @@
 """Tests for the OOXML fixture builders used by the DOCX edge-case suite."""
 
+import pytest
 from docx import Document
 
 from tests.fixture_builders import (
@@ -58,3 +59,26 @@ def test_builder_tracked_change_wrappers_and_multi_wt(tmp_path):
     assert "<w:ins" in body_xml and "<w:del" in body_xml
     # make_run preserves whitespace on w:delText exactly as it does on w:t
     assert '<w:delText xml:space="preserve">C</w:delText>' in body_xml
+
+
+def test_builder_tracked_move_wrappers(tmp_path):
+    b = DocBuilder()
+    p = b.paragraph("A")
+    b.add_text(p, "B", wrap="moveFrom")
+    b.add_text(p, "C", wrap="moveTo")
+    path = b.save(tmp_path / "m.docx")
+    para = Document(str(path)).paragraphs[0]
+    # python-docx ignores w:moveFrom/w:moveTo content in paragraph.text
+    assert para.text == "A"
+    body_xml = para._p.xml
+    assert "<w:moveFrom " in body_xml and "<w:moveTo " in body_xml
+    # unlike w:del, moved-from text keeps w:t (ECMA-376 17.13.5.22)
+    assert "<w:delText" not in body_xml
+    assert '<w:t xml:space="preserve">B</w:t>' in body_xml
+
+
+def test_builder_rejects_unknown_tracked_change_kind():
+    b = DocBuilder()
+    p = b.paragraph("A")
+    with pytest.raises(ValueError):
+        b.add_text(p, "B", wrap="moved")

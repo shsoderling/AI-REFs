@@ -157,6 +157,51 @@ def test_fields_in_tables_are_counted(tmp_path):
         b.add_field(cell_p, code=' ADDIN AIREFS.CITE {"a":9} ', result="9")
     idx = FieldIndex(_doc(tmp_path, build))
     assert idx.airefs_cite == 1 and idx.in_tables == 1
+    f = idx.fields[0]
+    assert f.in_table is True and f.in_text_box is False and f.out_of_flow is True
+
+
+def test_text_box_field_is_out_of_flow(tmp_path):
+    """A field inside a text box (w:txbxContent) is not a body field: its
+    paragraph is not in doc.paragraphs, so consumers that index body
+    paragraphs must skip it exactly as they skip table fields."""
+    def build(b):
+        p = b.paragraph("Body")
+
+        def fill(inner_p):
+            for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"a":3} '),
+                      make_run(fldchar="separate"), make_run("3"), make_run(fldchar="end")):
+                inner_p.append(r)
+        b.add_text_box(p, fill)
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    assert idx.airefs_cite == 1
+    f = idx.fields[0]
+    assert f.in_text_box is True and f.in_table is False and f.out_of_flow is True
+    assert idx.out_of_flow == 1 and idx.in_tables == 1
+    body_ps = [para._p for para in doc.paragraphs]
+    assert not any(f.paragraphs[0] is bp for bp in body_ps)
+    assert idx.fields_in_paragraph(doc.paragraphs[0]) == []
+
+
+def test_tracked_move_is_one_live_field(tmp_path):
+    """Moving a sentence with Track Changes on leaves the old copy under
+    w:moveFrom and the new copy under w:moveTo. In final view the moveFrom
+    copy is gone (like w:del) and the moveTo copy is present (like w:ins);
+    both are pending tracked changes."""
+    def build(b):
+        p1 = b.paragraph("")
+        b.add_field(p1, code=' ADDIN AIREFS.CITE {"a":1} ', result="1", wrap="moveFrom")
+        p2 = b.paragraph("")
+        b.add_field(p2, code=' ADDIN AIREFS.CITE {"a":1} ', result="1", wrap="moveTo")
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    assert idx.airefs_cite == 2
+    assert [f.deleted for f in idx.fields] == [True, False]
+    assert [f.inserted for f in idx.fields] == [False, True]
+    assert [f.tracked_change for f in idx.fields] == [True, True]
+    assert idx.pending_tracked_changes is True
+    assert sum(1 for f in idx.fields if not f.deleted) == 1
 
 
 def test_classify_code():

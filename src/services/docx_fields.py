@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,12 @@ def _w(tag: str) -> str:
 
 
 _MC_FALLBACK = f'{{{MC_NS}}}Fallback'
+
+# Final-view Track Changes semantics. A move made with Track Changes on leaves
+# the old copy under w:moveFrom (gone, like w:del) and the new copy under
+# w:moveTo (present, like w:ins); both are pending changes.
+_REMOVED_WRAPPERS = frozenset({_w('del'), _w('moveFrom')})
+_ADDED_WRAPPERS = frozenset({_w('ins'), _w('moveTo')})
 
 CITE_PREFIX = 'ADDIN AIREFS.CITE'
 BIBL_PREFIX = 'ADDIN AIREFS.BIBL'
@@ -54,14 +60,22 @@ class ComplexField:
     end: Optional[object] = None
     paragraphs: list = field(default_factory=list)  # w:p elements spanned, in order
     depth: int = 0
-    deleted: bool = False           # begin run sits under w:del (field removed in final view)
-    inserted: bool = False          # begin run sits under w:ins
-    tracked_change: bool = False    # any run of the field sits under w:del / w:ins
+    deleted: bool = False           # begin run under w:del / w:moveFrom (gone in final view)
+    inserted: bool = False          # begin run under w:ins / w:moveTo (present in final view)
+    tracked_change: bool = False    # any run of the field under a tracked-change wrapper
     complete: bool = False
     simple: bool = False
     code: str = ''
     kind: str = 'other'
-    in_table: bool = False
+    in_table: bool = False          # begin run inside a w:tbl
+    in_text_box: bool = False       # begin run inside a w:txbxContent (DrawingML or VML box)
+
+    @property
+    def out_of_flow(self) -> bool:
+        """True for table and text-box fields. Their paragraph is not in
+        ``doc.paragraphs``, so body-paragraph indexing and first-appearance
+        numbering must skip them; the design treats both alike."""
+        return self.in_table or self.in_text_box
 
     @property
     def result_text(self) -> str:
@@ -96,22 +110,37 @@ def _enclosing_paragraph(elem):
     return p
 
 
-def _ancestor_flags(r, stop):
-    """(skip_fallback, deleted, inserted, in_table) for a run."""
-    deleted = inserted = in_table = False
+class _Ancestry(NamedTuple):
+    """What the ancestors of a run say about it (see ``_ancestry``)."""
+    skip: bool          # under mc:Fallback: a duplicate of the mc:Choice content
+    deleted: bool       # under w:del / w:moveFrom: gone in the final view
+    inserted: bool      # under w:ins / w:moveTo: present in the final view
+    in_table: bool      # under w:tbl
+    in_text_box: bool   # under w:txbxContent
+
+    @property
+    def tracked_change(self) -> bool:
+        return self.deleted or self.inserted
+
+
+def _ancestry(r, stop) -> _Ancestry:
+    """Inspect the ancestors of run *r* up to (not including) *stop*."""
+    deleted = inserted = in_table = in_text_box = False
     anc = r.getparent()
     while anc is not None and anc is not stop:
         tag = anc.tag
         if tag == _MC_FALLBACK:
-            return True, deleted, inserted, in_table
-        if tag == _w('del'):
+            return _Ancestry(True, deleted, inserted, in_table, in_text_box)
+        if tag in _REMOVED_WRAPPERS:
             deleted = True
-        elif tag == _w('ins'):
+        elif tag in _ADDED_WRAPPERS:
             inserted = True
         elif tag == _w('tbl'):
             in_table = True
+        elif tag == _w('txbxContent'):
+            in_text_box = True
         anc = anc.getparent()
-    return False, deleted, inserted, in_table
+    return _Ancestry(False, deleted, inserted, in_table, in_text_box)
 
 
 def _instr_text(run) -> str:
@@ -124,20 +153,24 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
     """All fields under *body_elem* in document order (stack-based).
 
     Reaches body paragraphs, table cells and text boxes (``mc:Fallback``
-    duplicates skipped). ``w:fldSimple`` elements are yielded as complete
-    fields whose child runs are the result.
+    duplicates skipped); table and text-box fields are flagged ``in_table`` /
+    ``in_text_box`` (together: ``out_of_flow``). Tracked changes follow the
+    final view: a field under ``w:del`` or ``w:moveFrom`` is ``deleted``, one
+    under ``w:ins`` or ``w:moveTo`` is ``inserted``. ``w:fldSimple`` elements
+    are yielded as complete fields whose child runs are the result.
     """
     fields: list[ComplexField] = []
     stack: list[ComplexField] = []
     for node in body_elem.iter(_w('r'), _w('fldSimple')):
-        skip, deleted, inserted, in_table = _ancestor_flags(node, body_elem)
-        if skip:
+        a = _ancestry(node, body_elem)
+        if a.skip:
             continue
         if node.tag == _w('fldSimple'):
             f = ComplexField(begin=node, simple=True, complete=True,
                              code=(node.get(_w('instr')) or '').strip(),
-                             depth=len(stack), deleted=deleted, inserted=inserted,
-                             tracked_change=deleted or inserted, in_table=in_table)
+                             depth=len(stack), deleted=a.deleted, inserted=a.inserted,
+                             tracked_change=a.tracked_change,
+                             in_table=a.in_table, in_text_box=a.in_text_box)
             f.result_runs = list(node.iter(_w('r')))
             f.paragraphs = [_enclosing_paragraph(node)]
             f.kind = classify_code(f.code)
@@ -148,26 +181,27 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
         if fc is not None:
             ftype = fc.get(_w('fldCharType'))
             if ftype == 'begin':
-                f = ComplexField(begin=node, depth=len(stack), deleted=deleted,
-                                 inserted=inserted, tracked_change=deleted or inserted,
-                                 in_table=in_table, paragraphs=[p])
+                f = ComplexField(begin=node, depth=len(stack), deleted=a.deleted,
+                                 inserted=a.inserted, tracked_change=a.tracked_change,
+                                 in_table=a.in_table, in_text_box=a.in_text_box,
+                                 paragraphs=[p])
                 stack.append(f)
                 fields.append(f)
             elif ftype == 'separate' and stack:
                 stack[-1].separate = node
-                _note_run(stack[-1], p, deleted, inserted)
+                _note_run(stack[-1], p, a)
             elif ftype == 'end' and stack:
                 f = stack.pop()
                 f.end = node
                 f.complete = True
-                _note_run(f, p, deleted, inserted)
+                _note_run(f, p, a)
                 f.code = f.code.strip()
                 f.kind = classify_code(f.code)
             continue
         if not stack:
             continue
         f = stack[-1]
-        _note_run(f, p, deleted, inserted)
+        _note_run(f, p, a)
         if f.separate is None:          # between begin and separate: field code
             f.code_runs.append(node)
             f.code += _instr_text(node)
@@ -180,12 +214,11 @@ def iter_complex_fields(body_elem) -> list[ComplexField]:
     return fields
 
 
-def _note_run(f: ComplexField, p, deleted: bool, inserted: bool):
-    """Record that a run in paragraph *p* with the given tracked-change flags
-    belongs to field *f*."""
+def _note_run(f: ComplexField, p, a: _Ancestry):
+    """Record that a run in paragraph *p* with ancestry *a* belongs to *f*."""
     if p is not None and (not f.paragraphs or f.paragraphs[-1] is not p):
         f.paragraphs.append(p)
-    if deleted or inserted:
+    if a.tracked_change:
         f.tracked_change = True
 
 
@@ -229,12 +262,20 @@ class FieldIndex:
         return sum(1 for f in self.fields if f.kind == 'foreign')
 
     @property
+    def out_of_flow(self) -> int:
+        """Our own fields inside a table or a text box (``ComplexField.out_of_flow``)."""
+        return sum(1 for f in self.fields if f.out_of_flow and f.kind.startswith('airefs'))
+
+    @property
     def in_tables(self) -> int:
-        """Our own fields whose begin run sits inside a ``w:tbl``."""
-        return sum(1 for f in self.fields if f.in_table and f.kind.startswith('airefs'))
+        """The plan's name for :attr:`out_of_flow`. Text-box fields are counted
+        too: the design treats citations in tables and text boxes alike, and
+        both are invisible to ``doc.paragraphs``."""
+        return self.out_of_flow
 
     @property
     def pending_tracked_changes(self) -> bool:
+        """Any field with a run under a tracked insertion, deletion or move."""
         return any(f.tracked_change for f in self.fields)
 
     # ── membership ──────────────────────────────────────────────

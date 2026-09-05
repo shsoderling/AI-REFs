@@ -17,6 +17,10 @@ MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 # OxmlElement("mc:AlternateContent") resolves.
 nsmap.setdefault("mc", MC_NS)
 
+# Run-level tracked-change wrappers Word writes: insertion, deletion, and the
+# two halves of a move (old position / new position) made with Track Changes on.
+TRACKED_CHANGE_KINDS = ("ins", "del", "moveFrom", "moveTo")
+
 
 def run_texts(paragraph) -> list[str]:
     return [r.text for r in paragraph.runs]
@@ -65,7 +69,9 @@ class DocBuilder:
 
     def add_text(self, paragraph, text: str, *, superscript: bool = False,
                  wrap: str | None = None):
-        """Append a run; wrap='ins'|'del' wraps it in a tracked-change element."""
+        """Append a run; wrap in TRACKED_CHANGE_KINDS wraps it in that
+        tracked-change element. Only 'del' switches the text to w:delText;
+        moved text (moveFrom/moveTo) keeps w:t, as Word writes it."""
         r = make_run(text, superscript=superscript, deleted=(wrap == "del"))
         if wrap:
             w = self._tracked_change(wrap)
@@ -98,6 +104,7 @@ class DocBuilder:
         end_in_new_paragraph: put the end fldChar in a following paragraph
             (after any extra_paragraph_texts paragraphs), like a bibliography.
         nested_code: add a nested begin/instr/end inside (EndNote-style).
+        wrap: one of TRACKED_CHANGE_KINDS; wraps every run of the field.
         """
         runs = [make_run(fldchar="begin", fld_lock=fld_lock)]
         if split_code_at is None:
@@ -196,7 +203,11 @@ class DocBuilder:
 
     # ── internals ──────────────────────────────────────────────────
     def _tracked_change(self, kind: str):
-        """Build an empty w:ins / w:del wrapper with a fresh revision id."""
+        """Build an empty tracked-change run wrapper (w:ins, w:del, w:moveFrom
+        or w:moveTo) with a fresh revision id."""
+        if kind not in TRACKED_CHANGE_KINDS:
+            raise ValueError(f"unknown tracked-change kind {kind!r}; "
+                             f"expected one of {TRACKED_CHANGE_KINDS}")
         w = OxmlElement(f"w:{kind}")
         self._rev_id += 1
         w.set(qn("w:id"), str(self._rev_id))
