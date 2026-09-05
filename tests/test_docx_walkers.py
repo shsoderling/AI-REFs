@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from docx import Document
+from docx.enum.text import WD_BREAK
 
 from src.services.docx_io import iter_text_runs, iter_all_runs, run_text
 from tests.fixture_builders import DocBuilder, make_run
@@ -48,6 +49,8 @@ def test_all_runs_covers_nested_and_marks_deleted(tmp_path):
     assert " ins" in texts and " sdt" in texts and "link" in texts
     deleted = [i for i in infos if i.deleted]
     assert len(deleted) == 1 and deleted[0].elem.xpath("string(w:delText)") == " del"
+    inserted = [i for i in infos if i.inserted]
+    assert len(inserted) == 1 and run_text(inserted[0].elem) == " ins"
 
 
 def test_all_runs_skips_mc_fallback(tmp_path):
@@ -61,3 +64,17 @@ def test_all_runs_skips_mc_fallback(tmp_path):
     para = Document(str(b.save(tmp_path / "tb.docx"))).paragraphs[0]
     texts = [run_text(i.elem) for i in iter_all_runs(para)]
     assert texts.count("boxed") == 1
+
+
+def test_run_text_matches_python_docx_for_breaks_and_tabs(tmp_path):
+    b = DocBuilder()
+    p = b.paragraph()
+    r = p.add_run("a")
+    r.add_break(WD_BREAK.PAGE)      # page break: no text, unlike a line break
+    r.add_tab()
+    r.add_break(WD_BREAK.LINE)
+    r.add_text("b")
+    para = Document(str(b.save(tmp_path / "br.docx"))).paragraphs[0]
+    run = para.runs[0]._r
+    assert run_text(run) == run.text == "a\t\nb"
+    assert "".join(run_text(x) for x in iter_text_runs(para)) == para.text
