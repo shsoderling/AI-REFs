@@ -22,4 +22,16 @@ class SentenceRecord(BaseModel):
     section: Optional[str] = Field(default=None, description="Document section heading")
     marker_type: Optional[MarkerType] = Field(default=None)
     marker_count: int = Field(default=0, description="Number of markers found")
+    marker_types: list[MarkerType] = Field(
+        default_factory=list,
+        description="Type of each marker in document order (handles mixed (REF)/(REFS))",
+    )
     keywords: list[str] = Field(default_factory=list, description="Extracted keywords")
+
+    def effective_marker_types(self) -> list[MarkerType]:
+        """Per-marker types, falling back to marker_type for older projects."""
+        if self.marker_types:
+            return list(self.marker_types)
+        if self.marker_type is None:
+            return []
+        return [self.marker_type] * max(self.marker_count, 1)

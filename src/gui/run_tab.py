@@ -27,6 +27,7 @@ class PipelineWorker(QThread):
         super().__init__(parent)
         self.project = project
         self.orchestrator = None
+        self._cancel_requested = False
 
     def run(self):
         try:
@@ -35,6 +36,9 @@ class PipelineWorker(QThread):
                 progress_callback=lambda s, c, t: self.progress.emit(s, c, t),
                 log_callback=lambda l, m: self.log_message.emit(l, m),
             )
+            # cancel() may have been called before the orchestrator existed
+            if self._cancel_requested:
+                self.orchestrator.cancel()
             result = self.orchestrator.run()
             self.finished.emit(result)
         except Exception as e:
@@ -49,6 +53,7 @@ class PipelineWorker(QThread):
             self.orchestrator.resume()
 
     def cancel(self):
+        self._cancel_requested = True
         if self.orchestrator:
             self.orchestrator.cancel()
 
@@ -114,6 +119,7 @@ class RunTab(QWidget):
         super().__init__(parent)
         self._worker = None
         self._is_paused = False
+        self._cancel_requested = False
         self._active_stage_names = list(self.STAGE_NAMES_FRESH)
         self.stage_indicators = {}
         self._setup_ui()
@@ -139,6 +145,11 @@ class RunTab(QWidget):
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self._on_pause)
         btn_layout.addWidget(self.pause_btn)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        btn_layout.addWidget(self.cancel_btn)
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
@@ -187,6 +198,7 @@ class RunTab(QWidget):
 
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
 
     def _on_start(self):
         """Called when Start button is clicked. Parent window handles this."""
@@ -212,14 +224,20 @@ class RunTab(QWidget):
 
     @Slot(object)
     def _on_finished(self, project: ProjectState):
-        self._log("info", "Pipeline complete!")
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
 
-        # Mark all stages complete
-        for name in self._active_stage_names:
-            self.stage_indicators[name].set_status("complete")
-        self.progress_bar.setValue(self.progress_bar.maximum())
+        if self._cancel_requested:
+            self._log("warning",
+                      "Pipeline cancelled. Results found so far are available "
+                      "in the Review tab.")
+        else:
+            self._log("info", "Pipeline complete!")
+            # Mark all stages complete
+            for name in self._active_stage_names:
+                self.stage_indicators[name].set_status("complete")
+            self.progress_bar.setValue(self.progress_bar.maximum())
 
         self.pipeline_complete.emit(project)
 
@@ -228,6 +246,40 @@ class RunTab(QWidget):
         self._log("error", f"Pipeline error: {error_msg}")
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+
+    def _on_cancel(self):
+        """Request pipeline cancellation; the worker stops between sentences."""
+        if not self._worker or not self._worker.isRunning():
+            return
+        self._cancel_requested = True
+        self._worker.cancel()
+        # A paused orchestrator spins in its pause loop — resume so the
+        # cancel flag is noticed and the thread can exit.
+        if self._is_paused:
+            self._worker.resume()
+            self._is_paused = False
+            self.pause_btn.setText("Pause")
+        self.cancel_btn.setEnabled(False)
+        self._log("warning", "Cancelling pipeline (finishing current sentence)...")
+
+    def shutdown_workers(self, wait_ms: int = 5000):
+        """Cancel and wait for the pipeline worker — call before app close.
+
+        Destroying a running QThread crashes Qt, so this blocks (bounded)
+        until the thread exits.
+        """
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            if self._is_paused:
+                self._worker.resume()
+            if not self._worker.wait(wait_ms):
+                # Last resort at app exit: a thread stuck in a long network
+                # call. terminate() is harsh but better than Qt aborting on
+                # destruction of a running QThread.
+                logger.warning("Pipeline worker did not stop in time; terminating")
+                self._worker.terminate()
+                self._worker.wait(1000)
 
     def _on_pause(self):
         if not self._worker:
@@ -273,6 +325,7 @@ class RunTab(QWidget):
         for name in self._active_stage_names:
             self.stage_indicators[name].set_status("pending")
         self._is_paused = False
+        self._cancel_requested = False
         self.pause_btn.setText("Pause")
 
     def _rebuild_stage_indicators(self, stage_names: list[str]):

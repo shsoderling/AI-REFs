@@ -19,11 +19,16 @@ REFS_HEADING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Pattern for a numbered bibliography entry: "1. Author..." or "1) Author..."
-BIB_ENTRY_PATTERN = re.compile(r'^(\d+)[.\s)\]]+\s*(.+)')
+# Pattern for a numbered bibliography entry: "1. Author...", "1) Author...", "[1] Author..."
+BIB_ENTRY_PATTERN = re.compile(r'^\[?(\d+)[.\s)\]]+\s*(.+)')
 
-# Pattern for bracketed in-text citations: [1], [1,2,3], [1-3]
-BRACKET_CITE_PATTERN = re.compile(r'\[(\d+(?:\s*[,\-\u2013]\s*\d+)*)\]')
+# Pattern for bracketed in-text citations: [1], [1,2,3], [1-3], [1; 3]
+# Shared with the export renumbering pass \u2014 keep the two in sync by importing this.
+BRACKET_CITE_PATTERN = re.compile(r'\[(\d+(?:\s*[,;\-\u2013]\s*\d+)*)\]')
+
+# A run whose text is only digits/separators \u2014 the shape of a citation cluster.
+# Anything else (Ca2+, m2, footnote text) must not be treated as a citation.
+CITATION_SHAPE_PATTERN = re.compile(r'^[\d\s,;\-\u2013]+$')
 
 # Pattern for (REF) / (REFS) markers — used to detect char offsets
 MARKER_PATTERN = re.compile(r'\((REFS?)\)')
@@ -51,9 +56,12 @@ class ExistingCitationParser:
         if result.bib_entries:
             result.max_existing_number = max(result.bib_entries.keys())
 
-        # Step 3: Scan body paragraphs for in-text citation numbers
+        # Step 3: Scan body paragraphs for in-text citation numbers.
+        # Only numbers that exist in the bibliography count as citations —
+        # this excludes phantom matches (years, footnotes, chemical notation).
         result.in_text_citations = self._scan_in_text_citations(
-            paragraphs[:refs_start_idx]
+            paragraphs[:refs_start_idx],
+            valid_numbers=set(result.bib_entries.keys()),
         )
 
         # Step 4: Detect superscript vs bracket style
@@ -95,6 +103,7 @@ class ExistingCitationParser:
                 entry = ExistingBibEntry(
                     original_number=num,
                     raw_text=text,
+                    body=body,
                 )
                 self._extract_bib_fields(entry, body)
                 entries[num] = entry
@@ -117,12 +126,14 @@ class ExistingCitationParser:
             entry.year = int(year_match.group())
 
     def _scan_in_text_citations(
-        self, paragraphs
+        self, paragraphs, valid_numbers: set[int],
     ) -> dict[int, list[InTextCitation]]:
         """Scan body paragraphs for in-text citation numbers.
 
         Finds both superscript number runs and bracketed citations like [1,2,3].
-        Skips any numbers that fall inside (REF)/(REFS) markers.
+        Skips any numbers that fall inside (REF)/(REFS) markers, superscript
+        runs that are not citation-shaped (e.g. "2+" in Ca2+), and numbers
+        with no matching bibliography entry.
         """
         cite_map: dict[int, list[InTextCitation]] = {}
         for idx, para in enumerate(paragraphs):
@@ -139,13 +150,14 @@ class ExistingCitationParser:
             # Superscript runs
             char_offset = 0
             for run in para.runs:
-                if run.font.superscript:
+                if run.font.superscript and CITATION_SHAPE_PATTERN.match(run.text or ""):
                     for m in re.finditer(r'\d+', run.text):
                         abs_offset = char_offset + m.start()
-                        if not _in_marker(abs_offset):
+                        number = int(m.group())
+                        if number in valid_numbers and not _in_marker(abs_offset):
                             citations.append(InTextCitation(
                                 char_offset=abs_offset,
-                                number=int(m.group()),
+                                number=number,
                                 is_superscript=True,
                             ))
                 char_offset += len(run.text)
@@ -154,11 +166,12 @@ class ExistingCitationParser:
             for m in BRACKET_CITE_PATTERN.finditer(para.text):
                 if not _in_marker(m.start()):
                     for num in self._expand_citation_range(m.group(1)):
-                        citations.append(InTextCitation(
-                            char_offset=m.start(),
-                            number=num,
-                            is_superscript=False,
-                        ))
+                        if num in valid_numbers:
+                            citations.append(InTextCitation(
+                                char_offset=m.start(),
+                                number=num,
+                                is_superscript=False,
+                            ))
 
             if citations:
                 # Sort by position to enable sequential processing
@@ -171,7 +184,7 @@ class ExistingCitationParser:
     def _expand_citation_range(range_str: str) -> list[int]:
         """Expand '1,2,3' or '1-3' into [1, 2, 3]."""
         numbers = []
-        parts = re.split(r'[,\s]+', range_str)
+        parts = re.split(r'[,;\s]+', range_str)
         for part in parts:
             if '-' in part or '\u2013' in part:
                 bounds = re.split(r'[-\u2013]', part)
@@ -194,7 +207,8 @@ class ExistingCitationParser:
         bracket_count = 0
         for para in paragraphs:
             for run in para.runs:
-                if run.font.superscript and re.search(r'\d+', run.text):
+                if (run.font.superscript and re.search(r'\d+', run.text)
+                        and CITATION_SHAPE_PATTERN.match(run.text or "")):
                     superscript_count += 1
             bracket_count += len(BRACKET_CITE_PATTERN.findall(para.text))
         return superscript_count >= bracket_count

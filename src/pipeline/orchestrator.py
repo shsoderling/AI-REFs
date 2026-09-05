@@ -21,6 +21,7 @@ from .marker_locator import MarkerLocator
 from .llm_citation_agent import LLMCitationAgent
 from .global_qa import GlobalQA
 from .existing_citation_parser import ExistingCitationParser
+from .renumbering import CitationKeyIndex
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,29 @@ class PipelineOrchestrator:
             self._emit("info", f"  References heading at paragraph {existing.references_heading_para_idx}")
             self._emit("info", f"  Max existing number: {existing.max_existing_number}")
 
+            # Recover PMIDs/DOIs for entries that don't print one, so new
+            # candidates can be deduplicated against them.
+            needs_ids = sum(1 for e in existing.bib_entries.values()
+                            if not e.pmid and not e.doi)
+            if settings.enrich_existing_refs and settings.ncbi_email and needs_ids:
+                self._emit("info",
+                           f"  Matching {needs_ids} entries without PMID/DOI "
+                           f"against PubMed...")
+                from .existing_enrichment import ExistingRefEnricher
+                enrich_cache = CacheDB()
+                enrich_pubmed = PubMedClient(
+                    email=settings.ncbi_email,
+                    api_key=settings.ncbi_api_key or "",
+                    cache_db=enrich_cache,
+                )
+                enricher = ExistingRefEnricher(
+                    enrich_pubmed, cache=enrich_cache, log_callback=self._log,
+                )
+                enriched = enricher.enrich(
+                    existing, should_cancel=lambda: self._cancelled)
+                self._emit("info",
+                           f"  Recovered identifiers for {enriched}/{needs_ids} entries")
+
             if self._cancelled:
                 return self.project
 
@@ -211,6 +235,11 @@ class PipelineOrchestrator:
         self._emit("info", f"Stage {stage_offset + 3}: AI-powered citation search...")
         self._progress("AI Citation Search", stage_offset + 2, total_stages)
 
+        # Discard evidence from any previous run — sentence IDs are sequential
+        # (S001, S002, ...), so stale records would silently attach to the
+        # wrong sentences after the document is edited or replaced.
+        self.project.evidence_map = {}
+
         cache = CacheDB()
         pubmed = PubMedClient(
             email=settings.ncbi_email,
@@ -254,8 +283,11 @@ class PipelineOrchestrator:
                     f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}..."
                 )
 
-                # Multi-(REF) sentences: run a SEPARATE search for each (REF) marker
-                if sent.marker_type == MarkerType.REF and sent.marker_count > 1:
+                # Sentences with multiple markers that include at least one
+                # (REF): run a SEPARATE search for each marker.  All-(REFS)
+                # sentences keep the single combined search.
+                marker_types = sent.effective_marker_types()
+                if len(marker_types) > 1 and MarkerType.REF in marker_types:
                     evidence = self._find_citations_per_ref(
                         agent, sent, self.project.inferred_domains
                     )
@@ -318,11 +350,12 @@ class PipelineOrchestrator:
         from ..models.evidence import EvidenceRecord, ConfidenceLevel, VerificationStatus
         from ..models.sentence import SentenceRecord as SR
 
-        # Split the raw text at each (REF) to identify the sub-claims
-        parts = re.split(r'\(REF\)', sentence.raw_text)
+        # Split the raw text at each marker to identify the sub-claims
+        parts = re.split(r'\(REFS?\)', sentence.raw_text)
         num_markers = sentence.marker_count
+        marker_types = sentence.effective_marker_types()
 
-        self._emit("info", f"  Multi-(REF): splitting into {num_markers} independent searches")
+        self._emit("info", f"  Multi-marker: splitting into {num_markers} independent searches")
 
         # Run agent for each sub-claim independently
         combined_evidence = EvidenceRecord(sentence_id=sentence.id)
@@ -332,8 +365,12 @@ class PipelineOrchestrator:
         worst_confidence = ConfidenceLevel.HIGH
         total_score = 0.0
 
-        # Track already-assigned identifiers to prevent duplicates
-        assigned_keys: set[str] = set()  # PMIDs and DOIs already picked
+        # Track already-assigned papers to prevent duplicates.  The key index
+        # treats PMID/DOI/title as aliases of one identity, so the same paper
+        # found via different identifiers still counts as a duplicate.
+        key_index = CitationKeyIndex()
+        assigned_keys: set[str] = set()       # canonical identity keys
+        assigned_identifiers: set[str] = set()  # human-readable PMIDs/DOIs for the prompt
 
         confidence_order = {
             ConfidenceLevel.HIGH: 3,
@@ -347,6 +384,16 @@ class PipelineOrchestrator:
             if self._cancelled:
                 return combined_evidence
 
+            # A (REFS) marker inside a multi-marker sentence is searched like
+            # a (REF): one citation per marker keeps the marker→citation slot
+            # mapping unambiguous for review and export.
+            if marker_idx < len(marker_types) and marker_types[marker_idx] == MarkerType.REFS:
+                self._emit(
+                    "info",
+                    f"    Marker [{marker_idx+1}] is (REFS) in a multi-marker "
+                    f"sentence — selecting a single best citation for it"
+                )
+
             # Build a descriptive sub-claim for this marker
             sub_text = parts[marker_idx].strip() if marker_idx < len(parts) else ""
             trailing = parts[marker_idx + 1].strip() if marker_idx + 1 < len(parts) else ""
@@ -359,8 +406,8 @@ class PipelineOrchestrator:
                 sub_claim += f" (followed by: \"{trailing[:80]}\")"
 
             # Tell the agent which citations are already assigned to prior markers
-            if assigned_keys:
-                exclusion_list = ", ".join(sorted(assigned_keys))
+            if assigned_identifiers:
+                exclusion_list = ", ".join(sorted(assigned_identifiers))
                 sub_claim += (
                     f"\n\nIMPORTANT: The following identifiers have already been "
                     f"assigned to other (REF) markers in this sentence. You MUST "
@@ -393,7 +440,7 @@ class PipelineOrchestrator:
             selected_citation = None
             if ev.selected:
                 candidate = ev.selected[0]
-                cand_key = candidate.pmid or candidate.doi or candidate.title[:30]
+                cand_key = key_index.key_for_candidate(candidate)
 
                 if cand_key not in assigned_keys:
                     selected_citation = candidate
@@ -405,7 +452,7 @@ class PipelineOrchestrator:
                         f"[{marker_idx+1}], searching for alternative..."
                     )
                     for alt in ev.candidates:
-                        alt_key = alt.pmid or alt.doi or alt.title[:30]
+                        alt_key = key_index.key_for_candidate(alt)
                         if alt_key not in assigned_keys:
                             selected_citation = alt
                             self._emit(
@@ -422,12 +469,11 @@ class PipelineOrchestrator:
 
             if selected_citation:
                 combined_evidence.selected.append(selected_citation)
-                sel_key = selected_citation.pmid or selected_citation.doi or selected_citation.title[:30]
-                assigned_keys.add(sel_key)
+                assigned_keys.add(key_index.key_for_candidate(selected_citation))
                 if selected_citation.pmid:
-                    assigned_keys.add(selected_citation.pmid)
+                    assigned_identifiers.add(selected_citation.pmid)
                 if selected_citation.doi:
-                    assigned_keys.add(selected_citation.doi)
+                    assigned_identifiers.add(selected_citation.doi)
             else:
                 self._emit("warning", f"    No citation for marker [{marker_idx+1}]")
 

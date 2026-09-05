@@ -99,10 +99,10 @@ HELP_TEXTS = {
         "<li><b>Haiku 4.5</b> &mdash; Fastest and cheapest. Good for straightforward "
         "claims with obvious keywords. Best for quick drafts or budget-conscious use. "
         "~$0.01&ndash;0.05 per document.</li>"
-        "<li><b>Sonnet 4.5</b> &mdash; Balanced. Recommended for most use cases. "
+        "<li><b>Sonnet 4.6</b> &mdash; Balanced. Recommended for most use cases. "
         "Better at nuanced claims and multi-step reasoning. "
         "~$0.05&ndash;0.30 per document.</li>"
-        "<li><b>Opus 4.6</b> &mdash; Highest quality. Best for complex interdisciplinary "
+        "<li><b>Opus 4.8</b> &mdash; Highest quality. Best for complex interdisciplinary "
         "papers or when citation accuracy is critical. "
         "~$0.30&ndash;2.00 per document.</li>"
         "</ul>"
@@ -429,6 +429,12 @@ class InputsTab(QWidget):
         self.europepmc_check.setChecked(True)
         form.addRow("Europe PMC:", self.europepmc_check)
 
+        # Existing-reference enrichment (insert mode)
+        self.enrich_check = QCheckBox(
+            "Look up existing refs on PubMed to avoid duplicates (insert mode)")
+        self.enrich_check.setChecked(True)
+        form.addRow("Enrich existing:", self.enrich_check)
+
         layout.addWidget(settings_group)
 
         # ── NCBI / ORCID ────────────────────────────────────────────
@@ -471,8 +477,8 @@ class InputsTab(QWidget):
         self.model_combo = QComboBox()
         self.model_combo.addItems([
             "Haiku 4.5 (Fast, cheapest)",
-            "Sonnet 4.5 (Balanced)",
-            "Opus 4.6 (Highest quality)",
+            "Sonnet 4.6 (Balanced)",
+            "Opus 4.8 (Highest quality)",
         ])
         ai_layout.addLayout(
             self._make_form_row_with_help("Claude Model:", self.model_combo, "claude_model")
@@ -596,6 +602,7 @@ class InputsTab(QWidget):
             claude_model=self._get_model_id(),
             search_biorxiv=self.biorxiv_check.isChecked(),
             search_europepmc=self.europepmc_check.isChecked(),
+            enrich_existing_refs=self.enrich_check.isChecked(),
         )
 
     def set_settings(self, settings: ProjectSettings):
@@ -625,13 +632,14 @@ class InputsTab(QWidget):
         self._set_model_by_id(settings.claude_model)
         self.biorxiv_check.setChecked(settings.search_biorxiv)
         self.europepmc_check.setChecked(settings.search_europepmc)
+        self.enrich_check.setChecked(settings.enrich_existing_refs)
 
     def _get_model_id(self) -> str:
         """Map combo box index to Anthropic model ID."""
         model_map = {
             0: "claude-haiku-4-5-20251001",
-            1: "claude-sonnet-4-5-20250929",
-            2: "claude-opus-4-6",
+            1: "claude-sonnet-4-6",
+            2: "claude-opus-4-8",
         }
         return model_map.get(self.model_combo.currentIndex(), "claude-haiku-4-5-20251001")
 
@@ -639,6 +647,9 @@ class InputsTab(QWidget):
         """Set model combo box from Anthropic model ID."""
         model_to_index = {
             "claude-haiku-4-5-20251001": 0,
+            "claude-sonnet-4-6": 1,
+            "claude-opus-4-8": 2,
+            # Legacy IDs from older saved projects map to their current tier
             "claude-sonnet-4-5-20250929": 1,
             "claude-opus-4-6": 2,
         }

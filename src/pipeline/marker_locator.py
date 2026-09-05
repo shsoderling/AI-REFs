@@ -17,12 +17,14 @@ class MarkerLocator:
         for sent in sentences:
             matches = MARKER_PATTERN.findall(sent.raw_text)
             if matches:
-                # Use the first marker found
-                marker_str = matches[0]
-                if marker_str == "REFS":
-                    sent.marker_type = MarkerType.REFS
-                else:
-                    sent.marker_type = MarkerType.REF
+                # Record every marker's type in order — a sentence can mix
+                # (REF) and (REFS), and downstream per-marker splitting
+                # must know which is which.
+                sent.marker_types = [
+                    MarkerType.REFS if m == "REFS" else MarkerType.REF
+                    for m in matches
+                ]
+                sent.marker_type = sent.marker_types[0]
                 sent.marker_count = len(matches)
 
         marked_count = sum(1 for s in sentences if s.marker_type is not None)

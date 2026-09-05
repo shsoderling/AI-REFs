@@ -7,10 +7,13 @@ that searches PubMed iteratively and selects the best citations.
 
 import json
 import logging
+import os
 import re
 from typing import Optional, Callable
 
 import anthropic
+import certifi
+import httpx
 
 from ..models.sentence import SentenceRecord, MarkerType
 from ..models.citation import CitationCandidate
@@ -223,7 +226,18 @@ class LLMCitationAgent:
         orcid_id: Optional[str] = None,
         log_callback: Optional[Callable[[str, str], None]] = None,
     ):
-        self.client = anthropic.Anthropic(api_key=anthropic_api_key)
+        # Allow corporate TLS-inspecting proxies (e.g. Zscaler) to work by
+        # honoring SSL_CERT_FILE / REQUESTS_CA_BUNDLE if set, otherwise fall
+        # back to certifi's bundled CA list. Never disable verification.
+        ca_bundle = (
+            os.environ.get("SSL_CERT_FILE")
+            or os.environ.get("REQUESTS_CA_BUNDLE")
+            or certifi.where()
+        )
+        self.client = anthropic.Anthropic(
+            api_key=anthropic_api_key,
+            http_client=httpx.Client(verify=ca_bundle),
+        )
         self.model = model
         self.pubmed = pubmed_client
         self.biorxiv = biorxiv_client

@@ -11,6 +11,7 @@ class ExistingBibEntry(BaseModel):
     """A single entry parsed from an existing References section."""
     original_number: int = Field(description="Original citation number in the document")
     raw_text: str = Field(default="", description="Full text of the bibliography entry")
+    body: str = Field(default="", description="Entry text with the leading number stripped")
     # Parsed fields (best-effort extraction)
     title: str = Field(default="")
     authors_str: str = Field(default="")

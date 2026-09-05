@@ -3,6 +3,7 @@
 import re
 import logging
 import hashlib
+from typing import Optional
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -22,7 +23,16 @@ from ..models.evidence import ReviewDecision
 from ..models.sentence import MarkerType
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
-from ..pipeline.renumbering import compute_renumbering, NewMarkerInfo
+from ..pipeline.renumbering import CitationKeyIndex
+from ..pipeline.renumber_plan import build_renumber_plan
+from ..pipeline.export_stats import ExportStats
+from ..pipeline.renumber_apply import apply_renumbering
+from ..pipeline.bib_format import format_bib_entry
+from ..pipeline.author_date_convert import (
+    build_author_date_labels, convert_in_text_to_author_date,
+    build_author_date_bibliography,
+)
+from ..models.citation import is_valid_citation
 from ..storage.project_io import save_project, load_project
 from .inputs_tab import InputsTab
 from .library_tab import LibraryTab
@@ -113,6 +123,7 @@ class MainWindow(QMainWindow):
 
         # Review tab -> export, dirty tracking, and library sync
         self.review_tab.export_requested.connect(self._export_document)
+        self.review_tab.preview_requested.connect(self._preview_numbering)
         self.review_tab.project_modified.connect(self._mark_dirty)
         self.review_tab.library_updated.connect(self.library_tab._refresh_stats)
 
@@ -132,6 +143,14 @@ class MainWindow(QMainWindow):
         self._project.input_docx_path = path
         self._project.project_name = Path(path).stem
 
+        # Discard results from any previously loaded document — sentence IDs
+        # restart at S001 for every document, so stale evidence would attach
+        # to the wrong sentences.
+        self._project.sentences = []
+        self._project.evidence_map = {}
+        self._project.output_docx_path = None
+        self.review_tab.load_project(None)
+
         # Compute hash for change detection
         with open(path, 'rb') as f:
             self._project.input_docx_hash = hashlib.sha256(f.read()).hexdigest()
@@ -147,6 +166,18 @@ class MainWindow(QMainWindow):
                 n = len(existing.bib_entries)
                 self.inputs_tab.set_insert_mode(True, n)
                 logger.info(f"Insert mode auto-detected: {n} existing references")
+
+                # Leftover [?] tokens mean a previous export had unresolved
+                # markers — those citations are still missing.
+                leftover = sum(p.text.count("[?]") for p in handler.get_paragraphs())
+                if leftover:
+                    QMessageBox.warning(
+                        self, "Unresolved Placeholders Found",
+                        f"This document contains {leftover} unresolved [?] "
+                        "placeholder(s) from a previous export.\n\n"
+                        "They will be left as-is. To fill them, replace each "
+                        "[?] with a (REF) marker before running the pipeline.",
+                    )
             else:
                 self._project.is_insert_mode = False
                 self._project.existing_citations = None
@@ -236,13 +267,43 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._do_export(output_path)
+            stats = self._do_export(output_path)
+            if stats is None:
+                self.statusBar().showMessage("Export cancelled")
+                return
             self.statusBar().showMessage(f"Exported: {output_path}")
-            QMessageBox.information(self, "Export Complete",
-                                  f"Document exported to:\n{output_path}")
+            summary = "\n".join(stats.summary_lines())
+            message = f"Document exported to:\n{output_path}\n\n{summary}"
+            if stats.unresolved_markers:
+                message += (
+                    "\n\nWarning: markers exported as [?] have no accepted "
+                    "citation. Review those sentences and re-export."
+                )
+                QMessageBox.warning(self, "Export Complete (with gaps)", message)
+            else:
+                QMessageBox.information(self, "Export Complete", message)
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
             logger.error(f"Export error: {e}")
+
+    def _preview_numbering(self):
+        """Show the merged final numbering for insert mode without exporting."""
+        if not (self._project.is_insert_mode and self._project.existing_citations):
+            return
+        if not self._project.input_docx_path:
+            return
+        try:
+            handler = DocxHandler(self._project.input_docx_path)
+            plan = build_renumber_plan(handler, self._project)
+        except Exception as e:
+            QMessageBox.critical(self, "Preview Error",
+                                 f"Could not compute numbering:\n{e}")
+            logger.error(f"Preview error: {e}")
+            return
+
+        from .renumber_preview_dialog import RenumberPreviewDialog
+        dialog = RenumberPreviewDialog(plan.renumber_result, parent=self)
+        dialog.exec()
 
     # ── CSL-derived citation formatting helpers ──────────────────────
 
@@ -281,14 +342,16 @@ class MainWindow(QMainWindow):
             logger.warning(f"Could not parse CSL for {style}: {exc}")
             return defaults
 
-    def _do_export(self, output_path: str):
-        """Route to the appropriate export path based on mode."""
-        if self._project.is_insert_mode and self._project.existing_citations:
-            self._do_insert_export(output_path)
-        else:
-            self._do_fresh_export(output_path)
+    def _do_export(self, output_path: str) -> Optional[ExportStats]:
+        """Route to the appropriate export path based on mode.
 
-    def _do_fresh_export(self, output_path: str):
+        Returns export statistics, or None if the user cancelled.
+        """
+        if self._project.is_insert_mode and self._project.existing_citations:
+            return self._do_insert_export(output_path)
+        return self._do_fresh_export(output_path)
+
+    def _do_fresh_export(self, output_path: str) -> ExportStats:
         """Export a fresh document (no pre-existing citations).
 
         Matches DOCX markers to sentence evidence using paragraph_index
@@ -315,6 +378,7 @@ class MainWindow(QMainWindow):
         # Build bibliography
         bib_entries = []
         bib_number = {}
+        key_index = CitationKeyIndex()
         current_num = 1
 
         # ── Build a lookup: paragraph_index → expanded list of (sentence, evidence, ref_index) ──
@@ -323,7 +387,11 @@ class MainWindow(QMainWindow):
             if sent.marker_type is not None:
                 ev = self._project.evidence_map.get(sent.id)
                 count = max(sent.marker_count, 1)
-                if sent.marker_type == MarkerType.REF and count > 1:
+                types = sent.effective_marker_types()
+                # Per-marker slots whenever the orchestrator ran independent
+                # per-marker searches (multi-marker with at least one (REF)).
+                # Must stay in sync with the split condition in orchestrator.py.
+                if len(types) > 1 and MarkerType.REF in types:
                     for ref_idx in range(count):
                         para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
                 else:
@@ -337,6 +405,8 @@ class MainWindow(QMainWindow):
         total_expanded = sum(len(v) for v in para_to_markers.values())
         logger.info(f"Export: {len(markers)} DOCX markers, "
                      f"{total_expanded} expanded sentence-marker slots")
+
+        stats = ExportStats(total_markers=len(markers), output_path=output_path)
 
         for marker_info in markers:
             para = marker_info['paragraph']
@@ -367,15 +437,21 @@ class MainWindow(QMainWindow):
                 logger.info(f"  Marker para={para_idx}[{marker_order}] -> {sent_id} "
                             f"({sent_preview}) -> NO EVIDENCE")
 
+            refs_for_marker = []
             if matching_ev and matching_ev.selected:
-                if ref_index is not None and ref_index < len(matching_ev.selected):
-                    refs_for_marker = [matching_ev.selected[ref_index]]
+                if ref_index is not None:
+                    if ref_index < len(matching_ev.selected):
+                        refs_for_marker = [matching_ev.selected[ref_index]]
                 else:
                     refs_for_marker = matching_ev.selected
+                # Placeholder slots ("No citation found") must never become
+                # bibliography entries — drop them so the marker gets [?].
+                refs_for_marker = [c for c in refs_for_marker if is_valid_citation(c)]
 
+            if refs_for_marker:
                 citation_parts = []
                 for sel in refs_for_marker:
-                    bib_key = sel.pmid or sel.doi or sel.title[:30]
+                    bib_key = key_index.key_for_candidate(sel)
                     if bib_key not in bib_number:
                         bib_number[bib_key] = current_num
                         bib_entries.append(self._format_bib_entry(sel, current_num, style))
@@ -391,19 +467,27 @@ class MainWindow(QMainWindow):
                 replacement = f"{cite_prefix}{inner}{cite_suffix}"
                 handler.replace_marker_by_regex(para, marker_text, replacement,
                                                superscript=use_superscript)
+                stats.resolved_markers += 1
             else:
                 handler.replace_marker_by_regex(para, marker_text, "[?]")
+                stats.unresolved_markers += 1
+                if matching_sent and matching_sent.id not in stats.unresolved_sentence_ids:
+                    stats.unresolved_sentence_ids.append(matching_sent.id)
+                logger.warning(f"  Marker para={para_idx}[{marker_order}] exported as [?]")
 
         if bib_entries:
             handler.append_bibliography(bib_entries)
 
         handler.save(output_path)
         self._project.output_docx_path = output_path
+        stats.new_refs_added = len(bib_entries)
+        stats.bibliography_size = len(bib_entries)
         logger.info(f"Exported document with {len(bib_entries)} bibliography entries: {output_path}")
+        return stats
 
     # ── Insert-mode export ────────────────────────────────────────────
 
-    def _do_insert_export(self, output_path: str):
+    def _do_insert_export(self, output_path: str) -> Optional[ExportStats]:
         """Export a document in insert mode: resolve new markers + renumber.
 
         Steps:
@@ -412,6 +496,8 @@ class MainWindow(QMainWindow):
         3. Renumber all existing in-text citation numbers (before inserting new ones)
         4. Replace new markers with assigned citation numbers
         5. Remove old References section and append merged bibliography
+
+        Returns export statistics, or None if the user cancelled.
         """
         handler = DocxHandler(self._project.input_docx_path)
         existing = self._project.existing_citations
@@ -424,70 +510,96 @@ class MainWindow(QMainWindow):
         cite_delim = csl_info["delimiter"]
         use_superscript = style in SUPERSCRIPT_STYLES
 
+        # An author-date style cannot coherently merge with a numerically-cited
+        # document unless the existing numeric citations are converted too.
+        # Offer the conversion when every cited entry has author/year info
+        # (best with PubMed enrichment); otherwise fall back to numeric.
+        convert_existing_to_author_date = False
+        author_date_labels = None
+        if is_author_date and existing.in_text_citations:
+            author_date_labels = build_author_date_labels(existing)
+            if author_date_labels.missing:
+                n_missing = len(author_date_labels.missing)
+                choice = QMessageBox.question(
+                    self, "Citation Style Mismatch",
+                    "This document uses numbered citations and the selected "
+                    "style is author-date, but author/year information could "
+                    f"not be determined for {n_missing} existing reference(s) "
+                    "(enable 'Enrich existing' and re-run the pipeline to "
+                    "improve this).\n\n"
+                    "Export using the document's numeric style instead?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if choice != QMessageBox.StandardButton.Yes:
+                    return None
+                is_author_date = False
+            else:
+                choice = QMessageBox.question(
+                    self, "Convert to Author-Date?",
+                    "This document uses numbered citations. Convert all "
+                    f"{len(author_date_labels.labels)} existing in-text "
+                    "citations to author-date format (e.g. \"Smith et al., "
+                    "2020\")?\n\n"
+                    "Yes: convert everything to author-date.\n"
+                    "No: keep the document's numeric style.",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Cancel,
+                )
+                if choice == QMessageBox.StandardButton.Cancel:
+                    return None
+                if choice == QMessageBox.StandardButton.Yes:
+                    convert_existing_to_author_date = True
+                else:
+                    is_author_date = False
+
+        # Author-date in-text citations need parenthesized, "; "-joined text;
+        # fall back to that when the CSL layout gives empty delimiters.
+        if is_author_date and not (cite_prefix or cite_suffix):
+            cite_prefix, cite_suffix, cite_delim = "(", ")", "; "
+
+        # New citations must match the EXISTING document's in-text style, not
+        # the nominal CSL delimiters — otherwise renumbered existing citations
+        # (which keep their original brackets/superscript) and freshly inserted
+        # ones would look different (e.g. existing "[3]" next to new "(2)").
+        if not is_author_date:
+            use_superscript = existing.detected_style_is_superscript
+            if use_superscript:
+                cite_prefix, cite_suffix, cite_delim = "", "", ","
+            else:
+                cite_prefix, cite_suffix, cite_delim = "[", "]", ", "
+
         logger.info(f"Insert-mode export: style={style.value}  "
                      f"existing_refs={len(existing.bib_entries)}  "
                      f"superscript={use_superscript}")
 
-        # ── Step 1: Build new marker info from DOCX markers + evidence ──
-        markers = handler.find_markers()
-
-        # Build para_to_markers lookup (same logic as fresh export)
-        para_to_markers: dict[int, list[tuple]] = defaultdict(list)
-        for sent in self._project.sentences:
-            if sent.marker_type is not None:
-                ev = self._project.evidence_map.get(sent.id)
-                count = max(sent.marker_count, 1)
-                if sent.marker_type == MarkerType.REF and count > 1:
-                    for ref_idx in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
-                else:
-                    for _ in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, None))
-
-        para_marker_counter: dict[int, int] = defaultdict(int)
-
-        # Collect resolved citations for each marker position
-        new_marker_infos = []
-        marker_resolved_map = []  # parallel list: marker_info -> resolved citations
-
-        for marker_info in markers:
-            para_idx = marker_info['para_index']
-            char_offset = marker_info['location'][0]
-
-            expanded_list = para_to_markers.get(para_idx, [])
-            marker_order = para_marker_counter[para_idx]
-            para_marker_counter[para_idx] += 1
-
-            resolved_citations = []
-            if marker_order < len(expanded_list):
-                matching_sent, ev, ref_index = expanded_list[marker_order]
-                if ev and ev.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED):
-                    if ref_index is not None and ref_index < len(ev.selected):
-                        resolved_citations = [ev.selected[ref_index]]
-                    else:
-                        resolved_citations = list(ev.selected)
-
-            new_marker_infos.append(NewMarkerInfo(
-                para_index=para_idx,
-                char_offset=char_offset,
-                citations=resolved_citations,
-            ))
-            marker_resolved_map.append(resolved_citations)
-
-        # ── Step 2: Compute renumbering ──
-        renumber_result = compute_renumbering(existing, new_marker_infos)
+        # ── Steps 1+2: Match markers to evidence and compute renumbering ──
+        plan = build_renumber_plan(handler, self._project)
+        markers = plan.markers
+        marker_resolved_map = plan.marker_resolved_map
+        marker_sentences = plan.marker_sentences
+        renumber_result = plan.renumber_result
         renumber_map = renumber_result.renumber_map
+
+        stats = ExportStats(total_markers=len(markers), output_path=output_path)
 
         logger.info(f"Renumbering: {len(renumber_result.assignments)} total citations, "
                      f"renumber_map has {sum(1 for o, n in renumber_map.items() if o != n)} changes")
 
-        # ── Step 3: Renumber existing in-text citations ──
+        # ── Step 3: Update existing in-text citations ──
         # Must happen BEFORE replacing new markers, otherwise the newly-inserted
-        # superscript numbers would be caught and double-renumbered.
-        if not is_author_date and any(o != n for o, n in renumber_map.items()):
+        # citation text would be caught and double-processed.
+        if convert_existing_to_author_date:
+            converted = convert_in_text_to_author_date(
+                handler, existing, author_date_labels.labels,
+                prefix=cite_prefix, suffix=cite_suffix, delimiter=cite_delim,
+            )
+            stats.citations_converted = converted
+        elif not is_author_date and any(o != n for o, n in renumber_map.items()):
             self._renumber_existing_citations(handler, existing, renumber_map)
 
         # ── Step 4: Replace new (REF)/(REFS) markers ──
+        merged_duplicate_numbers: set[int] = set()
         for i, marker_info in enumerate(markers):
             para = marker_info['paragraph']
             marker_type = marker_info['marker_type']
@@ -497,165 +609,57 @@ class MainWindow(QMainWindow):
             if resolved and not is_author_date:
                 citation_numbers = []
                 for cand in resolved:
-                    bib_key = cand.pmid or cand.doi or cand.title[:30]
-                    for num, assn in renumber_result.assignments.items():
-                        if assn.bib_key == bib_key:
-                            citation_numbers.append(num)
-                            break
+                    num = renumber_result.number_for_candidate(cand)
+                    if num is not None:
+                        citation_numbers.append(num)
+                        if not renumber_result.assignments[num].is_new:
+                            merged_duplicate_numbers.add(num)
 
                 inner = cite_delim.join(str(n) for n in citation_numbers)
                 replacement = f"{cite_prefix}{inner}{cite_suffix}"
                 handler.replace_marker_by_regex(para, marker_text, replacement,
                                                superscript=use_superscript)
+                stats.resolved_markers += 1
             elif resolved and is_author_date:
                 parts = [cand.first_author_year for cand in resolved]
                 replacement = f"{cite_prefix}{cite_delim.join(parts)}{cite_suffix}"
                 handler.replace_marker_by_regex(para, marker_text, replacement,
                                                superscript=False)
+                stats.resolved_markers += 1
             else:
                 handler.replace_marker_by_regex(para, marker_text, "[?]")
+                stats.unresolved_markers += 1
+                sent = marker_sentences[i]
+                if sent and sent.id not in stats.unresolved_sentence_ids:
+                    stats.unresolved_sentence_ids.append(sent.id)
+                logger.warning(f"  Insert-mode marker {i} exported as [?]")
 
         # ── Step 5: Remove old References section, build merged bibliography ──
         handler.remove_references_section(existing.references_heading_para_idx)
-        merged_bib = self._build_merged_bibliography(existing, renumber_result, style)
+        if is_author_date:
+            merged_bib = build_author_date_bibliography(
+                existing, renumber_result, style)
+        else:
+            merged_bib = self._build_merged_bibliography(
+                existing, renumber_result, style)
         if merged_bib:
             handler.append_bibliography(merged_bib)
 
         handler.save(output_path)
         self._project.output_docx_path = output_path
+        stats.new_refs_added = sum(
+            1 for a in renumber_result.assignments.values() if a.is_new)
+        stats.existing_refs_renumbered = sum(
+            1 for o, n in renumber_map.items() if o != n)
+        stats.duplicates_merged = len(merged_duplicate_numbers)
+        stats.bibliography_size = len(merged_bib)
         logger.info(f"Insert-mode export complete: {len(merged_bib)} bibliography entries: {output_path}")
+        return stats
 
     def _renumber_existing_citations(self, handler: DocxHandler,
                                       existing, renumber_map: dict[int, int]):
-        """Update all existing in-text citation numbers using the renumber_map.
-
-        Walks superscript runs in body paragraphs (before the References heading)
-        and replaces each citation number according to the map.
-
-        Uses a single-pass re.sub with a callback to avoid cascading collisions
-        (e.g. 7->10 then a later run containing 10 being re-mapped).
-        """
-        refs_start = existing.references_heading_para_idx
-        cite_runs = handler.find_superscript_citation_runs()
-
-        # Filter to only body paragraphs
-        body_runs = [r for r in cite_runs if r['para_index'] < refs_start]
-
-        # Single-pass: re.sub replaces each number via callback — no collisions
-        def _replace_num(m):
-            old_num = int(m.group())
-            return str(renumber_map.get(old_num, old_num))
-
-        for run_info in body_runs:
-            run = run_info['run']
-            text = run.text
-            new_text = re.sub(r'\d+', _replace_num, text)
-            if new_text != text:
-                run.text = new_text
-
-        if body_runs:
-            logger.info(f"Renumbered superscript citations in {len(body_runs)} runs")
-
-        # Also renumber bracketed numeric citations (e.g. [1], [2-4], [1, 3]).
-        # We replace each bracket token by exact text match so surrounding
-        # paragraph formatting is preserved.
-        bracket_pattern = re.compile(r'\[(\d+(?:\s*[,;\-\u2013]\s*\d+)*)\]')
-        bracket_updates = 0
-        for para_idx, para in enumerate(handler.get_paragraphs()):
-            if para_idx >= refs_start:
-                break
-
-            para_text = para.text
-            if "[" not in para_text:
-                continue
-
-            replacements: list[tuple[str, str]] = []
-            for match in bracket_pattern.finditer(para_text):
-                old_token = match.group(0)
-                inner = match.group(1)
-                new_inner = self._renumber_bracket_group(inner, renumber_map)
-                new_token = f"[{new_inner}]"
-                if new_token != old_token:
-                    replacements.append((old_token, new_token))
-
-            for old_token, new_token in replacements:
-                handler.replace_marker_by_regex(
-                    para, old_token, new_token, superscript=False,
-                )
-                bracket_updates += 1
-
-        if bracket_updates:
-            logger.info(f"Renumbered bracket citations in {bracket_updates} locations")
-
-    @staticmethod
-    def _renumber_bracket_group(group_text: str, renumber_map: dict[int, int]) -> str:
-        """Renumber and normalize a bracket citation group like '1, 3-5'."""
-        numbers = MainWindow._expand_bracket_numbers(group_text)
-        if not numbers:
-            return group_text
-        mapped = [renumber_map.get(n, n) for n in numbers]
-
-        # De-duplicate while preserving first occurrence order.
-        seen = set()
-        ordered = []
-        for n in mapped:
-            if n not in seen:
-                seen.add(n)
-                ordered.append(n)
-
-        return MainWindow._format_bracket_numbers(ordered)
-
-    @staticmethod
-    def _expand_bracket_numbers(group_text: str) -> list[int]:
-        """Expand citation list/range text into explicit numbers."""
-        numbers: list[int] = []
-        for part in re.split(r'[;,]\s*', group_text):
-            token = part.strip()
-            if not token:
-                continue
-
-            bounds = re.split(r'\s*[-\u2013]\s*', token)
-            if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
-                start = int(bounds[0])
-                end = int(bounds[1])
-                if start <= end:
-                    numbers.extend(range(start, end + 1))
-                else:
-                    numbers.extend(range(start, end - 1, -1))
-            elif token.isdigit():
-                numbers.append(int(token))
-
-        return numbers
-
-    @staticmethod
-    def _format_bracket_numbers(numbers: list[int]) -> str:
-        """Format a list of citation numbers as compact ranges."""
-        if not numbers:
-            return ""
-
-        chunks = []
-        start = prev = numbers[0]
-        for n in numbers[1:]:
-            if n == prev + 1:
-                prev = n
-                continue
-
-            if start == prev:
-                chunks.append(str(start))
-            elif prev - start >= 2:
-                chunks.append(f"{start}-{prev}")
-            else:
-                chunks.extend([str(start), str(prev)])
-            start = prev = n
-
-        if start == prev:
-            chunks.append(str(start))
-        elif prev - start >= 2:
-            chunks.append(f"{start}-{prev}")
-        else:
-            chunks.extend([str(start), str(prev)])
-
-        return ", ".join(chunks)
+        """Update existing in-text citation numbers (delegates to pipeline)."""
+        apply_renumbering(handler, existing, renumber_map)
 
     def _build_merged_bibliography(self, existing, renumber_result, style: CitationStyle) -> list[str]:
         """Build the final merged bibliography in correct number order.
@@ -671,49 +675,20 @@ class MainWindow(QMainWindow):
                 # Re-use existing entry text with updated number
                 old_entry = existing.bib_entries.get(assignment.original_number)
                 if old_entry:
-                    # Replace the leading number prefix
-                    entry = re.sub(r'^\d+', str(num), old_entry.raw_text, count=1)
+                    # The parser stored the entry body (text after the number);
+                    # for older saved projects fall back to stripping the
+                    # number prefix, handling "1.", "1)" and "[1]" formats.
+                    body = old_entry.body or re.sub(
+                        r'^\[?\d+[.\s)\]]*\s*', '', old_entry.raw_text, count=1)
+                    entry = f"{num}. {body}"
                 else:
                     entry = f"{num}. [Missing reference]"
             entries.append(entry)
         return entries
 
     def _format_bib_entry(self, citation, number, style: CitationStyle):
-        """Format a single bibliography entry.
-
-        Uses a generic NLM-like format that works well for most styles.
-        The CSL file determines in-text citation formatting; this method
-        handles the bibliography list.
-        """
-        authors = ', '.join(a.display_name for a in citation.authors[:6])
-        if len(citation.authors) > 6:
-            authors += ' et al.'
-
-        base = f"{authors}. {citation.title}"
-        if not base.endswith('.'):
-            base += '.'
-        base += f" {citation.journal_abbrev or citation.journal}."
-        if citation.year:
-            base += f" {citation.year}"
-        if citation.volume:
-            base += f";{citation.volume}"
-            if citation.issue:
-                base += f"({citation.issue})"
-        if citation.pages:
-            base += f":{citation.pages}"
-        base += "."
-        if citation.doi:
-            base += f" doi:{citation.doi}"
-
-        # Add PMCID / PMID for NIH grant style
-        if style == CitationStyle.NIH_GRANT:
-            if citation.pmid:
-                base += f" PMID: {citation.pmid}"
-
-        # Numeric styles get a number prefix
-        if style not in AUTHOR_DATE_STYLES:
-            return f"{number}. {base}"
-        return base
+        """Format a single bibliography entry (delegates to pipeline)."""
+        return format_bib_entry(citation, number, style)
 
     def _new_project(self):
         self._project = ProjectState()
@@ -789,6 +764,14 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             # Discard → fall through and close
+
+        # Stop background workers before Qt tears down their parents —
+        # destroying a running QThread aborts the process.
+        try:
+            self.run_tab.shutdown_workers()
+            self.review_tab.shutdown_workers()
+        except Exception as e:
+            logger.warning(f"Worker shutdown during close failed: {e}")
         event.accept()
 
     def keyPressEvent(self, event):

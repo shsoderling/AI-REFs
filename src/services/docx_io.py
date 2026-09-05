@@ -259,21 +259,6 @@ class DocxHandler:
                 char_offset += len(run.text)
         return results
 
-    def renumber_superscript_run(self, run, renumber_map: dict[int, int]):
-        """Replace citation numbers in a superscript run using a renumber map.
-
-        Handles multi-number runs like '1,2,3' by replacing each number
-        individually with word-boundary awareness.
-        """
-        text = run.text
-        # Replace numbers from largest to smallest to avoid substring collisions
-        # (e.g. replacing '1' before '11' would corrupt '11')
-        for old_num in sorted(renumber_map.keys(), reverse=True):
-            new_num = renumber_map[old_num]
-            if old_num != new_num:
-                text = re.sub(rf'\b{old_num}\b', str(new_num), text)
-        run.text = text
-
     def remove_references_section(self, start_para_idx: int):
         """Remove the existing References section (heading + all entries).
 

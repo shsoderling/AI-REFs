@@ -135,6 +135,13 @@ class ProjectSettings(BaseModel):
     # Europe PMC
     search_europepmc: bool = Field(default=True, description="Also search Europe PMC")
 
+    # Insert mode
+    enrich_existing_refs: bool = Field(
+        default=True,
+        description="Look up existing bibliography entries lacking PMID/DOI "
+                    "on PubMed so they can be deduplicated against new finds",
+    )
+
     # User reference library
     reference_library_enabled: bool = Field(
         default=True,

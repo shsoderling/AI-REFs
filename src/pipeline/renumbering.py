@@ -5,6 +5,7 @@ numbers that incorporate both existing numbered citations and newly-resolved
 (REF)/(REFS) markers.
 """
 
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -13,6 +14,58 @@ from ..models.existing_refs import ExistingCitationMap, ExistingBibEntry
 from ..models.citation import CitationCandidate
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation, and truncate for fuzzy title identity."""
+    return re.sub(r'[^a-z0-9]+', ' ', title.lower()).strip()[:60]
+
+
+class CitationKeyIndex:
+    """Resolves any combination of (pmid, doi, title) to one canonical key.
+
+    The same paper can surface with different identifier subsets (PMID from
+    PubMed, DOI-only from bioRxiv, title-only from an old bibliography).
+    Registering every identifier as an alias of one canonical key guarantees
+    a single bibliography number per paper regardless of how it was found.
+    """
+
+    def __init__(self):
+        self._alias_to_key: dict[str, str] = {}
+
+    @staticmethod
+    def _aliases(pmid: str, doi: str, title: str) -> list[str]:
+        aliases = []
+        if pmid and pmid.strip():
+            aliases.append(f"pmid:{pmid.strip()}")
+        if doi and doi.strip():
+            aliases.append(f"doi:{doi.strip().lower()}")
+        if title:
+            norm = _normalize_title(title)
+            if norm:
+                aliases.append(f"title:{norm}")
+        return aliases
+
+    def get_or_assign(self, pmid: str = "", doi: str = "", title: str = "") -> str:
+        """Return the canonical key for this identifier set, registering aliases."""
+        aliases = self._aliases(pmid, doi, title)
+        if not aliases:
+            return ""
+        canonical = next(
+            (self._alias_to_key[a] for a in aliases if a in self._alias_to_key),
+            aliases[0],
+        )
+        for a in aliases:
+            self._alias_to_key.setdefault(a, canonical)
+        return canonical
+
+    def key_for_candidate(self, cand: CitationCandidate) -> str:
+        return self.get_or_assign(cand.pmid, cand.doi, cand.title)
+
+    def key_for_existing(self, entry: ExistingBibEntry) -> str:
+        # Enriched entries carry pmid/doi; bare entries may only have raw text.
+        key = self.get_or_assign(entry.pmid, entry.doi, entry.title)
+        return key or f"existing_{entry.original_number}"
 
 
 @dataclass
@@ -34,6 +87,17 @@ class RenumberingResult:
     assignments: dict[int, CitationAssignment] = field(default_factory=dict)
     # Next available number after all assignments
     next_number: int = 1
+    # The identity index used during numbering — callers must resolve
+    # candidates through this same instance so aliases stay consistent.
+    key_index: CitationKeyIndex = field(default_factory=CitationKeyIndex)
+
+    def number_for_candidate(self, cand: CitationCandidate) -> Optional[int]:
+        """Final number assigned to a candidate, or None if it has none."""
+        bib_key = self.key_index.key_for_candidate(cand)
+        for num, assn in self.assignments.items():
+            if assn.bib_key == bib_key:
+                return num
+        return None
 
 
 @dataclass
@@ -60,6 +124,7 @@ def compute_renumbering(
     - Build renumber_map and assignments
     """
     result = RenumberingResult()
+    key_index = result.key_index
     current_num = 1
     key_to_number: dict[str, int] = {}
 
@@ -89,7 +154,7 @@ def compute_renumbering(
         for _offset, event_type, data in events:
             if event_type == "existing":
                 old_num: int = data
-                bib_key = _existing_bib_key(existing, old_num)
+                bib_key = _existing_bib_key(existing, old_num, key_index)
                 if bib_key not in key_to_number:
                     key_to_number[bib_key] = current_num
                     result.assignments[current_num] = CitationAssignment(
@@ -105,7 +170,7 @@ def compute_renumbering(
             elif event_type == "new":
                 citations: list[CitationCandidate] = data
                 for cand in citations:
-                    bib_key = cand.pmid or cand.doi or cand.title[:30]
+                    bib_key = key_index.key_for_candidate(cand)
                     if bib_key not in key_to_number:
                         key_to_number[bib_key] = current_num
                         result.assignments[current_num] = CitationAssignment(
@@ -130,9 +195,10 @@ def compute_renumbering(
     return result
 
 
-def _existing_bib_key(existing: ExistingCitationMap, old_num: int) -> str:
+def _existing_bib_key(existing: ExistingCitationMap, old_num: int,
+                      key_index: CitationKeyIndex) -> str:
     """Get a stable key for an existing bibliography entry."""
     entry = existing.bib_entries.get(old_num)
     if entry:
-        return entry.bib_key
+        return key_index.key_for_existing(entry)
     return f"existing_{old_num}"

@@ -20,6 +20,29 @@ class Author(BaseModel):
         return self.display
 
 
+PLACEHOLDER_TITLE_PREFIX = "(No citation found"
+
+
+def make_placeholder_citation() -> "CitationCandidate":
+    """A stand-in for an unresolved marker slot. Never export as a real reference."""
+    placeholder = CitationCandidate(
+        title=f"{PLACEHOLDER_TITLE_PREFIX} — click Replace to search)",
+        pmid="", doi="", year=0, journal="",
+    )
+    placeholder.composite_score = 0.0
+    placeholder.score_rationale = "No citation found for this marker"
+    return placeholder
+
+
+def is_valid_citation(citation: "CitationCandidate") -> bool:
+    """True if this is a real citation (not empty, not a placeholder slot)."""
+    if not citation:
+        return False
+    if citation.title.startswith(PLACEHOLDER_TITLE_PREFIX):
+        return False
+    return bool(citation.title or citation.pmid or citation.doi)
+
+
 class CitationCandidate(BaseModel):
     """A candidate reference retrieved from PubMed or bioRxiv."""
     pmid: str = Field(default="", description="PubMed ID")

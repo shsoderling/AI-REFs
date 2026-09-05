@@ -265,6 +265,11 @@ class ChatSearchWorker(QThread):
         self.max_library_results = max(3, min(max_library_results, 50))
         # Seed with candidates from previous turns so selections can resolve
         self.all_candidates: dict[str, CitationCandidate] = dict(prior_candidates) if prior_candidates else {}
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation; checked between tool-use rounds."""
+        self._cancelled = True
 
     def run(self):
         user_library = None
@@ -325,6 +330,9 @@ class ChatSearchWorker(QThread):
             messages = list(self.messages)
 
             for round_num in range(MAX_CHAT_ROUNDS):
+                if self._cancelled:
+                    logger.info("ChatSearchWorker cancelled")
+                    return
                 response = client.messages.create(
                     model=self.model,
                     max_tokens=4096,
@@ -337,6 +345,9 @@ class ChatSearchWorker(QThread):
                     tool_results = []
                     for block in response.content:
                         if block.type == "tool_use":
+                            if self._cancelled:
+                                logger.info("ChatSearchWorker cancelled mid-round")
+                                return
                             self.status_update.emit(f"Calling {block.name}...")
                             result = executor.execute(block.name, block.input)
                             tool_results.append({
@@ -349,6 +360,9 @@ class ChatSearchWorker(QThread):
                     messages.append({"role": "user", "content": tool_results})
 
                 elif response.stop_reason == "end_turn":
+                    if self._cancelled:
+                        logger.info("ChatSearchWorker cancelled before reply")
+                        return
                     text = ""
                     for block in response.content:
                         if hasattr(block, "text"):
@@ -369,6 +383,8 @@ class ChatSearchWorker(QThread):
                     break
 
             # Exited loop without returning — emit any candidates found and a message
+            if self._cancelled:
+                return
             if self.all_candidates:
                 self.candidates_found.emit(list(self.all_candidates.values()))
                 self.assistant_message.emit(
@@ -381,14 +397,17 @@ class ChatSearchWorker(QThread):
                 )
 
         except anthropic.AuthenticationError:
-            self.error.emit(
-                "Anthropic API authentication failed. Check your API key in the Input tab."
-            )
+            if not self._cancelled:
+                self.error.emit(
+                    "Anthropic API authentication failed. Check your API key in the Input tab."
+                )
         except anthropic.APIError as e:
-            self.error.emit(f"API error: {e}")
+            if not self._cancelled:
+                self.error.emit(f"API error: {e}")
         except Exception as e:
             logger.error(f"ChatSearchWorker error: {e}", exc_info=True)
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
         finally:
             if user_library:
                 try:

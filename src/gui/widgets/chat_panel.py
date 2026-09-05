@@ -181,6 +181,33 @@ class ChatPanel(QFrame):
 
     # ── Public API ───────────────────────────────────────────────
 
+    def cancel_active_search(self):
+        """Cancel any running chat search; do not block the UI.
+
+        The worker checks its flag between rounds and exits without emitting,
+        so no stale replies land on a different sentence's context.
+        """
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            logger.info("Cancelled active chat search")
+        self.status_label.setText("")
+        self._enable_input()
+
+    def shutdown_workers(self, wait_ms: int = 3000):
+        """Cancel and wait for all workers — call before app shutdown.
+
+        Destroying a running QThread crashes Qt, so this blocks (bounded)
+        until the threads exit.
+        """
+        for worker in (self._worker, self._fetch_worker):
+            if worker and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                if not worker.wait(wait_ms):
+                    logger.warning("Chat worker did not stop in time; terminating")
+                    worker.terminate()
+                    worker.wait(1000)
+
     def open_for_sentence(
         self,
         sentence_id: str,
@@ -188,6 +215,8 @@ class ChatPanel(QFrame):
         settings: ProjectSettings,
     ):
         """Initialize the chat panel for a specific sentence."""
+        # A search may still be running for the previous sentence
+        self.cancel_active_search()
         self._settings = settings
         self._claim_text = claim_text
         self._sentence_id = sentence_id
