@@ -51,7 +51,9 @@ REM Output: dist\AI REFs\AI REFs.exe
 4. **Review Tab**: Review each citation assignment:
    - Green = high confidence, Yellow = medium, Red = low
    - Click a sentence to see candidate details, abstracts, and rationale
-   - Accept, modify (enter your own PMID), or find alternatives
+   - Every reference, whether the sentence has one (REF) or several (REFS),
+     gets its own Keep / View It / Replace buttons (Remove appears when a
+     sentence has several); Replace opens the search chat for that slot
    - Export when all sentences are resolved
 
 4. **Export**: Generates:
