@@ -15,6 +15,7 @@ from ..services.pubmed_client import PubMedClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
+from ..services.jats import select_passages
 from ..storage.cache_db import CacheDB
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ def _article_summary(article: CitationCandidate, include_mesh: bool = False) -> 
         "year": article.year,
         "journal": article.journal_abbrev or article.journal,
         "abstract": article.abstract[:2000],
+        "pmcid": article.pmcid,
+        "full_text_available": bool(article.pmcid),
     }
     if include_mesh:
         d["mesh_terms"] = article.mesh_terms[:10]
@@ -53,6 +56,7 @@ def _biorxiv_summary(candidate: CitationCandidate) -> dict:
         "year": candidate.year,
         "journal": candidate.journal,
         "abstract": candidate.abstract[:2000],
+        "published_doi": candidate.published_doi,
     }
 
 
@@ -70,6 +74,53 @@ def _europepmc_summary(candidate: CitationCandidate) -> dict:
         "journal": candidate.journal_abbrev or candidate.journal,
         "abstract": candidate.abstract[:2000],
         "is_review": candidate.is_review,
+        "pmcid": candidate.pmcid,
+        "full_text_available": bool(candidate.pmcid),
+    }
+
+
+def resolve_pmcid(candidate: Optional[CitationCandidate], europepmc: Optional[EuropePMCClient],
+                  pmcid: str = "", pmid: str = "", doi: str = "") -> str:
+    """Find a PMC id from what we know: explicit id, the candidate, or Europe PMC."""
+    if pmcid:
+        return pmcid
+    if candidate is not None and candidate.pmcid:
+        return candidate.pmcid
+    if europepmc is None:
+        return ""
+    pmid = pmid or (candidate.pmid if candidate else "")
+    doi = doi or (candidate.doi if candidate else "")
+    found = None
+    if pmid:
+        found = europepmc.fetch_by_pmid(pmid)
+    if found is None and doi:
+        found = europepmc.fetch_by_doi(doi)
+    if found is not None and found.pmcid and candidate is not None:
+        candidate.pmcid = found.pmcid
+    return found.pmcid if found is not None else ""
+
+
+def fulltext_passages_for(candidate: Optional[CitationCandidate], keywords: list[str],
+                          europepmc: Optional[EuropePMCClient], pmcid: str = "",
+                          pmid: str = "", doi: str = "",
+                          max_passages: int = 8, max_chars: int = 6000) -> Optional[dict]:
+    """Keyword-ranked full-text passages, or ``None`` when no open-access text exists.
+
+    Shared by the agent tool and the verifier.
+    """
+    if europepmc is None:
+        return None
+    pmcid = resolve_pmcid(candidate, europepmc, pmcid=pmcid, pmid=pmid, doi=doi)
+    if not pmcid:
+        return None
+    paragraphs = europepmc.fetch_full_text(pmcid)
+    if not paragraphs:
+        return None
+    return {
+        "pmcid": pmcid,
+        "paragraph_count": len(paragraphs),
+        "passages": select_passages(paragraphs, keywords, max_passages=max_passages,
+                                    max_chars=max_chars),
     }
 
 
@@ -217,6 +268,31 @@ class ToolExecutor:
                 self.all_candidates[key] = c
         return json.dumps([_article_summary(c, include_mesh=True) for c in candidates])
 
+    def _get_fulltext_passages(self, inp: dict) -> str:
+        if not self.europepmc:
+            return json.dumps({"available": False, "reason": "Europe PMC is not enabled"})
+        keywords = [str(k) for k in (inp.get("keywords") or []) if str(k).strip()]
+        pmcid = str(inp.get("pmcid", "") or "").strip()
+        pmid = str(inp.get("pmid", "") or "").strip()
+        doi = str(inp.get("doi", "") or "").strip()
+        candidate = None
+        for key in (pmid, doi, pmcid):
+            if key and key in self.all_candidates:
+                candidate = self.all_candidates[key]
+                break
+        if candidate is None and pmcid:
+            candidate = next((c for c in self.all_candidates.values() if c.pmcid == pmcid), None)
+        label = pmcid or pmid or doi or (candidate.title[:40] if candidate else "?")
+        self._status(f"Reading full text: {label}")
+        result = fulltext_passages_for(candidate, keywords, self.europepmc,
+                                       pmcid=pmcid, pmid=pmid, doi=doi)
+        if result is None:
+            return json.dumps({
+                "available": False,
+                "reason": "No open-access full text in PMC for this article; rely on the abstract.",
+            })
+        return json.dumps({"available": True, **result})
+
     # ── dispatch table ───────────────────────────────────────────────
 
     _dispatch: dict[str, Callable] = {
@@ -227,6 +303,7 @@ class ToolExecutor:
         "fetch_biorxiv_preprint": _fetch_biorxiv_preprint,
         "search_europepmc": _search_europepmc,
         "fetch_europepmc_article": _fetch_europepmc_article,
+        "get_fulltext_passages": _get_fulltext_passages,
     }
 
 

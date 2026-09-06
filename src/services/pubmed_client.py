@@ -304,14 +304,16 @@ class PubMedClient:
             if id_elem.get("EIdType") == "doi":
                 doi = id_elem.text or ""
                 break
-        # Also check PubmedData ArticleIdList
-        if not doi:
-            pubmed_data = elem.find("PubmedData")
-            if pubmed_data is not None:
-                for aid in pubmed_data.findall(".//ArticleId"):
-                    if aid.get("IdType") == "doi":
-                        doi = aid.text or ""
-                        break
+        # PubmedData ArticleIdList: DOI fallback and the PMC id
+        pmcid = ""
+        pubmed_data = elem.find("PubmedData")
+        if pubmed_data is not None:
+            for aid in pubmed_data.findall(".//ArticleId"):
+                id_type = aid.get("IdType")
+                if id_type == "doi" and not doi:
+                    doi = aid.text or ""
+                elif id_type == "pmc" and not pmcid:
+                    pmcid = (aid.text or "").strip()
 
         # MeSH terms
         mesh_terms = []
@@ -351,6 +353,7 @@ class PubMedClient:
             publication_types=pub_types,
             is_review=is_review,
             is_retracted=is_retracted,
+            pmcid=pmcid,
         )
 
     def _get_text(self, elem) -> str:

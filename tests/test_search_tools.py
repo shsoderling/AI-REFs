@@ -19,8 +19,7 @@ def test_every_search_tool_is_dispatchable_and_well_formed():
     ]
     for t in tools:
         assert t["description"] and t["input_schema"]["type"] == "object"
-        if t["name"] != "get_fulltext_passages":      # executor handler lands with full text
-            assert t["name"] in ToolExecutor._dispatch, t["name"]
+        assert t["name"] in ToolExecutor._dispatch, t["name"]
 
 
 def test_final_tool_goes_last_and_carries_the_cache_breakpoint():
