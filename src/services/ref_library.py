@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 from ..models.citation import CitationCandidate, Author
+
+from .rate_limiter import synchronized
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,7 @@ class ReferenceLibrary:
         candidates.append("/tmp/ai_refs_ref_manager_library.db")
 
         self._conn = None
+        self._lock = threading.RLock()   # shared by the search worker threads
         self.db_path = requested
         last_exc: Optional[Exception] = None
         tried: set[str] = set()
@@ -107,6 +111,7 @@ class ReferenceLibrary:
     # CRUD + search
     # ------------------------------------------------------------------
 
+    @synchronized
     def count(self) -> int:
         row = self._conn.execute(
             "SELECT COUNT(*) FROM references_library"
@@ -119,6 +124,7 @@ class ReferenceLibrary:
         "is_retracted, is_review, source, updated_at"
     )
 
+    @synchronized
     def upsert_candidate(
         self,
         citation: CitationCandidate,
@@ -242,6 +248,7 @@ class ReferenceLibrary:
         merged.is_review = merged.is_review or incoming.is_review
         return merged
 
+    @synchronized
     def add_candidates(
         self,
         citations: list[CitationCandidate],
@@ -257,6 +264,7 @@ class ReferenceLibrary:
                 updated += 1
         return imported, updated
 
+    @synchronized
     def search(self, query: str, max_results: int = 10) -> list[CitationCandidate]:
         """Search the local library and return ranked candidate matches."""
         max_results = max(1, min(int(max_results or 10), 50))
@@ -299,6 +307,7 @@ class ReferenceLibrary:
         scored.sort(key=lambda x: (x[0], x[1].year), reverse=True)
         return [cand for _, cand in scored[:max_results]]
 
+    @synchronized
     def close(self):
         self._conn.close()
 
@@ -306,6 +315,7 @@ class ReferenceLibrary:
     # EndNote import
     # ------------------------------------------------------------------
 
+    @synchronized
     def import_from_path(self, input_path: str) -> ImportReport:
         """Import an EndNote export (`.ris` or EndNote XML `.xml`)."""
         path = Path(input_path).expanduser()
@@ -330,6 +340,7 @@ class ReferenceLibrary:
         )
         return report
 
+    @synchronized
     def import_ris(self, ris_path: str) -> ImportReport:
         report = ImportReport()
         path = Path(ris_path).expanduser()
@@ -358,6 +369,7 @@ class ReferenceLibrary:
 
         return report
 
+    @synchronized
     def import_endnote_xml(self, xml_path: str) -> ImportReport:
         report = ImportReport()
         path = Path(xml_path).expanduser()

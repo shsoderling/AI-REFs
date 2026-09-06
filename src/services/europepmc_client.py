@@ -17,6 +17,7 @@ import requests
 
 from ..models.citation import CitationCandidate, Author
 from ..storage.cache_db import CacheDB
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,13 @@ class EuropePMCClient:
         """
         self.cache = cache_db or CacheDB()
         self._session = requests.Session()
-        self._last_request_time = 0.0
         self._min_interval = 0.5  # Conservative rate limiting
         self._max_retries = 3
+        self._limiter = RateLimiter(self._min_interval)
 
     def _rate_limit(self):
-        """Enforce rate limiting between requests."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce rate limiting between requests (shared across threads)."""
+        self._limiter.wait(self._min_interval)
 
     def _request(self, params: dict, url: str = EUROPEPMC_SEARCH_URL,
                  raw: bool = False) -> Optional[Any]:

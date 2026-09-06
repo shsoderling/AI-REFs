@@ -5,6 +5,7 @@ Can run headlessly or emit Qt signals for GUI progress updates.
 
 import json
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional, Callable
 
 from ..models.project import ProjectState, PipelineStage
@@ -290,33 +291,16 @@ class PipelineOrchestrator:
         )
 
         try:
-            for i, sent in enumerate(marked):
-                self._check_pause()
-                if self._cancelled:
-                    return self.project
+            workers = self._effective_parallelism()
+            if workers > 1:
+                self._emit("info", f"  Running {workers} sentence searches in parallel")
 
-                self._emit(
-                    "info",
-                    f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}..."
-                )
+            def search_one(i: int, sent: SentenceRecord):
+                return self._run_sentence(i, sent, marked, sentences, agent)
 
-                # Sentences with multiple markers that include at least one
-                # (REF): run a SEPARATE search for each marker.  All-(REFS)
-                # sentences keep the single combined search.
-                base_ctx = build_claim_context(sentences, sent)
-                if sent.searched_per_marker:
-                    evidence = self._find_citations_per_ref(
-                        agent, sent, self.project.inferred_domains, base_ctx
-                    )
-                else:
-                    self._contexts[sent.id] = [base_ctx]
-                    evidence = agent.find_citations(
-                        sent, self.project.inferred_domains, context=base_ctx
-                    )
-                self.project.evidence_map[sent.id] = evidence
-
-                if not evidence.selected:
-                    self._emit("warning", f"  No citations found for {sent.id}")
+            for sent, evidence in self._run_pool(workers, marked, search_one):
+                if evidence is not None:
+                    self.project.evidence_map[sent.id] = evidence
 
             self._check_pause()
             if self._cancelled:
@@ -373,22 +357,82 @@ class PipelineOrchestrator:
         else:
             self._emit("info", "  Independent verification is off; running retraction/preprint checks only")
 
-        checked = 0
-        for sent in marked:
+        def verify_one(i: int, sent: SentenceRecord) -> bool:
             self._check_pause()
             if self._cancelled:
-                return
+                return False
             evidence = self.project.evidence_map.get(sent.id)
             if evidence is None or not evidence.selected:
-                continue
+                return False
             deterministic_checks(evidence, biorxiv=biorxiv, europepmc=europepmc,
                                  pubmed=pubmed, log=self._log)
-            if verifier is not None:
-                contexts = self._contexts.get(sent.id) or [bare_context(sent)]
-                verifier.verify_evidence(contexts, evidence)
-                checked += 1
+            if verifier is None:
+                return False
+            contexts = self._contexts.get(sent.id) or [bare_context(sent)]
+            verifier.verify_evidence(contexts, evidence)
+            return True
+
+        checked = sum(1 for _, done in self._run_pool(self._effective_parallelism(), marked, verify_one)
+                      if done)
         if verifier is not None:
             self._emit("info", f"  Verified selections for {checked} sentence(s)")
+
+    # ── concurrency helpers ──────────────────────────────────────────
+
+    def _effective_parallelism(self) -> int:
+        """Worker threads for the per-sentence stages: 1 without an NCBI API
+        key (3 requests/s would be exceeded), else the setting clamped to 1–8."""
+        settings = self.project.settings
+        if not settings.ncbi_api_key:
+            return 1
+        return max(1, min(int(settings.parallel_searches or 1), 8))
+
+    def _run_pool(self, workers: int, items: list, func):
+        """Apply ``func(index, item)`` to every item on ``workers`` threads and
+        yield ``(item, result)`` in the original order.
+
+        Cancel makes pending items return quickly (each checks the flag);
+        an exception cancels the rest and is re-raised.
+        """
+        if workers <= 1:
+            for i, item in enumerate(items):
+                yield item, func(i, item)
+            return
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="airefs-search") as pool:
+            futures: list[Future] = [pool.submit(func, i, item) for i, item in enumerate(items)]
+            try:
+                for item, fut in zip(items, futures):
+                    yield item, fut.result()
+            except BaseException:
+                self._cancelled = True
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    def _run_sentence(self, i: int, sent: SentenceRecord, marked: list, sentences: list,
+                      agent: LLMCitationAgent) -> Optional[EvidenceRecord]:
+        """Search one sentence (one call, or one per marker); None when cancelled."""
+        self._check_pause()
+        if self._cancelled:
+            return None
+
+        self._emit("info", f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}...")
+
+        # Sentences with multiple markers that include at least one (REF):
+        # run a SEPARATE search for each marker.  All-(REFS) sentences keep
+        # the single combined search.
+        base_ctx = build_claim_context(sentences, sent)
+        if sent.searched_per_marker:
+            evidence = self._find_citations_per_ref(
+                agent, sent, self.project.inferred_domains, base_ctx
+            )
+        else:
+            self._contexts[sent.id] = [base_ctx]
+            evidence = agent.find_citations(
+                sent, self.project.inferred_domains, context=base_ctx
+            )
+        if not evidence.selected:
+            self._emit("warning", f"  No citations found for {sent.id}")
+        return evidence
 
     def _find_citations_per_ref(
         self,

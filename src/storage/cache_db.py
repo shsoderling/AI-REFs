@@ -3,9 +3,12 @@
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Any
+
+from ..services.rate_limiter import synchronized
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,9 @@ class CacheDB:
             db_path = str(_DEFAULT_CACHE_DIR / "cache.db")
 
         self._ttl = ttl
+        # One connection shared by the search worker threads; every public
+        # method runs under this lock.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
@@ -76,6 +82,7 @@ class CacheDB:
 
     # ── Search cache ────────────────────────────────────────────────
 
+    @synchronized
     def get_search(self, key: str) -> Optional[Any]:
         row = self._conn.execute(
             "SELECT value, ts FROM search_cache WHERE key = ?", (key,)
@@ -88,6 +95,7 @@ class CacheDB:
             return None
         return json.loads(row[0])
 
+    @synchronized
     def put_search(self, key: str, value: Any):
         self._conn.execute(
             "INSERT OR REPLACE INTO search_cache (key, value, ts) VALUES (?, ?, ?)",
@@ -97,6 +105,7 @@ class CacheDB:
 
     # ── Article cache ───────────────────────────────────────────────
 
+    @synchronized
     def get_article(self, key: str) -> Optional[dict]:
         row = self._conn.execute(
             "SELECT value, ts FROM article_cache WHERE key = ?", (key,)
@@ -109,6 +118,7 @@ class CacheDB:
             return None
         return json.loads(row[0])
 
+    @synchronized
     def put_article(self, key: str, value: dict):
         self._conn.execute(
             "INSERT OR REPLACE INTO article_cache (key, value, ts) VALUES (?, ?, ?)",
@@ -118,12 +128,14 @@ class CacheDB:
 
     # ── Housekeeping ────────────────────────────────────────────────
 
+    @synchronized
     def clear(self):
         """Remove all cached entries."""
         self._conn.execute("DELETE FROM search_cache")
         self._conn.execute("DELETE FROM article_cache")
         self._conn.commit()
 
+    @synchronized
     def prune_expired(self):
         """Remove entries older than the TTL."""
         cutoff = time.time() - self._ttl
@@ -131,6 +143,7 @@ class CacheDB:
         self._conn.execute("DELETE FROM article_cache WHERE ts < ?", (cutoff,))
         self._conn.commit()
 
+    @synchronized
     def close(self):
         """Close the database connection."""
         self._conn.close()

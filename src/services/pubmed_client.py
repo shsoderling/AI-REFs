@@ -16,6 +16,7 @@ import requests
 
 from ..models.citation import CitationCandidate, Author
 from ..storage.cache_db import CacheDB
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +31,13 @@ class PubMedClient:
         self.api_key = api_key
         self.cache = cache_db or CacheDB()
         self._session = requests.Session()
-        self._last_request_time = 0.0
         # NCBI allows 3 req/s without key, 10 req/s with key
         self._min_interval = 0.11 if api_key else 0.35
+        self._limiter = RateLimiter(self._min_interval)
 
     def _rate_limit(self):
-        """Enforce NCBI rate limiting."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce NCBI rate limiting (shared across threads)."""
+        self._limiter.wait(self._min_interval)
 
     def _base_params(self) -> dict:
         """Common parameters for all E-utility requests."""
