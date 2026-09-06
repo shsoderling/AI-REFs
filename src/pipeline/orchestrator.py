@@ -24,6 +24,7 @@ from .llm_citation_agent import LLMCitationAgent
 from .global_qa import GlobalQA
 from .existing_citation_parser import ExistingCitationParser
 from .renumbering import CitationKeyIndex
+from .claim_context import ClaimContext, build_claim_context, sub_claims_for
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,9 @@ class PipelineOrchestrator:
         self._log = log_callback or (lambda *a: None)
         self._paused = False
         self._cancelled = False
+        # sentence id -> one ClaimContext per marker slot (built during search,
+        # reused by verification)
+        self._contexts: dict[str, list[ClaimContext]] = {}
 
     def pause(self):
         self._paused = True
@@ -248,6 +252,7 @@ class PipelineOrchestrator:
         # (S001, S002, ...), so stale records would silently attach to the
         # wrong sentences after the document is edited or replaced.
         self.project.evidence_map = {}
+        self._contexts = {}
 
         cache = CacheDB()
         pubmed = PubMedClient(
@@ -297,13 +302,15 @@ class PipelineOrchestrator:
                 # Sentences with multiple markers that include at least one
                 # (REF): run a SEPARATE search for each marker.  All-(REFS)
                 # sentences keep the single combined search.
+                base_ctx = build_claim_context(sentences, sent)
                 if sent.searched_per_marker:
                     evidence = self._find_citations_per_ref(
-                        agent, sent, self.project.inferred_domains
+                        agent, sent, self.project.inferred_domains, base_ctx
                     )
                 else:
+                    self._contexts[sent.id] = [base_ctx]
                     evidence = agent.find_citations(
-                        sent, self.project.inferred_domains
+                        sent, self.project.inferred_domains, context=base_ctx
                     )
                 self.project.evidence_map[sent.id] = evidence
 
@@ -344,6 +351,7 @@ class PipelineOrchestrator:
         agent: LLMCitationAgent,
         sentence: SentenceRecord,
         domain_context: list[str] = None,
+        base_context: ClaimContext = None,
     ):
         """Handle sentences with multiple (REF) markers by searching independently.
 
@@ -356,14 +364,16 @@ class PipelineOrchestrator:
         still slips through, a post-search deduplication picks the next-best
         unique candidate from the result set.
         """
-        import re
         from ..models.evidence import EvidenceRecord, ConfidenceLevel, VerificationStatus
         from ..models.sentence import SentenceRecord as SR
 
+        if base_context is None:
+            base_context = build_claim_context(self.project.sentences, sentence)
         # Split the raw text at each marker to identify the sub-claims
-        parts = re.split(r'\(REFS?\)', sentence.raw_text)
+        parts = sub_claims_for(sentence)
         num_markers = sentence.marker_count
         marker_types = sentence.effective_marker_types()
+        self._contexts[sentence.id] = []
 
         self._emit("info", f"  Multi-marker: splitting into {num_markers} independent searches")
 
@@ -404,34 +414,19 @@ class PipelineOrchestrator:
                     f"sentence — selecting a single best citation for it"
                 )
 
-            # Build a descriptive sub-claim for this marker
-            sub_text = parts[marker_idx].strip() if marker_idx < len(parts) else ""
-            trailing = parts[marker_idx + 1].strip() if marker_idx + 1 < len(parts) else ""
+            # The sub-claim for this marker, plus the papers already assigned
+            # to earlier markers so the agent picks a different one.
+            sub_text, trailing = parts[marker_idx] if marker_idx < len(parts) else ("", "")
+            ctx = base_context.with_marker(sub_text, trailing, sorted(assigned_identifiers))
+            self._contexts[sentence.id].append(ctx)
 
-            sub_claim = (
-                f"From the sentence: \"{sentence.clean_text}\"\n\n"
-                f"Find a citation specifically for this part: \"{sub_text}\""
-            )
-            if trailing:
-                sub_claim += f" (followed by: \"{trailing[:80]}\")"
-
-            # Tell the agent which citations are already assigned to prior markers
-            if assigned_identifiers:
-                exclusion_list = ", ".join(sorted(assigned_identifiers))
-                sub_claim += (
-                    f"\n\nIMPORTANT: The following identifiers have already been "
-                    f"assigned to other (REF) markers in this sentence. You MUST "
-                    f"find a DIFFERENT paper — do NOT select any of these: "
-                    f"{exclusion_list}"
-                )
-
-            # Create a temporary single-marker sentence for the agent
+            # A temporary single-marker sentence for the agent
             temp_sentence = SR(
                 id=f"{sentence.id}_ref{marker_idx}",
                 paragraph_index=sentence.paragraph_index,
                 sentence_index=sentence.sentence_index,
                 raw_text=sentence.raw_text,
-                clean_text=sub_claim,
+                clean_text=sentence.clean_text,
                 section=sentence.section,
                 marker_type=MarkerType.REF,
                 marker_count=1,  # Treat as single (REF)
@@ -440,11 +435,10 @@ class PipelineOrchestrator:
 
             self._emit(
                 "info",
-                f"    Marker [{marker_idx+1}/{num_markers}]: "
-                f"{parts[marker_idx].strip()[:50]}..."
+                f"    Marker [{marker_idx+1}/{num_markers}]: {sub_text[:50]}..."
             )
 
-            ev = agent.find_citations(temp_sentence, domain_context)
+            ev = agent.find_citations(temp_sentence, domain_context, context=ctx)
 
             # Collect the best single citation, enforcing uniqueness
             selected_citation = None

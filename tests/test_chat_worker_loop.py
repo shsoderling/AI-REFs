@@ -90,3 +90,10 @@ def test_round_limit_reports_what_was_found(qapp, offline):
     assert len(client.calls) == cw.MAX_CHAT_ROUNDS
     assert got["messages"] and "many steps" in got["messages"][0]
     assert [c.pmid for c in got["candidates"][0]] == ["11"]
+
+
+def test_context_text_is_added_to_the_chat_system_prompt(qapp, offline):
+    client = FakeAnthropic([message(text_block("ok"), stop_reason="end_turn")])
+    run_worker(client, context_text="CONTEXT — for understanding only:\nSection: Results")
+    system = client.calls[0]["system"][0]["text"]
+    assert "Section: Results" in system and system.index("Rac1 drives spine growth.") < system.index("Section: Results")

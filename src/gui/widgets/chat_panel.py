@@ -214,12 +214,18 @@ class ChatPanel(QFrame):
         sentence_id: str,
         claim_text: str,
         settings: ProjectSettings,
+        context_text: str = "",
     ):
-        """Initialize the chat panel for a specific sentence."""
+        """Initialize the chat panel for a specific sentence.
+
+        ``context_text`` (section, neighbouring sentences) is handed to the
+        search worker so it understands the claim; it is never cited.
+        """
         # A search may still be running for the previous sentence
         self.cancel_active_search()
         self._settings = settings
         self._claim_text = claim_text
+        self._context_text = context_text or ""
         self._sentence_id = sentence_id
         self._conversation = []
         self._all_candidates = {}
@@ -419,6 +425,7 @@ class ChatPanel(QFrame):
             parent=self,
             prefer_reviews=self._settings.prefer_reviews,
             recency_bias=self._settings.recency_bias,
+            context_text=getattr(self, "_context_text", ""),
         )
         self._worker.status_update.connect(self._on_status)
         self._worker.assistant_message.connect(self._on_assistant_reply)

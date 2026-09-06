@@ -133,3 +133,20 @@ def test_orcid_hint_only_for_self_referencing_claims():
     assert "0000-0001-2345-6789[auid]" in client.calls[0]["messages"][0]["content"]
     agent.find_citations(sentence("Spines remodel."))
     assert "[auid]" not in client.calls[1]["messages"][0]["content"]
+
+
+def test_context_reaches_the_agent_with_the_do_not_cite_instruction():
+    from src.pipeline.claim_context import build_claim_context
+    doc = [
+        SentenceRecord(id="S000", paragraph_index=3, clean_text="Spines are dynamic.", raw_text="Spines are dynamic.", section="Results"),
+        sentence("These changes require Rac1."),
+    ]
+    doc[1].paragraph_index = 3
+    doc[1].section = "Results"
+    ctx = build_claim_context(doc, doc[1])
+    client = FakeAnthropic([submit_msg([])])
+    make_agent(client).find_citations(doc[1], context=ctx)
+    msg = client.calls[0]["messages"][0]["content"]
+    assert msg.startswith('CLAIM — find 1 reference')
+    assert "Section: Results" in msg and "Do NOT search for or cite" in msg
+    assert 'Preceding: "Spines are dynamic."' in msg

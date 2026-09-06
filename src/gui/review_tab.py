@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QFont, QDesktopServices
 from ..models.embedded import DocumentTier
 from ..models.project import ProjectState
 from ..models.sentence import SentenceRecord, MarkerType
+from ..pipeline.claim_context import build_claim_context
 from ..models.evidence import (
     EvidenceRecord, ConfidenceLevel, ReviewDecision, VerificationStatus
 )
@@ -1160,6 +1161,7 @@ class ReviewTab(QWidget):
             sentence_id=self._current_sentence_id,
             claim_text=sentence.clean_text,
             settings=self._project.settings,
+            context_text=build_claim_context(self._project.sentences, sentence).to_context_block(),
         )
 
     @Slot(object)
@@ -1343,6 +1345,7 @@ class ReviewTab(QWidget):
             sentence_id=self._current_sentence_id,
             claim_text=sentence.clean_text,
             settings=self._project.settings,
+            context_text=build_claim_context(self._project.sentences, sentence).to_context_block(),
         )
 
     # ── Chat panel integration ───────────────────────────────────

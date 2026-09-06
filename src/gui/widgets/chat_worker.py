@@ -85,10 +85,12 @@ class ChatSearchWorker(QThread):
         client=None,
         prefer_reviews: bool = False,
         recency_bias: bool = True,
+        context_text: str = "",
     ):
         super().__init__(parent)
         self._client = client  # injected in tests; built in run() otherwise
         self.preferences = build_preference_text(prefer_reviews, recency_bias)
+        self.context_text = (context_text or "").strip()
         self.messages = messages
         self.claim_text = claim_text
         self.api_key = anthropic_api_key
@@ -151,6 +153,8 @@ class ChatSearchWorker(QThread):
                 max_rounds=MAX_CHAT_ROUNDS,
             )
             system += f"\n{self.preferences}"
+            if self.context_text:
+                system += f"\n\n{self.context_text}"
             if user_library:
                 if self.prefer_user_library:
                     system += (

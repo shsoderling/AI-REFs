@@ -25,6 +25,7 @@ from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
 from ..services.search_tools import SUBMIT_CITATIONS, build_tool_list, find_tool_use
 from ..services.tool_executor import ToolExecutor
+from .claim_context import ClaimContext, bare_context
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,7 @@ class LLMCitationAgent:
 
     # ── prompt assembly ──────────────────────────────────────────────
 
-    def _extra_instructions(self, sentence: SentenceRecord, domain_context: list[str] = None) -> str:
+    def _extra_instructions(self, context: ClaimContext, domain_context: list[str] = None) -> str:
         parts = []
         if domain_context:
             parts.append(f"Document research domains: {', '.join(domain_context)}")
@@ -168,7 +169,7 @@ class LLMCitationAgent:
                 )
 
         # Detect self-referencing language (our, we, our lab, etc.)
-        if self.orcid_id and _SELF_REFERENCE.search(sentence.clean_text):
+        if self.orcid_id and _SELF_REFERENCE.search(f"{context.claim} {context.paragraph}"):
             parts.append(
                 f"IMPORTANT: This sentence references the document author's OWN work. "
                 f"The author's ORCID is {self.orcid_id}. "
@@ -178,17 +179,9 @@ class LLMCitationAgent:
             )
         return "\n".join(parts)
 
-    def _user_message(self, sentence: SentenceRecord, num_refs: int,
+    def _user_message(self, context: ClaimContext, num_refs: int,
                       domain_context: list[str] = None) -> str:
-        extras = self._extra_instructions(sentence, domain_context)
-        text = (
-            f"Find {'1 reference' if num_refs == 1 else f'{num_refs} references'} "
-            f"that support this claim:\n\n"
-            f"\"{sentence.clean_text}\""
-        )
-        if extras:
-            text += "\n\n" + extras
-        return text
+        return context.to_agent_message(num_refs, self._extra_instructions(context, domain_context))
 
     # ── agent loop ───────────────────────────────────────────────────
 
@@ -196,8 +189,16 @@ class LLMCitationAgent:
         self,
         sentence: SentenceRecord,
         domain_context: list[str] = None,
+        context: Optional[ClaimContext] = None,
     ) -> EvidenceRecord:
-        """Run the agent loop for a single sentence. Returns an EvidenceRecord."""
+        """Run the agent loop for a single sentence. Returns an EvidenceRecord.
+
+        ``context`` carries the section, neighbouring sentences and, for a
+        multi-marker sentence, the sub-claim and exclusions; without it the
+        bare sentence is used.
+        """
+        if context is None:
+            context = bare_context(sentence)
         marker_type = sentence.marker_type or MarkerType.REF
         # Multi-(REF) sentences are handled by the orchestrator, which calls
         # find_citations once per marker with marker_count=1.
@@ -205,7 +206,7 @@ class LLMCitationAgent:
 
         system = SYSTEM_PROMPT.format(max_refs=num_refs, max_rounds=MAX_AGENT_ROUNDS,
                                       preferences=self.preferences)
-        messages = [{"role": "user", "content": self._user_message(sentence, num_refs, domain_context)}]
+        messages = [{"role": "user", "content": self._user_message(context, num_refs, domain_context)}]
 
         # Track all candidates seen across rounds
         all_pmids_seen: dict[str, CitationCandidate] = {}
