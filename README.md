@@ -36,7 +36,7 @@ REM Output: dist\AI REFs\AI REFs.exe
 
 ## How to Use
 
-1. **Input Tab**: Load your DOCX file (drag & drop or browse). Configure citation style, NCBI email, and preferences.
+1. **Input Tab**: Load your DOCX file (drag & drop or browse). Configure citation style, NCBI email, and preferences. The Claude model list is fetched from Anthropic for your API key (newest first) and cached for a day; click ↻ to refresh it. New projects default to the newest model; your own selection is always kept.
 
 2. **REF Library Tab**: Load your AI REFs library and optionally import EndNote exports (`.ris` / `.xml`).
    - The run agent searches your library first (when enabled), then external literature.

@@ -16,6 +16,7 @@ from ..services.pubmed_client import PubMedClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
+from ..services.model_catalog import resolve_model_id
 from ..storage.cache_db import CacheDB
 from .document_parser import DocumentParser
 from .marker_locator import MarkerLocator
@@ -229,7 +230,7 @@ class PipelineOrchestrator:
         if settings.domain_inference and settings.anthropic_api_key:
             self._emit("info", "Inferring document research domains...")
             self.project.inferred_domains = _infer_domains_with_llm(
-                sentences, settings.anthropic_api_key, settings.claude_model,
+                sentences, settings.anthropic_api_key, resolve_model_id(settings.claude_model),
             )
             self._emit("info", f"Inferred domains: {self.project.inferred_domains}")
 
@@ -265,7 +266,7 @@ class PipelineOrchestrator:
 
         agent = LLMCitationAgent(
             anthropic_api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+            model=resolve_model_id(settings.claude_model),
             pubmed_client=pubmed,
             biorxiv_client=biorxiv,
             europepmc_client=europepmc,

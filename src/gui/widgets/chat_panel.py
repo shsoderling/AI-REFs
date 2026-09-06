@@ -13,6 +13,7 @@ from PySide6.QtCore import Signal, Slot, Qt, QTimer
 
 from ...models.citation import CitationCandidate
 from ...models.project import ProjectSettings
+from ...services.model_catalog import resolve_model_id
 from ...services.orcid_client import fetch_orcid_name
 from .chat_worker import ChatSearchWorker
 
@@ -406,7 +407,7 @@ class ChatPanel(QFrame):
             messages=list(self._conversation),
             claim_text=self._claim_text,
             anthropic_api_key=self._settings.anthropic_api_key,
-            model=self._settings.claude_model,
+            model=resolve_model_id(self._settings.claude_model),
             ncbi_email=self._settings.ncbi_email or "",
             ncbi_api_key=self._settings.ncbi_api_key or "",
             search_biorxiv=self._settings.search_biorxiv,

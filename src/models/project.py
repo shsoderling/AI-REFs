@@ -128,7 +128,11 @@ class ProjectSettings(BaseModel):
 
     # Anthropic / Claude
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API key for Claude-powered citation search")
-    claude_model: str = Field(default="claude-haiku-4-5-20251001", description="Claude model for citation agent")
+    claude_model: str = Field(
+        default="newest",
+        description="Claude model id for the citation agent; 'newest' means the most recently "
+                    "released model on the Input tab's list (see services.model_catalog)",
+    )
 
     # bioRxiv
     search_biorxiv: bool = Field(default=True, description="Also search bioRxiv preprints")
