@@ -73,10 +73,11 @@ class CitationCandidate(BaseModel):
     retraction_notice: str = Field(default="")
     has_erratum: bool = Field(default=False)
 
-    # Scoring (populated by Ranker)
-    relevance_score: float = Field(default=0.0)
-    recency_score: float = Field(default=0.0)
-    journal_score: float = Field(default=0.0)
+    # Full text / preprint provenance
+    is_open_access: bool = Field(default=False, description="Open-access full text available in PMC")
+    published_doi: str = Field(default="", description="DOI of the journal version of a preprint, if known")
+
+    # Scoring (user library matches and review-tab annotations)
     composite_score: float = Field(default=0.0)
     score_rationale: str = Field(default="")
     matching_keywords: list[str] = Field(default_factory=list)

@@ -145,3 +145,16 @@ def test_refresh_failure_keeps_the_list(tab, monkeypatch):
     tab.wait_for_model_refresh(timeout_ms=5000)
     assert tab.model_combo.count() == 3
     assert "could not" in tab.model_status_label.text().lower()
+
+
+def test_new_pipeline_settings_round_trip_through_the_tab(tab):
+    settings = ProjectSettings(parallel_searches=6, verify_citations=False, use_full_text=False,
+                               prefer_reviews=True, recency_bias=False)
+    tab.set_settings(settings)
+    assert tab.parallel_spin.value() == 6
+    assert not tab.verify_check.isChecked() and not tab.fulltext_check.isChecked()
+
+    back = tab.get_settings()
+    assert back.parallel_searches == 6
+    assert back.verify_citations is False and back.use_full_text is False
+    assert back.prefer_reviews is True and back.recency_bias is False

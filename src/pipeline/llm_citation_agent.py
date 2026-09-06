@@ -54,8 +54,7 @@ if it is not perfect.
 For a (REF) marker, select exactly 1 best reference. For a (REFS) marker, \
 select up to {max_refs} references.
 
-Prefer peer-reviewed primary research over reviews. Prefer recent publications \
-when relevance is equal.
+{preferences}
 
 If the tool `search_user_library` is available, call it in round 1 before
 external searches and strongly prefer those results when they support the claim.
@@ -207,6 +206,21 @@ EUROPEPMC_TOOL = {
 }
 
 
+def build_preference_text(prefer_reviews: bool, recency_bias: bool) -> str:
+    """Prompt sentences for the Input tab's review/recency preferences."""
+    if prefer_reviews:
+        reviews = ("Prefer an authoritative review when one directly covers the claim; "
+                   "otherwise choose peer-reviewed primary research.")
+    else:
+        reviews = "Prefer peer-reviewed primary research over reviews."
+    if recency_bias:
+        recency = "Prefer recent publications when relevance is equal."
+    else:
+        recency = ("Do not weigh publication date; choose the most relevant, "
+                   "well-established source.")
+    return f"{reviews} {recency}"
+
+
 class LLMCitationAgent:
     """Claude-powered citation finder using tool-use."""
 
@@ -226,6 +240,8 @@ class LLMCitationAgent:
         orcid_id: Optional[str] = None,
         log_callback: Optional[Callable[[str, str], None]] = None,
         client=None,
+        prefer_reviews: bool = False,
+        recency_bias: bool = True,
     ):
         if client is None:
             # Allow corporate TLS-inspecting proxies (e.g. Zscaler) to work by
@@ -252,6 +268,7 @@ class LLMCitationAgent:
         self.max_library_results = max(3, min(max_library_results, 50))
         self.max_refs = max_refs
         self.orcid_id = orcid_id
+        self.preferences = build_preference_text(prefer_reviews, recency_bias)
         self._log = log_callback or (lambda *a: None)
 
         # Build tool list
@@ -281,7 +298,8 @@ class LLMCitationAgent:
         else:
             num_refs = 1
 
-        system = SYSTEM_PROMPT.format(max_refs=num_refs, max_rounds=MAX_AGENT_ROUNDS)
+        system = SYSTEM_PROMPT.format(max_refs=num_refs, max_rounds=MAX_AGENT_ROUNDS,
+                                      preferences=self.preferences)
 
         domain_info = ""
         if domain_context:

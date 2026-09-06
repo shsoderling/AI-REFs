@@ -281,11 +281,10 @@ class BioRxivClient:
         server = preprint.get("server", self.server)
         journal = "bioRxiv" if "biorxiv" in server.lower() else "medRxiv"
 
-        # Published DOI (if paper was published in a journal)
-        published_doi = preprint.get("published_doi", "")
-        if published_doi and published_doi != "NA":
-            # This preprint has been published — note it in the abstract
-            abstract = f"[Published: {published_doi}] {abstract}"
+        # DOI of the journal version, when the preprint has been published
+        published_doi = preprint.get("published_doi", "") or ""
+        if published_doi == "NA":
+            published_doi = ""
 
         return CitationCandidate(
             pmid="",  # Preprints don't have PMIDs
@@ -304,6 +303,7 @@ class BioRxivClient:
             publication_types=["Preprint"],
             is_retracted=False,
             is_review=False,
+            published_doi=published_doi,
         )
 
     def _parse_author_string(self, author_str: str) -> list[Author]:

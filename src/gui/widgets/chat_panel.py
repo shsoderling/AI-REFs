@@ -417,6 +417,8 @@ class ChatPanel(QFrame):
             max_library_results=self._settings.max_library_results,
             prior_candidates=self._all_candidates,
             parent=self,
+            prefer_reviews=self._settings.prefer_reviews,
+            recency_bias=self._settings.recency_bias,
         )
         self._worker.status_update.connect(self._on_status)
         self._worker.assistant_message.connect(self._on_assistant_reply)

@@ -452,6 +452,25 @@ class InputsTab(QWidget):
         self.europepmc_check.setChecked(True)
         form.addRow("Europe PMC:", self.europepmc_check)
 
+        # Full text
+        self.fulltext_check = QCheckBox("Read open-access full text (Europe PMC) when needed")
+        self.fulltext_check.setChecked(True)
+        form.addRow("Full text:", self.fulltext_check)
+
+        # Independent verification
+        self.verify_check = QCheckBox("Verify each selected paper against its claim")
+        self.verify_check.setChecked(True)
+        form.addRow("Verification:", self.verify_check)
+
+        # Parallel sentence searches
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setValue(3)
+        self.parallel_spin.setToolTip(
+            "Sentences searched at the same time. More than 1 needs an NCBI API key "
+            "(the pipeline falls back to 1 without one).")
+        form.addRow("Parallel searches:", self.parallel_spin)
+
         # Existing-reference enrichment (insert mode)
         self.enrich_check = QCheckBox(
             "Look up existing refs on PubMed to avoid duplicates (insert mode)")
@@ -638,6 +657,9 @@ class InputsTab(QWidget):
             search_biorxiv=self.biorxiv_check.isChecked(),
             search_europepmc=self.europepmc_check.isChecked(),
             enrich_existing_refs=self.enrich_check.isChecked(),
+            use_full_text=self.fulltext_check.isChecked(),
+            verify_citations=self.verify_check.isChecked(),
+            parallel_searches=self.parallel_spin.value(),
         )
 
     def set_settings(self, settings: ProjectSettings):
@@ -668,6 +690,9 @@ class InputsTab(QWidget):
         self.biorxiv_check.setChecked(settings.search_biorxiv)
         self.europepmc_check.setChecked(settings.search_europepmc)
         self.enrich_check.setChecked(settings.enrich_existing_refs)
+        self.fulltext_check.setChecked(settings.use_full_text)
+        self.verify_check.setChecked(settings.verify_citations)
+        self.parallel_spin.setValue(settings.parallel_searches)
 
     # ── Claude model list ─────────────────────────────────────────────
 
@@ -881,6 +906,12 @@ class InputsTab(QWidget):
         style_idx = s.value("citation_style_index", None)
         if style_idx is not None:
             self.style_combo.setCurrentIndex(int(style_idx))
+        parallel = s.value("parallel_searches", None)
+        if parallel is not None:
+            try:
+                self.parallel_spin.setValue(int(parallel))
+            except (TypeError, ValueError):
+                pass
         logger.info("Loaded saved settings")
 
     def _save_settings(self):
@@ -893,6 +924,7 @@ class InputsTab(QWidget):
         s.setValue("claude_model_id", self.current_model_id())
         s.remove("claude_model_index")
         s.setValue("citation_style_index", self.style_combo.currentIndex())
+        s.setValue("parallel_searches", self.parallel_spin.value())
         s.sync()
 
     @property

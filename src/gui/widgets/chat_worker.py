@@ -14,6 +14,7 @@ from ...services.biorxiv_client import BioRxivClient
 from ...services.europepmc_client import EuropePMCClient
 from ...services.ref_library import ReferenceLibrary
 from ...services.tool_executor import ToolExecutor, extract_json
+from ...pipeline.llm_citation_agent import build_preference_text
 from ...storage.cache_db import CacheDB
 
 logger = logging.getLogger(__name__)
@@ -251,9 +252,12 @@ class ChatSearchWorker(QThread):
         prior_candidates: Optional[dict] = None,
         parent=None,
         client=None,
+        prefer_reviews: bool = False,
+        recency_bias: bool = True,
     ):
         super().__init__(parent)
         self._client = client  # injected in tests; built in run() otherwise
+        self.preferences = build_preference_text(prefer_reviews, recency_bias)
         self.messages = messages
         self.claim_text = claim_text
         self.api_key = anthropic_api_key
@@ -316,6 +320,7 @@ class ChatSearchWorker(QThread):
                 claim_text=self.claim_text,
                 max_rounds=MAX_CHAT_ROUNDS,
             )
+            system += f"\n{self.preferences}"
             if user_library:
                 if self.prefer_user_library:
                     system += (

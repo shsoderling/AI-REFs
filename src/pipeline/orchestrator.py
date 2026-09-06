@@ -278,6 +278,8 @@ class PipelineOrchestrator:
             max_refs=settings.max_refs_for_refs,
             orcid_id=settings.orcid_id,
             log_callback=self._log,
+            prefer_reviews=settings.prefer_reviews,
+            recency_bias=settings.recency_bias,
         )
 
         try:

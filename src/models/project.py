@@ -109,14 +109,24 @@ class ProjectSettings(BaseModel):
     """User-configurable settings for the processing pipeline."""
     # Citation preferences
     citation_style: CitationStyle = Field(default=CitationStyle.NIH_GRANT)
-    custom_csl_path: Optional[str] = Field(default=None, description="Path to custom CSL file")
     max_refs_for_refs: int = Field(default=3, ge=2, le=10, description="Max references for (REFS) markers")
 
     # Search preferences
     recency_bias: bool = Field(default=True, description="Prefer more recent publications")
-    recency_weight: float = Field(default=0.2, ge=0.0, le=1.0, description="Weight for recency in scoring")
     prefer_reviews: bool = Field(default=False, description="Prefer review articles over primary research")
     domain_inference: bool = Field(default=True, description="Auto-detect research domain from document")
+    parallel_searches: int = Field(
+        default=3, ge=1, le=8,
+        description="Sentences searched concurrently (clamped to 1 without an NCBI API key)",
+    )
+    verify_citations: bool = Field(
+        default=True,
+        description="Independently verify each selected paper against its claim and quote the evidence",
+    )
+    use_full_text: bool = Field(
+        default=True,
+        description="Read open-access full text from Europe PMC when an abstract is not enough",
+    )
 
     # ORCID
     orcid_id: Optional[str] = Field(default=None, description="User's ORCID for self-cite detection")
@@ -124,7 +134,6 @@ class ProjectSettings(BaseModel):
     # PubMed
     ncbi_api_key: Optional[str] = Field(default=None, description="NCBI API key for higher rate limits")
     ncbi_email: str = Field(default="", description="Email for NCBI E-utilities (required)")
-    max_candidates_per_sentence: int = Field(default=15, ge=5, le=50)
 
     # Anthropic / Claude
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API key for Claude-powered citation search")
@@ -186,11 +195,6 @@ class ProjectSettings(BaseModel):
         default=10, ge=3, le=50,
         description="Maximum user-library matches to return per query",
     )
-
-    # Output
-    include_abstracts_in_report: bool = Field(default=True)
-    generate_ris: bool = Field(default=False)
-    generate_bibtex: bool = Field(default=False)
 
 
 PROJECT_SCHEMA_VERSION = 2
