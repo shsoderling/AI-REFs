@@ -250,8 +250,10 @@ class ChatSearchWorker(QThread):
         max_library_results: int = 10,
         prior_candidates: Optional[dict] = None,
         parent=None,
+        client=None,
     ):
         super().__init__(parent)
+        self._client = client  # injected in tests; built in run() otherwise
         self.messages = messages
         self.claim_text = claim_text
         self.api_key = anthropic_api_key
@@ -298,7 +300,7 @@ class ChatSearchWorker(QThread):
                 status_callback=lambda msg: self.status_update.emit(msg),
             )
 
-            client = anthropic.Anthropic(api_key=self.api_key)
+            client = self._client or anthropic.Anthropic(api_key=self.api_key)
 
             tools = list(TOOLS)
             if user_library:

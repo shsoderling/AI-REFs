@@ -31,25 +31,7 @@ class TestParseEntryFields:
         assert f["volume"] == ""
 
 
-class _FakePubMed:
-    """Stand-in for PubMedClient — no network."""
-    def __init__(self, by_citation=None, by_search=None, articles=None):
-        self.by_citation = by_citation or {}
-        self.by_search = by_search or {}
-        self.articles = articles or {}
-        self.cache = CacheDB(":memory:")
-
-    def citation_match(self, journal, year, volume, first_page, author_last):
-        return self.by_citation.get((journal, year, volume, first_page, author_last))
-
-    def search(self, query, max_results=3):
-        return self.by_search.get(query, ([], 0))
-
-    def fetch_article(self, pmid):
-        return self.articles.get(pmid)
-
-    def fetch_articles(self, pmids):
-        return [self.articles[p] for p in pmids if p in self.articles]
+from tests.fakes import FakePubMed as _FakePubMed  # noqa: E402
 
 
 def _entry(num, body):

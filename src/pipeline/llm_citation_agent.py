@@ -225,19 +225,22 @@ class LLMCitationAgent:
         max_refs: int = 3,
         orcid_id: Optional[str] = None,
         log_callback: Optional[Callable[[str, str], None]] = None,
+        client=None,
     ):
-        # Allow corporate TLS-inspecting proxies (e.g. Zscaler) to work by
-        # honoring SSL_CERT_FILE / REQUESTS_CA_BUNDLE if set, otherwise fall
-        # back to certifi's bundled CA list. Never disable verification.
-        ca_bundle = (
-            os.environ.get("SSL_CERT_FILE")
-            or os.environ.get("REQUESTS_CA_BUNDLE")
-            or certifi.where()
-        )
-        self.client = anthropic.Anthropic(
-            api_key=anthropic_api_key,
-            http_client=httpx.Client(verify=ca_bundle),
-        )
+        if client is None:
+            # Allow corporate TLS-inspecting proxies (e.g. Zscaler) to work by
+            # honoring SSL_CERT_FILE / REQUESTS_CA_BUNDLE if set, otherwise fall
+            # back to certifi's bundled CA list. Never disable verification.
+            ca_bundle = (
+                os.environ.get("SSL_CERT_FILE")
+                or os.environ.get("REQUESTS_CA_BUNDLE")
+                or certifi.where()
+            )
+            client = anthropic.Anthropic(
+                api_key=anthropic_api_key,
+                http_client=httpx.Client(verify=ca_bundle),
+            )
+        self.client = client
         self.model = model
         self.pubmed = pubmed_client
         self.biorxiv = biorxiv_client
