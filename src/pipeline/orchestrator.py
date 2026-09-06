@@ -24,7 +24,8 @@ from .llm_citation_agent import LLMCitationAgent
 from .global_qa import GlobalQA
 from .existing_citation_parser import ExistingCitationParser
 from .renumbering import CitationKeyIndex
-from .claim_context import ClaimContext, build_claim_context, sub_claims_for
+from .claim_context import ClaimContext, bare_context, build_claim_context, sub_claims_for
+from .verification import CitationVerifier, deterministic_checks
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +91,8 @@ def _infer_domains_with_llm(
         logger.warning(f"LLM domain inference failed: {exc}")
         return []
 
-TOTAL_STAGES_FRESH = 4
-TOTAL_STAGES_INSERT = 5
+TOTAL_STAGES_FRESH = 5
+TOTAL_STAGES_INSERT = 6
 
 
 class PipelineOrchestrator:
@@ -321,10 +322,20 @@ class PipelineOrchestrator:
             if self._cancelled:
                 return self.project
 
-            # ── Stage 4: Global QA ────────────────────────────────────────
+            # ── Stage 4: Verification ─────────────────────────────────────
+            self.project.current_stage = PipelineStage.VERIFICATION
+            self._emit("info", f"Stage {stage_offset + 4}: Verifying citations...")
+            self._progress("Verify Citations", stage_offset + 3, total_stages)
+            self._verify_selections(marked, agent, pubmed, biorxiv, europepmc)
+
+            self._check_pause()
+            if self._cancelled:
+                return self.project
+
+            # ── Stage 5: Global QA ────────────────────────────────────────
             self.project.current_stage = PipelineStage.GLOBAL_QA
-            self._emit("info", f"Stage {stage_offset + 4}: Running global QA...")
-            self._progress("Global QA", stage_offset + 3, total_stages)
+            self._emit("info", f"Stage {stage_offset + 5}: Running global QA...")
+            self._progress("Global QA", stage_offset + 4, total_stages)
 
             qa = GlobalQA()
             self.project.evidence_map = qa.run(sentences, self.project.evidence_map)
@@ -345,6 +356,39 @@ class PipelineOrchestrator:
                    f"Pipeline complete: {resolved}/{len(marked)} sentences have citations")
 
         return self.project
+
+    def _verify_selections(self, marked, agent: LLMCitationAgent, pubmed, biorxiv, europepmc):
+        """Deterministic checks for every selection, then the LLM verifier
+        when enabled. Each sentence's verdicts are aligned with its
+        selected references."""
+        settings = self.project.settings
+        verifier = None
+        if settings.verify_citations and settings.anthropic_api_key:
+            verifier = CitationVerifier(
+                agent.caller,
+                europepmc if settings.search_europepmc else None,
+                use_full_text=settings.use_full_text,
+                log=self._log,
+            )
+        else:
+            self._emit("info", "  Independent verification is off; running retraction/preprint checks only")
+
+        checked = 0
+        for sent in marked:
+            self._check_pause()
+            if self._cancelled:
+                return
+            evidence = self.project.evidence_map.get(sent.id)
+            if evidence is None or not evidence.selected:
+                continue
+            deterministic_checks(evidence, biorxiv=biorxiv, europepmc=europepmc,
+                                 pubmed=pubmed, log=self._log)
+            if verifier is not None:
+                contexts = self._contexts.get(sent.id) or [bare_context(sent)]
+                verifier.verify_evidence(contexts, evidence)
+                checked += 1
+        if verifier is not None:
+            self._emit("info", f"  Verified selections for {checked} sentence(s)")
 
     def _find_citations_per_ref(
         self,
@@ -373,7 +417,7 @@ class PipelineOrchestrator:
         parts = sub_claims_for(sentence)
         num_markers = sentence.marker_count
         marker_types = sentence.effective_marker_types()
-        self._contexts[sentence.id] = []
+        self._contexts[sentence.id] = []   # one context per *selected* citation
 
         self._emit("info", f"  Multi-marker: splitting into {num_markers} independent searches")
 
@@ -418,7 +462,6 @@ class PipelineOrchestrator:
             # to earlier markers so the agent picks a different one.
             sub_text, trailing = parts[marker_idx] if marker_idx < len(parts) else ("", "")
             ctx = base_context.with_marker(sub_text, trailing, sorted(assigned_identifiers))
-            self._contexts[sentence.id].append(ctx)
 
             # A temporary single-marker sentence for the agent
             temp_sentence = SR(
@@ -473,6 +516,7 @@ class PipelineOrchestrator:
 
             if selected_citation:
                 combined_evidence.selected.append(selected_citation)
+                self._contexts[sentence.id].append(ctx)
                 assigned_keys.add(key_index.key_for_candidate(selected_citation))
                 if selected_citation.pmid:
                     assigned_identifiers.add(selected_citation.pmid)

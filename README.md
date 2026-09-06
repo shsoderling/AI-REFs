@@ -45,12 +45,18 @@ REM Output: dist\AI REFs\AI REFs.exe
 3. **Run Tab**: Click "Start Pipeline" to process the document. The pipeline will:
    - Parse the document and find all `(REF)` / `(REFS)` markers
    - Extract keywords from each claim sentence
-   - Search your user library + PubMed/Europe PMC/bioRxiv for candidate references
-   - Rank and verify candidates
+   - Search your user library + PubMed/Europe PMC/bioRxiv for candidate
+     references, reading abstracts and, for open-access papers, the
+     relevant full-text passages from Europe PMC
+   - Independently verify each selected paper against its claim: a
+     separate check quotes the supporting passage, flags retracted papers
+     and swaps preprints for their published journal version
 
 4. **Review Tab**: Review each citation assignment:
-   - Green = high confidence, Yellow = medium, Red = low
-   - Click a sentence to see candidate details, abstracts, and rationale
+   - Green = verified (quoted support found), Yellow = partial support,
+     Red = not supported, retracted, or the quote was not in the paper
+   - Click a sentence to see candidate details, abstracts, the verifier's
+     verdict and quote for each reference, and the rationale
    - Every reference, whether the sentence has one (REF) or several (REFS),
      gets its own Keep / View It / Replace buttons (Remove appears when a
      sentence has several); Replace opens the search chat for that slot

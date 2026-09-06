@@ -120,3 +120,25 @@ def test_no_candidates_shows_a_placeholder_to_replace(tab):
     assert not w.view_btn.isEnabled()
     assert w.replace_btn.isEnabled() and w.remove_btn.isHidden()
     assert tab.ref_detail.isHidden()
+
+
+def test_verdict_line_and_badge_status_are_shown(tab):
+    from src.models.evidence import CitationVerdict, Verdict, VerificationStatus
+    ev = tab._project.evidence_map["S001"]
+    ev.verdicts = [CitationVerdict(key="1001", verdict=Verdict.SUPPORTS, quote="Dendritic spines remodel",
+                                   quote_found=True, source="abstract", reason="direct")]
+    ev.verification_status = VerificationStatus.VERIFIED
+    tab.sentence_list.setCurrentRow(0)
+    w = ref_widgets(tab)[0]
+    assert not w.verdict_label.isHidden()
+    assert w.verdict_label.text().startswith("Verification: supports — “Dendritic spines remodel”")
+    assert "(abstract)" in w.verdict_label.text()
+    assert "· verified" in tab.confidence_label.text()
+
+    # Keeping the reference keeps its verdict aligned with the selection
+    w.accept_btn.click()
+    assert [v.verdict for v in ev.verdicts] == [Verdict.SUPPORTS]
+
+    # A sentence without verdicts shows no verification line
+    tab.sentence_list.setCurrentRow(1)
+    assert all(x.verdict_label.isHidden() for x in ref_widgets(tab))

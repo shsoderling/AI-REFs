@@ -16,7 +16,7 @@ from ..models.project import ProjectState
 from ..models.sentence import SentenceRecord, MarkerType
 from ..pipeline.claim_context import build_claim_context
 from ..models.evidence import (
-    EvidenceRecord, ConfidenceLevel, ReviewDecision, VerificationStatus
+    EvidenceRecord, ConfidenceLevel, ReviewDecision, VerificationStatus, CitationVerdict, Verdict,
 )
 from ..models.citation import (
     CitationCandidate, is_valid_citation, make_placeholder_citation,
@@ -47,10 +47,12 @@ class SingleRefWidget(QFrame):
     ABSTRACT_EXCERPT_CHARS = 220
 
     def __init__(self, index: int, citation: CitationCandidate, accepted: bool = False,
-                 parent=None, allow_remove: bool = True):
+                 parent=None, allow_remove: bool = True,
+                 verdict: Optional[CitationVerdict] = None):
         super().__init__(parent)
         self.index = index
         self.citation = citation
+        self.verdict = verdict
         self._accepted = accepted
         self._removed = False
         self._allow_remove = allow_remove
@@ -94,6 +96,12 @@ class SingleRefWidget(QFrame):
         self.abstract_label.setStyleSheet("font-size: 11px; color: #666; font-style: italic;")
         layout.addWidget(self.abstract_label)
         self._set_abstract(self.citation.abstract)
+
+        # Row 3c: Independent verification verdict
+        self.verdict_label = QLabel("")
+        self.verdict_label.setWordWrap(True)
+        layout.addWidget(self.verdict_label)
+        self._set_verdict(self.verdict)
 
         # Row 4: Action buttons
         btn_layout = QHBoxLayout()
@@ -161,6 +169,35 @@ class SingleRefWidget(QFrame):
         # Apply initial state
         if self._accepted:
             self._mark_accepted()
+
+    _VERDICT_COLORS = {
+        Verdict.SUPPORTS: COLOR_HIGH,
+        Verdict.PARTIAL: COLOR_MEDIUM,
+        Verdict.NOT_SUPPORTED: COLOR_LOW,
+        Verdict.UNVERIFIED: COLOR_UNRESOLVED,
+    }
+
+    def _set_verdict(self, verdict: Optional[CitationVerdict]):
+        self.verdict = verdict
+        if verdict is None:
+            self.verdict_label.setText("")
+            self.verdict_label.setVisible(False)
+            return
+        label = verdict.verdict.value.replace("_", " ")
+        text = f"Verification: {label}"
+        if verdict.quote:
+            quote = verdict.quote[:140].rstrip() + ("…" if len(verdict.quote) > 140 else "")
+            text += f" — “{quote}”"
+            if not verdict.quote_found:
+                text += " (quote not found in the paper)"
+        if verdict.source:
+            text += f" ({verdict.source.replace('_', ' ')})"
+        elif verdict.reason:
+            text += f" — {verdict.reason}"
+        color = self._VERDICT_COLORS.get(verdict.verdict, COLOR_UNRESOLVED)
+        self.verdict_label.setText(text)
+        self.verdict_label.setStyleSheet(f"font-size: 11px; color: {color}; font-weight: bold;")
+        self.verdict_label.setVisible(True)
 
     def _set_abstract(self, abstract: str):
         text = (abstract or "").strip()
@@ -251,6 +288,7 @@ class SingleRefWidget(QFrame):
         self.citation = new_citation
         self._accepted = True
         self._set_abstract(new_citation.abstract)
+        self._set_verdict(None)          # a user-chosen paper has not been verified
         self._update_frame_style()
         self.accept_btn.setEnabled(False)
         self.accept_btn.setText("✓ Replaced")
@@ -948,8 +986,10 @@ class ReviewTab(QWidget):
             if i < len(evidence.selected):
                 citation = evidence.selected[i]
                 accepted = already_resolved and is_valid_citation(citation)
+                verdict = evidence.verdicts[i] if i < len(evidence.verdicts) else None
                 widget = SingleRefWidget(i, citation, accepted=accepted,
-                                         parent=self.per_ref_container, allow_remove=several)
+                                         parent=self.per_ref_container, allow_remove=several,
+                                         verdict=verdict)
             else:
                 # Missing citation for this slot — show a placeholder widget.
                 # The placeholder lives only in the widget; evidence.selected
@@ -1026,7 +1066,10 @@ class ReviewTab(QWidget):
                 ConfidenceLevel.UNRESOLVED: COLOR_UNRESOLVED,
             }
             color = color_map.get(level, COLOR_UNRESOLVED)
-            self.confidence_label.setText(f"{level.value} ({score:.0f}/100)")
+            badge = f"{level.value} ({score:.0f}/100)"
+            if evidence.verification_status != VerificationStatus.NOT_CHECKED:
+                badge += f" · {evidence.verification_status.value.replace('_', ' ')}"
+            self.confidence_label.setText(badge)
             self.confidence_label.setStyleSheet(
                 f"color: white; background-color: {color}; font-size: 14px; "
                 f"font-weight: bold; padding: 4px 12px; border-radius: 4px;"
@@ -1270,14 +1313,20 @@ class ReviewTab(QWidget):
         sentence = self._get_current_sentence()
         positional = bool(sentence and sentence.marker_count > 1)
         rebuilt = []
+        rebuilt_verdicts = []
         for w in self._per_ref_widgets:
             if not isinstance(w, SingleRefWidget):
                 continue
             if not w._removed and is_valid_citation(w.citation):
                 rebuilt.append(w.citation)
+                rebuilt_verdicts.append(w.verdict or CitationVerdict(
+                    key=w.citation.pmid or w.citation.doi or w.citation.title,
+                    reason="chosen by the user"))
             elif positional:
                 rebuilt.append(make_placeholder_citation())
+                rebuilt_verdicts.append(CitationVerdict(reason="no citation"))
         evidence.selected = rebuilt
+        evidence.verdicts = rebuilt_verdicts if evidence.verdicts else []
 
         # All refs have a decision — mark sentence as resolved
         has_removal = any(

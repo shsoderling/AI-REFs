@@ -105,6 +105,7 @@ class RunTab(QWidget):
         "Parse Document",
         "Locate Markers",
         "AI Citation Search",
+        "Verify Citations",
         "Global QA",
     ]
     STAGE_NAMES_INSERT = [
@@ -112,6 +113,7 @@ class RunTab(QWidget):
         "Parse Document",
         "Locate Markers",
         "AI Citation Search",
+        "Verify Citations",
         "Global QA",
     ]
 

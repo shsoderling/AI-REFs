@@ -43,6 +43,24 @@ class Warning(BaseModel):
     severity: str = Field(default="low", description="low, medium, or high")
 
 
+class Verdict(str, Enum):
+    """The independent verifier's view of one selected paper."""
+    SUPPORTS = "supports"
+    PARTIAL = "partial"
+    NOT_SUPPORTED = "not_supported"
+    UNVERIFIED = "unverified"
+
+
+class CitationVerdict(BaseModel):
+    """Verdict for one selected paper, aligned by index with ``EvidenceRecord.selected``."""
+    key: str = Field(default="", description="pmid, doi or title of the paper")
+    verdict: Verdict = Field(default=Verdict.UNVERIFIED)
+    quote: str = Field(default="", description="Verbatim supporting passage")
+    quote_found: bool = Field(default=False, description="The quote occurs in the source text")
+    source: str = Field(default="", description="abstract, full_text, or empty")
+    reason: str = Field(default="")
+
+
 class EvidenceRecord(BaseModel):
     """Links a sentence to its candidate and selected citations."""
     sentence_id: str = Field(default="")
@@ -63,6 +81,8 @@ class EvidenceRecord(BaseModel):
     verification_status: VerificationStatus = Field(default=VerificationStatus.NOT_CHECKED)
     abstract_snippets: list[str] = Field(default_factory=list)
     warnings: list[Warning] = Field(default_factory=list)
+    verdicts: list[CitationVerdict] = Field(default_factory=list,
+                                            description="One per selected paper, same order")
 
     # Review
     review_decision: ReviewDecision = Field(default=ReviewDecision.PENDING)

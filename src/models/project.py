@@ -98,6 +98,7 @@ class PipelineStage(str, Enum):
     PARSING = "parsing"
     MARKER_LOCATION = "marker_location"
     AI_CITATION_SEARCH = "ai_citation_search"
+    VERIFICATION = "verification"
     GLOBAL_QA = "global_qa"
     EXISTING_CITATION_ANALYSIS = "existing_citation_analysis"
     COMPLETE = "complete"
