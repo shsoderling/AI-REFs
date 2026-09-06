@@ -102,7 +102,11 @@ class FakeAnthropic:
         self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs):
-        self.calls.append(kwargs)
+        # Snapshot the message list: the loops append to the same list object
+        # after the call, and tests inspect what each round actually saw.
+        recorded = dict(kwargs)
+        recorded["messages"] = list(kwargs.get("messages") or [])
+        self.calls.append(recorded)
         if not self.script:
             raise AssertionError(
                 f"FakeAnthropic script exhausted after {len(self.calls)} call(s)")

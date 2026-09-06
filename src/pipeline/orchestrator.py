@@ -65,7 +65,8 @@ def _infer_domains_with_llm(
         excerpt += " ..."
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        from ..services.claude_client import make_client
+        client = make_client(api_key)
         response = client.messages.create(
             model=model,
             max_tokens=150,

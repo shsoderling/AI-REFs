@@ -1,6 +1,5 @@
 """Background worker for Claude-powered citation search chat."""
 
-import json
 import logging
 from typing import Optional
 
@@ -13,7 +12,9 @@ from ...services.pubmed_client import PubMedClient
 from ...services.biorxiv_client import BioRxivClient
 from ...services.europepmc_client import EuropePMCClient
 from ...services.ref_library import ReferenceLibrary
-from ...services.tool_executor import ToolExecutor, extract_json
+from ...services.claude_client import ClaudeCaller, make_client
+from ...services.search_tools import SELECT_CITATIONS, build_tool_list, find_tool_use
+from ...services.tool_executor import ToolExecutor
 from ...pipeline.llm_citation_agent import build_preference_text
 from ...storage.cache_db import CacheDB
 
@@ -44,184 +45,14 @@ PMID: 23456789 | DOI: 10.xxxx/zzzz
 After presenting options, ask the user which one(s) they want to use. \
 The user can say things like "use #2" or "use the Smith paper".
 
-When the user confirms a selection, respond with ONLY this JSON (no other text):
-{{"action": "select", "selections": [{{"pmid": "12345678", "doi": "", "title": ""}}]}}
+When the user confirms a selection, call the `select_citations` tool with the \
+chosen PMIDs/DOIs. Never call it before the user has confirmed.
 
 Be concise and helpful. Present at most 5 candidates per search.
 
 IMPORTANT: You have a maximum of {max_rounds} tool-call rounds per search. \
 Be efficient: do 1-2 searches, fetch the most promising results, and present them.
 """
-
-USER_LIBRARY_TOOL = {
-    "name": "search_user_library",
-    "description": (
-        "Search the user's local AI REFs reference library. Use this first when "
-        "available, then supplement with external searches."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum results to return (default 10)",
-                "default": 10,
-            },
-        },
-        "required": ["query"],
-    },
-}
-
-TOOLS = [
-    {
-        "name": "search_pubmed",
-        "description": (
-            "Search PubMed for articles matching a query. Returns a list of "
-            "PubMed IDs (PMIDs) and the total number of results. Use standard "
-            "PubMed query syntax: combine terms with AND/OR, use [MeSH] tags, "
-            "field tags like [ti] (title), [tiab] (title/abstract), [au] (author). "
-            "Example: 'Rac1 AND dendritic spine AND hippocampus'"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "PubMed search query",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of PMIDs to return (default 20)",
-                    "default": 20,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "fetch_articles",
-        "description": (
-            "Fetch full metadata for one or more PubMed articles by their PMIDs. "
-            "Returns title, authors, year, journal, abstract, DOI, MeSH terms "
-            "for each article. Use this after search_pubmed to read abstracts "
-            "and evaluate relevance."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pmids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of PubMed IDs to fetch",
-                }
-            },
-            "required": ["pmids"],
-        },
-    },
-]
-
-BIORXIV_TOOL = {
-    "name": "search_biorxiv",
-    "description": (
-        "Search bioRxiv preprints by keywords. Returns matching preprints with "
-        "title, authors, year, abstract, and DOI. Use this to supplement PubMed "
-        "results with recent preprints that may not yet be indexed. "
-        "Note: bioRxiv keyword search is limited — it only scans recent preprints. "
-        "If you know the DOI, use fetch_biorxiv_preprint instead."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Search keywords",
-            },
-            "category": {
-                "type": "string",
-                "description": "Optional bioRxiv category (e.g. 'neuroscience', 'cell_biology')",
-                "default": "",
-            },
-        },
-        "required": ["keywords"],
-    },
-}
-
-BIORXIV_FETCH_TOOL = {
-    "name": "fetch_biorxiv_preprint",
-    "description": (
-        "Fetch full metadata for a specific bioRxiv or medRxiv preprint by its DOI. "
-        "Use this when you know the DOI of a preprint (e.g., '10.1101/2024.01.15.123456' "
-        "or newer format like '10.64898/2026.01.04.697581'). "
-        "Returns title, authors, year, abstract, and DOI."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "doi": {
-                "type": "string",
-                "description": "The DOI of the preprint (e.g., '10.1101/2024.01.15.123456')",
-            },
-        },
-        "required": ["doi"],
-    },
-}
-
-EUROPEPMC_SEARCH_TOOL = {
-    "name": "search_europepmc",
-    "description": (
-        "Search Europe PMC for articles and preprints. Europe PMC indexes PubMed, "
-        "PMC full-text articles, and preprints. Supports full-text keyword search "
-        "and returns full metadata (PMID, DOI, title, authors, abstract) in one call. "
-        "Use this to supplement PubMed results or to find articles not yet in PubMed. "
-        "Example: 'CRISPR base editing liver disease therapy'"
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query (free text or Europe PMC query syntax)",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results to return (default 20)",
-                "default": 20,
-            },
-        },
-        "required": ["query"],
-    },
-}
-
-EUROPEPMC_FETCH_TOOL = {
-    "name": "fetch_europepmc_article",
-    "description": (
-        "Fetch a single article from Europe PMC by DOI or PMID. "
-        "Use this when you have a specific identifier and need the full metadata. "
-        "Provide either a DOI (e.g., '10.1038/s41586-024-07487-w') or a PMID."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "doi": {
-                "type": "string",
-                "description": "Article DOI (optional if pmid is given)",
-                "default": "",
-            },
-            "pmid": {
-                "type": "string",
-                "description": "PubMed ID (optional if doi is given)",
-                "default": "",
-            },
-        },
-        "required": [],
-    },
-}
-
 
 class ChatSearchWorker(QThread):
     """Background worker for a single Claude chat turn with tool-use.
@@ -304,17 +135,16 @@ class ChatSearchWorker(QThread):
                 status_callback=lambda msg: self.status_update.emit(msg),
             )
 
-            client = self._client or anthropic.Anthropic(api_key=self.api_key)
+            client = self._client or make_client(self.api_key)
+            caller = ClaudeCaller(client, self.model)
 
-            tools = list(TOOLS)
-            if user_library:
-                tools.insert(0, USER_LIBRARY_TOOL)
-            if self.search_biorxiv and biorxiv:
-                tools.append(BIORXIV_TOOL)
-                tools.append(BIORXIV_FETCH_TOOL)
-            if self.search_europepmc and europepmc:
-                tools.append(EUROPEPMC_SEARCH_TOOL)
-                tools.append(EUROPEPMC_FETCH_TOOL)
+            tools = build_tool_list(
+                user_library=user_library is not None,
+                biorxiv=bool(self.search_biorxiv and biorxiv),
+                europepmc=bool(self.search_europepmc and europepmc),
+                fulltext=bool(self.search_europepmc and europepmc),
+                final_tool=SELECT_CITATIONS,
+            )
 
             system = CHAT_SYSTEM_PROMPT.format(
                 claim_text=self.claim_text,
@@ -340,13 +170,17 @@ class ChatSearchWorker(QThread):
                 if self._cancelled:
                     logger.info("ChatSearchWorker cancelled")
                     return
-                response = client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=system,
-                    tools=tools,
-                    messages=messages,
-                )
+                response = caller.create(system=system, messages=messages, tools=tools)
+
+                selection = find_tool_use(response, SELECT_CITATIONS["name"])
+                if selection is not None:
+                    if self._cancelled:
+                        return
+                    prose = "".join(getattr(b, "text", "") for b in response.content)
+                    if prose.strip():
+                        self.status_update.emit(prose.strip()[:80])
+                    self.selection_made.emit(self._resolve_selection(selection.input))
+                    return
 
                 if response.stop_reason == "tool_use":
                     tool_results = []
@@ -374,13 +208,7 @@ class ChatSearchWorker(QThread):
                     for block in response.content:
                         if hasattr(block, "text"):
                             text += block.text
-
-                    # Check if Claude returned a selection JSON
-                    selection = self._check_for_selection(text)
-                    if selection:
-                        self.selection_made.emit(selection)
-                    else:
-                        self.assistant_message.emit(text)
+                    self.assistant_message.emit(text)
 
                     # Emit candidates found during tool calls
                     if self.all_candidates:
@@ -422,26 +250,20 @@ class ChatSearchWorker(QThread):
                 except Exception:
                     pass
 
-    def _check_for_selection(self, text: str) -> Optional[list]:
-        """Check if Claude's response contains a selection JSON.
+    def _resolve_selection(self, data: dict) -> list:
+        """Map the select_citations input to fetched CitationCandidates.
 
-        Returns list of CitationCandidate if selection found, else None.
+        Unknown identifiers are dropped; an empty list tells the panel the
+        selection could not be matched.
         """
-        try:
-            data = extract_json(text)
-        except (ValueError, json.JSONDecodeError):
-            return None
-
-        if data.get("action") != "select":
-            return None
-
-        selections = data.get("selections", [])
         result = []
-        for sel in selections:
-            pmid = str(sel.get("pmid", "")).strip()
-            doi = str(sel.get("doi", "")).strip()
-            title = str(sel.get("title", "")).strip()
+        for sel in (data or {}).get("selections", []) or []:
+            if not isinstance(sel, dict):
+                continue
+            pmid = str(sel.get("pmid", "") or "").strip()
+            doi = str(sel.get("doi", "") or "").strip()
+            title = str(sel.get("title", "") or "").strip()
             key = pmid or doi or title
             if key and key in self.all_candidates:
                 result.append(self.all_candidates[key])
-        return result if result else None
+        return result
