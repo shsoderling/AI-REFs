@@ -59,7 +59,9 @@ REM Output: dist\AI REFs\AI REFs.exe
      verdict and quote for each reference, and the rationale
    - Every reference, whether the sentence has one (REF) or several (REFS),
      gets its own Keep / View It / Replace buttons (Remove appears when a
-     sentence has several); Replace opens the search chat for that slot
+     sentence has several); Replace opens the search chat for that slot,
+     and choosing several papers there makes the marker cite all of them,
+     even when it started as a single (REF)
    - Export when all sentences are resolved
 
 4. **Export**: Generates:

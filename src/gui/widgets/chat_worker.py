@@ -43,7 +43,9 @@ PMID: 23456789 | DOI: 10.xxxx/zzzz
 > Brief explanation of relevance
 
 After presenting options, ask the user which one(s) they want to use. \
-The user can say things like "use #2" or "use the Smith paper".
+The user can say things like "use #2", "use the Smith paper" or "use #1 and #3". \
+The user may choose several papers even for a single citation marker; pass every \
+chosen paper to select_citations in one call.
 
 When the user confirms a selection, call the `select_citations` tool with the \
 chosen PMIDs/DOIs. Never call it before the user has confirmed.

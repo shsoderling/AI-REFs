@@ -1410,28 +1410,46 @@ class ReviewTab(QWidget):
             evidence = EvidenceRecord(sentence_id=self._current_sentence_id)
             self._project.evidence_map[self._current_sentence_id] = evidence
 
-        # Check if this is a per-ref replacement (REFS mode)
+        # Per-reference replacement (the Replace button on one card)
         if self._chat_replace_index is not None and citations:
             index = self._chat_replace_index
-            article = citations[0]
-            article.composite_score = 100.0
-            article.score_rationale = "User-selected via chat"
+            for article in citations:
+                article.composite_score = 100.0
+                article.score_rationale = "User-selected via chat"
+            first, extra = citations[0], list(citations[1:])
 
-            # The widget holds the replacement; evidence.selected is rebuilt
+            # A single-marker sentence may cite several papers, even when
+            # the marker was (REF): the extra picks become new slots. A
+            # multi-marker sentence maps one paper to each marker, so the
+            # extras cannot go into this slot.
+            sentence = self._get_current_sentence()
+            positional = bool(sentence and sentence.marker_count > 1)
+            if extra and positional:
+                note = (
+                    f"This sentence has {sentence.marker_count} markers with one reference "
+                    f"each: \"{first.title[:50]}\" was placed at marker {index + 1}; "
+                    f"{len(extra)} other selection(s) were not placed. Use Replace on "
+                    f"another marker to add them."
+                )
+                self.warnings_label.setText(note)
+                logger.warning(f"{self._current_sentence_id}: {note}")
+                extra = []
+
+            # The widgets hold the replacement; evidence.selected is rebuilt
             # from widget decisions in _check_all_refs_reviewed.
-            evidence.candidates = [article] + evidence.candidates
+            evidence.candidates = citations + evidence.candidates
             logger.info(
                 f"Chat replaced ref [{index+1}] for {self._current_sentence_id}: "
-                f"{article.title[:60]}"
+                f"{first.title[:60]}" + (f" (+{len(extra)} more)" if extra else "")
             )
 
-            # Update the per-ref widget
             for w in self._per_ref_widgets:
                 if isinstance(w, SingleRefWidget) and w.index == index:
-                    w.mark_replaced(article)
+                    w.mark_replaced(first)
                     break
-
             self._per_ref_accepted[index] = True
+            if extra:
+                self._append_ref_widgets(extra)
             self._check_all_refs_reviewed()
         else:
             # Whole-sentence selection
@@ -1481,6 +1499,27 @@ class ReviewTab(QWidget):
 
         # Close chat panel
         self._close_chat_panel()
+
+    def _append_ref_widgets(self, citations: list):
+        """Add already-chosen papers as new reference slots after the last card.
+
+        Used when the user picks several papers for one marker: the slots
+        are marked replaced, so they count as decided.
+        """
+        ref_widgets = [w for w in self._per_ref_widgets if isinstance(w, SingleRefWidget)]
+        next_index = (max(w.index for w in ref_widgets) + 1) if ref_widgets else 0
+        position = (self.per_ref_layout.indexOf(ref_widgets[-1]) + 1) if ref_widgets else 0
+        for offset, citation in enumerate(citations):
+            widget = SingleRefWidget(next_index + offset, citation, accepted=False,
+                                     parent=self.per_ref_container, allow_remove=True)
+            widget.ref_accepted.connect(self._on_single_ref_accepted)
+            widget.ref_replace_requested.connect(self._on_single_ref_replace)
+            widget.ref_chat_requested.connect(self._on_single_ref_chat)
+            widget.ref_removed.connect(self._on_single_ref_removed)
+            widget.mark_replaced(citation)
+            self.per_ref_layout.insertWidget(position + offset, widget)
+            self._per_ref_widgets.append(widget)
+            self._per_ref_accepted[widget.index] = True
 
     def _close_chat_panel(self):
         """Hide the chat panel and restore splitter sizes."""

@@ -39,6 +39,7 @@ def tab(qapp):
         sentence("S001", MarkerType.REF, "Single claim (REF)."),
         sentence("S002", MarkerType.REFS, "Multi claim (REFS)."),
         sentence("S003", MarkerType.REF, "Nothing found (REF)."),
+        sentence("S004", MarkerType.REF, "Alpha (REF) and beta (REF).", count=2),
     ]
     project.evidence_map = {
         "S001": EvidenceRecord(sentence_id="S001", selected=[cite(1, abstract="Dendritic spines remodel.")],
@@ -47,6 +48,8 @@ def tab(qapp):
         "S002": EvidenceRecord(sentence_id="S002", selected=[cite(2), cite(3)],
                                confidence_level=ConfidenceLevel.MEDIUM, confidence_score=60),
         "S003": EvidenceRecord(sentence_id="S003", selected=[], confidence_level=ConfidenceLevel.UNRESOLVED),
+        "S004": EvidenceRecord(sentence_id="S004", selected=[cite(4), cite(5)],
+                               confidence_level=ConfidenceLevel.MEDIUM, confidence_score=60),
     }
     t = ReviewTab()
     t.load_project(project)
@@ -142,3 +145,40 @@ def test_verdict_line_and_badge_status_are_shown(tab):
     # A sentence without verdicts shows no verification line
     tab.sentence_list.setCurrentRow(1)
     assert all(x.verdict_label.isHidden() for x in ref_widgets(tab))
+
+
+def test_choosing_several_papers_in_chat_expands_a_single_ref_marker(tab):
+    tab.sentence_list.setCurrentRow(0)
+    tab._on_single_ref_chat(0)
+    tab._on_chat_citation_selected([cite(9), cite(8), cite(7)])
+
+    ev = tab._project.evidence_map["S001"]
+    assert [c.title for c in ev.selected] == ["Paper 9", "Paper 8", "Paper 7"]
+    assert ev.review_decision == ReviewDecision.MODIFIED
+    assert all(c.score_rationale == "User-selected via chat" for c in ev.selected)
+    assert tab.chat_panel.isHidden()
+
+    # Re-opening the sentence shows one card per paper, all decided
+    tab.sentence_list.setCurrentRow(1)
+    tab.sentence_list.setCurrentRow(0)
+    widgets = ref_widgets(tab)
+    assert [w.citation.title for w in widgets] == ["Paper 9", "Paper 8", "Paper 7"]
+    assert all(w._accepted for w in widgets)
+    assert len(accept_all_buttons(tab)) == 1
+
+
+def test_several_papers_on_a_multi_marker_sentence_fill_only_that_slot(tab):
+    tab.sentence_list.setCurrentRow(3)
+    tab._on_single_ref_chat(1)
+    tab._on_chat_citation_selected([cite(9), cite(8)])
+
+    ev = tab._project.evidence_map["S004"]
+    assert ev.review_decision == ReviewDecision.PENDING      # marker 1 still undecided
+    assert "2 markers with one reference each" in tab.warnings_label.text()
+    assert "1 other selection(s) were not placed" in tab.warnings_label.text()
+    widgets = ref_widgets(tab)
+    assert [w.citation.title for w in widgets] == ["Paper 4", "Paper 9"]
+
+    widgets[0].accept_btn.click()
+    assert [c.title for c in ev.selected] == ["Paper 4", "Paper 9"]
+    assert ev.review_decision == ReviewDecision.MODIFIED
