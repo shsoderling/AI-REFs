@@ -263,6 +263,13 @@ class ProjectState(BaseModel):
         description="Marker detection configuration used by the last pipeline run",
     )
 
+    # Set by the pre-run dialog ("Only (REF)/(REFS)" for this run); consumed
+    # by the orchestrator and never written to the project file.
+    run_marker_override: Optional["MarkerConfig"] = Field(
+        default=None, exclude=True,
+        description="Marker detection configuration for the next run only",
+    )
+
     @property
     def marker_config(self) -> "MarkerConfig":
         """MarkerConfig for a NEW pipeline run, derived from the current settings."""

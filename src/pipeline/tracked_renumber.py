@@ -113,13 +113,16 @@ def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
                      result: RenumberingResult, layout: CitationLayout, style: CitationStyle,
                      stats: ExportStats) -> int:
     """Give every cluster its new numbers, text and payload; rewrite only what
-    changed. An unresolved [?] field into which the user typed a (REF) or
-    (REFS) marker is unwrapped so the marker pass fills it like any other.
+    changed. An unresolved [?] field into which the user typed a marker
+    ((REF), (REFS) or an author-suggested citation) is unwrapped so the
+    marker pass fills it like any other.
     Returns the number of clusters unwrapped."""
-    from .existing_citation_parser import MARKER_PATTERN
+    from ..models.markers import MarkerConfig
+    from ..utils.markers import find_markers
     unwrapped = 0
     for cluster in clusters:
-        if cluster.payload.unresolved and not cluster.items and MARKER_PATTERN.search(cluster.field.result_text):
+        if (cluster.payload.unresolved and not cluster.items
+                and find_markers(cluster.field.result_text, MarkerConfig.all_on())):
             unwrap_field(cluster.field)
             unwrapped += 1
             continue

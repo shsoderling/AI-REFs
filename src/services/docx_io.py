@@ -167,20 +167,27 @@ class DocxHandler:
         Returns list of dicts with keys:
             paragraph, para_index, location, marker_type, text, spec,
             full_paragraph_text, marker_order_in_para.
-        ``location`` is the marker's span in ``paragraph.text`` and ``text``
-        the marker exactly as written, e.g. ``(REF)`` or ``(Smith et al. 2020)``.
+        ``location`` is the marker's span in ``paragraph.text``, ``text`` the
+        marker exactly as written, e.g. ``(REF)`` or ``(Smith et al. 2020)``, and
+        ``occurrence`` its ordinal among the paragraph's markers with the same
+        text (stable while other text of the paragraph is rewritten, unlike an
+        offset).
         """
         config = config or MarkerConfig.all_on()
         markers = []
         for para_idx, para in enumerate(self.doc.paragraphs):
             text = para.text
+            same_text: dict[str, int] = {}
             for order, spec in enumerate(_find_marker_specs(text, config)):
+                occurrence = same_text.get(spec.text, 0)
+                same_text[spec.text] = occurrence + 1
                 markers.append({
                     'paragraph': para,
                     'para_index': para_idx,
                     'location': (spec.start, spec.end),
                     'marker_type': spec.kind.value,
                     'text': spec.text,
+                    'occurrence': occurrence,
                     'spec': spec,
                     'full_paragraph_text': text,
                     'marker_order_in_para': order,
@@ -189,8 +196,9 @@ class DocxHandler:
         return markers
 
     def replace_marker_by_regex(self, paragraph, marker_text: str, replacement: str,
-                                superscript: Optional[bool] = False, start: int = 0):
-        """Replace the first occurrence of *marker_text* at or after *start* in *paragraph*.
+                                superscript: Optional[bool] = False, start: int = 0,
+                                occurrence: int = 0):
+        """Replace one occurrence of *marker_text* in *paragraph*.
 
         Locates the marker over the text runs, then replaces the touched runs
         with up to three new ones (before | citation | after). The before- and
@@ -208,19 +216,21 @@ class DocxHandler:
 
         Returns the new citation ``w:r`` element, or None when the marker is
         not in the paragraph. Raises :class:`FieldBoundaryError` rather than
-        rewriting a run that belongs to a field. *start* (an offset into
-        ``paragraph.text``) picks a later occurrence when the same marker text
-        appears several times; callers writing several markers of one
-        paragraph go right to left so earlier offsets stay valid.
+        rewriting a run that belongs to a field. *occurrence* (0 = first)
+        picks a later occurrence when the same marker text appears several
+        times, counted from *start* (an offset into ``paragraph.text``);
+        callers writing several markers of one paragraph go right to left so
+        earlier occurrences are still there to be counted.
         """
-        span = self._locate_span(paragraph, marker_text, start)
+        span = self._locate_span(paragraph, marker_text, start, occurrence)
         if span is None:
             return None
         return self._split_and_emit(span, replacement, superscript)
 
-    def _locate_span(self, paragraph, marker_text: str, start: int = 0) -> Optional[MarkerSpan]:
-        """Where the first *marker_text* at or after *start* sits among
-        ``iter_text_runs(paragraph)``.
+    def _locate_span(self, paragraph, marker_text: str, start: int = 0,
+                     occurrence: int = 0) -> Optional[MarkerSpan]:
+        """Where the *occurrence*-th *marker_text* at or after *start* sits
+        among ``iter_text_runs(paragraph)``.
 
         Offsets are computed over the very runs that make up ``paragraph.text``,
         so a marker present in the text is always found. Raises
@@ -228,9 +238,14 @@ class DocxHandler:
         cached field result must be rewritten through the field API instead.
         """
         full_text = paragraph.text
-        start = full_text.find(marker_text, start)
-        if start < 0:
-            return None
+        search_from = max(start, 0)
+        found = -1
+        for _ in range(max(int(occurrence), 0) + 1):
+            found = full_text.find(marker_text, search_from)
+            if found < 0:
+                return None
+            search_from = found + max(len(marker_text), 1)
+        start = found
         end = start + len(marker_text)
         runs = iter_text_runs(paragraph)
         first = last = None
@@ -370,9 +385,10 @@ class DocxHandler:
         return cite
 
     def insert_citation_field(self, paragraph, marker_text: str, code: str,
-                              result_text: str, superscript: bool, start: int = 0):
-        """Replace the first *marker_text* (at or after *start*) with an
-        AIREFS citation field.
+                              result_text: str, superscript: bool, start: int = 0,
+                              occurrence: int = 0):
+        """Replace the *occurrence*-th *marker_text* (at or after *start*) with
+        an AIREFS citation field.
 
         Same run surgery as :meth:`replace_marker_by_regex`, but the marker
         becomes the five runs of a complex field whose cached result shows
@@ -381,7 +397,7 @@ class DocxHandler:
         when the marker is not in the paragraph. Raises
         :class:`FieldBoundaryError` if the marker overlaps a field.
         """
-        span = self._locate_span(paragraph, marker_text, start)
+        span = self._locate_span(paragraph, marker_text, start, occurrence)
         if span is None:
             return None
         runs, first, first_off, last, last_off = span

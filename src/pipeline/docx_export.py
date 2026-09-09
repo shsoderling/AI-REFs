@@ -164,13 +164,15 @@ def render_new_bibliography(result: RenumberingResult, style: CitationStyle,
 
 def _write_cluster(handler: DocxHandler, paragraph, marker_text: str, candidates,
                    numbers: list[int], layout: CitationLayout, style: CitationStyle,
-                   embed: bool, stats: ExportStats, start: int = 0) -> str:
+                   embed: bool, stats: ExportStats, occurrence: int = 0) -> str:
     """Replace one marker with its rendered citation (field or plain run).
 
-    *start* is the marker's offset in the paragraph's original text: with
-    it the right occurrence is rewritten even when an earlier marker of the
-    paragraph carries the same words (author-date output can look exactly
-    like an author-suggested marker such as ``(Smith et al., 2020)``).
+    *occurrence* is the marker's ordinal among the paragraph's markers with
+    the same text: the right one is rewritten even when an earlier marker of
+    the paragraph carries the same words (author-date output can look exactly
+    like an author-suggested marker such as ``(Smith et al., 2020)``), and
+    the ordinal stays valid after renumbering has changed the length of
+    citations earlier in the paragraph, which a character offset would not.
     """
     unresolved = not candidates
     text = UNRESOLVED_TEXT if unresolved else render_cluster(candidates, numbers, layout)
@@ -181,7 +183,7 @@ def _write_cluster(handler: DocxHandler, paragraph, marker_text: str, candidates
         code = build_cite_code(candidates, numbers=stored_numbers, render=layout.render_kind,
                                style=style.value, plain=text, unresolved=unresolved)
         written = handler.insert_citation_field(paragraph, marker_text, code, text,
-                                                superscript=superscript, start=start)
+                                                superscript=superscript, occurrence=occurrence)
         if written is None:
             raise ExportBlocked([f"The marker {marker_text} could not be found in its paragraph "
                                  f"(\"{paragraph.text[:60]}\"); the document may have changed "
@@ -191,7 +193,7 @@ def _write_cluster(handler: DocxHandler, paragraph, marker_text: str, candidates
             stats.unresolved_fields += 1
     else:
         if handler.replace_marker_by_regex(paragraph, marker_text, text, superscript=superscript,
-                                           start=start) is None:
+                                           occurrence=occurrence) is None:
             raise ExportBlocked([f"The marker {marker_text} could not be found in its paragraph "
                                  f"(\"{paragraph.text[:60]}\"). Reload the document and run again."])
     return text
@@ -215,10 +217,13 @@ def write_new_markers(handler: DocxHandler, plan: RenumberPlan, result: Renumber
                       stats: ExportStats) -> set[int]:
     """Write every marker of *plan* into the document.
 
-    Markers are processed right to left within each paragraph so the
-    offsets read from the original text stay valid while earlier text is
-    untouched. Returns the numbers of new citations that merged with an
-    existing bibliography entry (legacy documents report them).
+    Each marker is addressed by its ordinal among the paragraph's markers
+    with the same text (``occurrence``), which survives the renumbering of
+    existing citations that ran before this; markers are still processed
+    right to left within a paragraph so a rendered citation can never be
+    counted as a later marker with identical text. Returns the numbers of
+    new citations that merged with an existing bibliography entry (legacy
+    documents report them).
     """
     stats.total_markers = len(plan.markers)
     merged_duplicate_numbers: set[int] = set()
@@ -238,7 +243,7 @@ def write_new_markers(handler: DocxHandler, plan: RenumberPlan, result: Renumber
             if assignment is not None and not assignment.is_new:
                 merged_duplicate_numbers.add(n)
         _write_cluster(handler, info['paragraph'], info['text'], candidates, numbers, layout,
-                       style, embed, stats, start=info['location'][0])
+                       style, embed, stats, occurrence=info.get('occurrence', 0))
         if candidates:
             stats.resolved_markers += 1
         else:

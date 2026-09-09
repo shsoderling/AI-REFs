@@ -1503,7 +1503,9 @@ class ReviewTab(QWidget):
         rebuilt = []
         rebuilt_verdicts = []
         sizes = [0] * n_slots
-        for w in widgets:
+        # Grouped by slot (a stable sort keeps the card order within a slot),
+        # since slot_sizes describes contiguous blocks of ``selected``.
+        for w in sorted(widgets, key=lambda w: w.slot):
             if w._removed or not is_valid_citation(w.citation):
                 continue
             rebuilt.append(w.citation)
@@ -1606,25 +1608,36 @@ class ReviewTab(QWidget):
                 or sentence.marker_type == MarkerType.REFS
             ))
             existing_valid = [c for c in evidence.selected if is_valid_citation(c)]
-            if is_multi and existing_valid:
-                # Keep every slot's kept references; the new papers join the
-                # first empty slot (else the last one).
+            if n_slots > 1:
+                # One block per marker: kept references stay where they are
+                # and each new paper goes to the first marker without one
+                # (so three picks for three empty markers fill them in
+                # order), else to the last marker.
                 ranges = evidence.slot_ranges(n_slots)
                 blocks = [[c for c in evidence.selected[s:e] if is_valid_citation(c)]
                           for s, e in ranges]
                 seen = {self._citation_key(c) for c in existing_valid}
-                new = []
+                for article in citations:
+                    if self._citation_key(article) in seen:
+                        continue
+                    seen.add(self._citation_key(article))
+                    target = next((i for i, b in enumerate(blocks) if not b), len(blocks) - 1)
+                    blocks[target].append(article)
+                evidence.selected = [c for b in blocks for c in b]
+                evidence.slot_sizes = [len(b) for b in blocks]
+            elif is_multi and existing_valid:
+                # A (REFS) sentence: merge with the references already kept
+                seen = {self._citation_key(c) for c in existing_valid}
+                merged = list(existing_valid)
                 for article in citations:
                     if self._citation_key(article) not in seen:
                         seen.add(self._citation_key(article))
-                        new.append(article)
-                target = next((i for i, b in enumerate(blocks) if not b), len(blocks) - 1)
-                blocks[target].extend(new)
-                evidence.selected = [c for b in blocks for c in b]
-                evidence.slot_sizes = [len(b) for b in blocks]
+                        merged.append(article)
+                evidence.selected = merged
+                evidence.slot_sizes = [len(merged)]
             else:
                 evidence.selected = list(citations)
-                evidence.slot_sizes = [len(citations)] + [0] * (n_slots - 1)
+                evidence.slot_sizes = [len(citations)]
             evidence.candidates = citations + evidence.candidates
             evidence.review_decision = ReviewDecision.MODIFIED
             self.project_modified.emit()
@@ -1662,6 +1675,11 @@ class ReviewTab(QWidget):
         anchor = after if after is not None else (ref_widgets[-1] if ref_widgets else None)
         position = (self.per_ref_layout.indexOf(anchor) + 1) if anchor is not None else 0
         slot_label = anchor.slot_label if anchor is not None else ""
+        # Keep the bookkeeping list in display order (the rebuild groups by
+        # slot, and cards of one slot keep this order).
+        insert_at = len(self._per_ref_widgets)
+        if anchor is not None and any(w is anchor for w in self._per_ref_widgets):
+            insert_at = next(i for i, w in enumerate(self._per_ref_widgets) if w is anchor) + 1
         for offset, citation in enumerate(citations):
             widget = SingleRefWidget(next_index + offset, citation, accepted=False,
                                      parent=self.per_ref_container, allow_remove=True,
@@ -1669,7 +1687,7 @@ class ReviewTab(QWidget):
             self._connect_ref_widget(widget)
             widget.mark_replaced(citation)
             self.per_ref_layout.insertWidget(position + offset, widget)
-            self._per_ref_widgets.append(widget)
+            self._per_ref_widgets.insert(insert_at + offset, widget)
             self._per_ref_accepted[widget.index] = True
 
     def _close_chat_panel(self):

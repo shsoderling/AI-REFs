@@ -20,7 +20,7 @@ from ..models.project import (
     AUTHOR_DATE_STYLES, SUPERSCRIPT_STYLES,
 )
 from ..models.evidence import ReviewDecision
-from ..models.markers import MarkerType, SuggestionKind
+from ..models.markers import MarkerConfig, MarkerType, SuggestionKind
 from ..services.docx_io import DocxHandler
 from ..utils.markers import find_markers
 from ..pipeline.existing_citation_parser import ExistingCitationParser
@@ -312,7 +312,6 @@ class MainWindow(QMainWindow):
         ahead, restrict this run to (REF)/(REFS) markers, or cancel.
         Returns False when the run should not start.
         """
-        settings = self._project.settings
         config = self._project.marker_config
         if not (config.detect_ids or config.detect_author_year):
             return True
@@ -369,9 +368,10 @@ class MainWindow(QMainWindow):
         if clicked is None or clicked == cancel_btn:
             return False
         if clicked == refs_only_btn:
-            # This run only; the Input tab checkboxes keep the user's preference.
-            settings.detect_suggested_ids = False
-            settings.detect_author_year = False
+            # This run only: the settings (and the Input tab checkboxes) keep
+            # the user's preference; the override is consumed by the run and
+            # never written to the project file.
+            self._project.run_marker_override = MarkerConfig.legacy()
         return True
 
     @Slot(object)

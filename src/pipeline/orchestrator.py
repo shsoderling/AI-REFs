@@ -216,8 +216,10 @@ class PipelineOrchestrator:
         self._progress("Parse Document", stage_offset, total_stages)
 
         # The marker grammar of this run is recorded on the project: export
-        # must re-scan the DOCX with exactly this configuration.
-        marker_config = self.project.marker_config
+        # must re-scan the DOCX with exactly this configuration. A one-run
+        # override (the pre-run dialog's "Only (REF)/(REFS)") wins once.
+        marker_config = self.project.run_marker_override or self.project.marker_config
+        self.project.run_marker_override = None
         self.project.run_marker_config = marker_config
 
         handler = DocxHandler(self.project.input_docx_path)
@@ -546,6 +548,9 @@ class PipelineOrchestrator:
         for idx, marker in enumerate(markers):
             self._check_pause()
             if self._cancelled:
+                # Keep one slot per marker so a partial record still maps
+                # each citation to the marker it was found for.
+                combined.slot_sizes += [0] * (num_markers - len(combined.slot_sizes))
                 return combined
 
             sub_text, trailing = parts[idx] if idx < len(parts) else ("", "")

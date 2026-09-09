@@ -135,9 +135,12 @@ in the port:
 * **Export.** `renumber_plan.build_renumber_plan` scans the DOCX with
   `export_marker_config`, matches markers to slots by order *and* text
   (`export_slots`), and records an action per marker; `docx_export.write_new_markers`
-  writes them right to left within a paragraph at their own offsets, and markers
-  left as written take no number and no field (`plan.written_count` feeds
-  `validate_before_save`).
+  writes them right to left within a paragraph, each addressed by its ordinal among
+  the paragraph's markers with the same text (`occurrence`; an offset would go stale
+  once renumbering shortened an earlier citation), and markers left as written take
+  no number and no field (`plan.written_count` feeds `validate_before_save`). A
+  suggested marker typed into a pending `[?]` field is unwrapped and filled like a
+  `(REF)`.
 * **Review decisions.** "Leave unchanged" is `ReviewDecision.SKIPPED` (resolved;
   export keeps the text). `REJECTED` keeps its earlier meaning (not resolved; a
   (REF)/(REFS) marker exports as `[?]`).
