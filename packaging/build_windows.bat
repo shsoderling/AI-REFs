@@ -3,7 +3,7 @@ REM Build AI REFs for Windows — produces an NSIS installer .exe
 setlocal
 
 set APP_NAME=AI REFs
-set VERSION=1.0.0
+set VERSION=1.1.0
 
 echo === Building %APP_NAME% %VERSION% for Windows ===
 echo.

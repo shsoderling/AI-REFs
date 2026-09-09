@@ -24,7 +24,13 @@ python -m src.app
 cd packaging
 chmod +x build_mac.sh
 ./build_mac.sh
-# Output: dist/AI REFs.app
+# Output: packaging/dist/AI REFs.app and packaging/dist/AI REFs <version>.dmg
+```
+
+To build and install into /Applications in one step (the previous copy is moved
+to the Trash, then the new app is launched):
+```bash
+./packaging/install_mac.sh
 ```
 
 **Windows:**
