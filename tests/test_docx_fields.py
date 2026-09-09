@@ -1,0 +1,214 @@
+"""Tests for the complex-field reader: fields are walked in document order,
+split/cross-paragraph field codes are concatenated, nesting is recorded with
+depth, and FieldIndex answers run-membership and result-span questions."""
+
+from docx import Document
+
+from src.services.docx_fields import (
+    FieldIndex, classify_code, iter_complex_fields,
+)
+from tests.fixture_builders import DocBuilder, make_run
+
+
+def _doc(tmp_path, build):
+    b = DocBuilder()
+    build(b)
+    return Document(str(b.save(tmp_path / "d.docx")))
+
+
+def test_single_field_code_and_result(tmp_path):
+    def build(b):
+        p = b.paragraph("x")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"v":1} ', result="1", superscript=True)
+    doc = _doc(tmp_path, build)
+    fields = iter_complex_fields(doc.element.body)
+    assert len(fields) == 1
+    f = fields[0]
+    assert f.code == 'ADDIN AIREFS.CITE {"v":1}'
+    assert f.result_text == "1"
+    assert f.complete and f.depth == 0 and f.kind == "airefs_cite"
+
+
+def test_split_instr_text_is_concatenated(tmp_path):
+    def build(b):
+        p = b.paragraph("")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"title":"a~b"} ', result="2", split_code_at=20)
+    f = iter_complex_fields(_doc(tmp_path, build).element.body)[0]
+    assert f.code == 'ADDIN AIREFS.CITE {"title":"a~b"}'
+
+
+def test_del_instr_text_is_concatenated(tmp_path):
+    """A field code partly under a tracked deletion (w:delInstrText) still
+    reads as one code string."""
+    def build(b):
+        p = b.paragraph("")
+        for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"t":'),
+                  make_run(instr='"a"} ', deleted=True), make_run(fldchar="separate"),
+                  make_run("1"), make_run(fldchar="end")):
+            p._p.append(r)
+    f = iter_complex_fields(_doc(tmp_path, build).element.body)[0]
+    assert f.code == 'ADDIN AIREFS.CITE {"t":"a"}'
+    assert len(f.code_runs) == 2
+
+
+def test_runs_without_instr_text_in_code_part_are_code_runs(tmp_path):
+    """Everything between begin and separate is inside the field, even a run
+    that carries no instrText; only the code string comes from instrText."""
+    def build(b):
+        p = b.paragraph("")
+        for r in (make_run(fldchar="begin"), make_run(), make_run(instr=" PAGE "),
+                  make_run(fldchar="separate"), make_run("7"), make_run(fldchar="end")):
+            p._p.append(r)
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    roles = [idx.role(r) for r in doc.paragraphs[0].runs]
+    assert roles == ["marker", "code", "code", "marker", "result", "marker"]
+    assert idx.fields[0].code == "PAGE"
+
+
+def test_field_spanning_paragraphs(tmp_path):
+    def build(b):
+        p = b.paragraph("")
+        b.add_field(p, code=' ADDIN AIREFS.BIBL {"v":1} ', result="1. One",
+                    end_in_new_paragraph=True, extra_paragraph_texts=["2. Two", "3. Three"])
+    doc = _doc(tmp_path, build)
+    f = iter_complex_fields(doc.element.body)[0]
+    assert f.kind == "airefs_bibl" and f.complete
+    assert len(f.paragraphs) == 3
+    assert f.result_text == "1. One\n2. Two\n3. Three"
+
+
+def test_nested_field_depth_and_foreign_classification(tmp_path):
+    def build(b):
+        p = b.paragraph("")
+        b.add_field(p, code=" ADDIN EN.CITE <EndNote/> ", result="(Smith 2020)",
+                    nested_code=" ADDIN EN.CITE.DATA ")
+    fields = iter_complex_fields(_doc(tmp_path, build).element.body)
+    assert [(f.kind, f.depth) for f in fields] == [("foreign", 0), ("foreign", 1)]
+
+
+def test_fld_simple_and_unmatched_begin(tmp_path):
+    def build(b):
+        p = b.paragraph("")
+        b.add_simple_field(p, instr=" PAGE ", result="7")
+        p2 = b.paragraph("")
+        p2._p.append(make_run(fldchar="begin"))
+        p2._p.append(make_run(instr=" ADDIN AIREFS.CITE {} "))
+    fields = iter_complex_fields(_doc(tmp_path, build).element.body)
+    assert fields[0].kind == "other" and fields[0].result_text == "7"
+    assert fields[1].complete is False
+
+
+def test_tracked_change_wrappers_and_text_box_dedup(tmp_path):
+    def build(b):
+        p = b.paragraph("")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="1", wrap="del")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"a":2} ', result="2", wrap="ins")
+
+        def fill(inner_p):
+            for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"a":3} '),
+                      make_run(fldchar="separate"), make_run("3"), make_run(fldchar="end")):
+                inner_p.append(r)
+        b.add_text_box(p, fill)
+    doc = _doc(tmp_path, build)
+    fields = iter_complex_fields(doc.element.body)
+    assert len(fields) == 3
+    assert fields[0].deleted is True and fields[1].deleted is False
+    idx = FieldIndex(doc)
+    assert idx.pending_tracked_changes is True
+    assert idx.airefs_cite == 3
+
+
+def test_tracked_change_inside_result_only_is_pending(tmp_path):
+    """A field whose begin is clean but whose result run sits under w:ins is
+    neither deleted nor inserted as a whole, yet still has a pending change."""
+    def build(b):
+        p = b.paragraph("")
+        for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"a":5} '),
+                  make_run(fldchar="separate")):
+            p._p.append(r)
+        b.add_text(p, "5", wrap="ins")
+        p._p.append(make_run(fldchar="end"))
+    doc = _doc(tmp_path, build)
+    f = iter_complex_fields(doc.element.body)[0]
+    assert f.complete and f.result_text == "5"
+    assert f.deleted is False and f.inserted is False
+    assert FieldIndex(doc).pending_tracked_changes is True
+
+
+def test_field_index_roles_and_result_spans(tmp_path):
+    def build(b):
+        p = b.paragraph("Cells fire")
+        b.add_field(p, code=' ADDIN AIREFS.CITE {"a":1} ', result="4,5", superscript=True)
+        b.add_text(p, " and [2] more.")
+    doc = _doc(tmp_path, build)
+    para = doc.paragraphs[0]
+    idx = FieldIndex(doc)
+    roles = [idx.role(r) for r in para.runs]
+    assert roles == [None, "marker", "code", "marker", "result", "marker", None]
+    assert idx.in_field(para.runs[4]) and not idx.in_field(para.runs[0])
+    assert idx.result_spans(para) == [(10, 13)]
+    assert para.text[10:13] == "4,5"
+
+
+def test_fields_in_tables_are_counted(tmp_path):
+    def build(b):
+        cell_p = b.add_table_cell_paragraph("Fig. 1 ")
+        b.add_field(cell_p, code=' ADDIN AIREFS.CITE {"a":9} ', result="9")
+    idx = FieldIndex(_doc(tmp_path, build))
+    assert idx.airefs_cite == 1 and idx.in_tables == 1
+    f = idx.fields[0]
+    assert f.in_table is True and f.in_text_box is False and f.out_of_flow is True
+
+
+def test_text_box_field_is_out_of_flow(tmp_path):
+    """A field inside a text box (w:txbxContent) is not a body field: its
+    paragraph is not in doc.paragraphs, so consumers that index body
+    paragraphs must skip it exactly as they skip table fields."""
+    def build(b):
+        p = b.paragraph("Body")
+
+        def fill(inner_p):
+            for r in (make_run(fldchar="begin"), make_run(instr=' ADDIN AIREFS.CITE {"a":3} '),
+                      make_run(fldchar="separate"), make_run("3"), make_run(fldchar="end")):
+                inner_p.append(r)
+        b.add_text_box(p, fill)
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    assert idx.airefs_cite == 1
+    f = idx.fields[0]
+    assert f.in_text_box is True and f.in_table is False and f.out_of_flow is True
+    assert idx.out_of_flow == 1 and idx.in_tables == 1
+    body_ps = [para._p for para in doc.paragraphs]
+    assert not any(f.paragraphs[0] is bp for bp in body_ps)
+    assert idx.fields_in_paragraph(doc.paragraphs[0]) == []
+
+
+def test_tracked_move_is_one_live_field(tmp_path):
+    """Moving a sentence with Track Changes on leaves the old copy under
+    w:moveFrom and the new copy under w:moveTo. In final view the moveFrom
+    copy is gone (like w:del) and the moveTo copy is present (like w:ins);
+    both are pending tracked changes."""
+    def build(b):
+        p1 = b.paragraph("")
+        b.add_field(p1, code=' ADDIN AIREFS.CITE {"a":1} ', result="1", wrap="moveFrom")
+        p2 = b.paragraph("")
+        b.add_field(p2, code=' ADDIN AIREFS.CITE {"a":1} ', result="1", wrap="moveTo")
+    doc = _doc(tmp_path, build)
+    idx = FieldIndex(doc)
+    assert idx.airefs_cite == 2
+    assert [f.deleted for f in idx.fields] == [True, False]
+    assert [f.inserted for f in idx.fields] == [False, True]
+    assert [f.tracked_change for f in idx.fields] == [True, True]
+    assert idx.pending_tracked_changes is True
+    assert sum(1 for f in idx.fields if not f.deleted) == 1
+
+
+def test_classify_code():
+    assert classify_code(' ADDIN AIREFS.CITE {} ') == "airefs_cite"
+    assert classify_code('ADDIN AIREFS.BIBL {}') == "airefs_bibl"
+    assert classify_code(' ADDIN ZOTERO_ITEM CSL_CITATION {} ') == "foreign"
+    assert classify_code(' ADDIN EN.CITE <x/> ') == "foreign"
+    assert classify_code(' ADDIN Mendeley Bibliography CSL_BIBLIOGRAPHY ') == "foreign"
+    assert classify_code(' PAGE ') == "other"
+    assert classify_code(' HYPERLINK "x" ') == "other"

@@ -5,7 +5,7 @@
 
 ; ── Application metadata ──
 !define APP_NAME "AI REFs"
-!define APP_VERSION "1.1.0"
+!define APP_VERSION "1.3.0"
 !define APP_PUBLISHER "AI REFs"
 !define APP_EXE "AI REFs.exe"
 !define APP_ICON "..\assets\icon.ico"

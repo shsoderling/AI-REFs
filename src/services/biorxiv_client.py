@@ -17,6 +17,7 @@ import requests
 
 from ..models.citation import CitationCandidate, Author
 from ..storage.cache_db import CacheDB
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +54,13 @@ class BioRxivClient:
         self.cache = cache_db or CacheDB()
         self.server = server
         self._session = requests.Session()
-        self._last_request_time = 0.0
         self._min_interval = 0.5  # bioRxiv rate limit is more conservative
         self._max_retries = 3
+        self._limiter = RateLimiter(self._min_interval)
 
     def _rate_limit(self):
-        """Enforce rate limiting between requests."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce rate limiting between requests (shared across threads)."""
+        self._limiter.wait(self._min_interval)
 
     def _request(self, url: str) -> Optional[dict]:
         """Make a GET request with rate limiting and retry. Returns parsed JSON."""
@@ -281,11 +279,10 @@ class BioRxivClient:
         server = preprint.get("server", self.server)
         journal = "bioRxiv" if "biorxiv" in server.lower() else "medRxiv"
 
-        # Published DOI (if paper was published in a journal)
-        published_doi = preprint.get("published_doi", "")
-        if published_doi and published_doi != "NA":
-            # This preprint has been published — note it in the abstract
-            abstract = f"[Published: {published_doi}] {abstract}"
+        # DOI of the journal version, when the preprint has been published
+        published_doi = preprint.get("published_doi", "") or ""
+        if published_doi == "NA":
+            published_doi = ""
 
         return CitationCandidate(
             pmid="",  # Preprints don't have PMIDs
@@ -304,6 +301,7 @@ class BioRxivClient:
             publication_types=["Preprint"],
             is_retracted=False,
             is_review=False,
+            published_doi=published_doi,
         )
 
     def _parse_author_string(self, author_str: str) -> list[Author]:

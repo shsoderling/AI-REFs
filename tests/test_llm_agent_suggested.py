@@ -1,39 +1,24 @@
-"""LLMCitationAgent.evaluate_suggested with a fake Anthropic client."""
+"""LLMCitationAgent.evaluate_suggested driven by a scripted Claude (tool use)."""
 
-import json
 from types import SimpleNamespace
 
 from src.models.citation import Author, CitationCandidate
 from src.models.evidence import ConfidenceLevel
-from src.models.markers import MarkerType, SuggestedCitation, SuggestionKind
+from src.models.markers import MarkerType, SuggestionKind
 from src.models.sentence import SentenceRecord
-from src.pipeline.llm_citation_agent import LLMCitationAgent
+from src.pipeline.claim_context import ClaimContext
+from src.pipeline.llm_citation_agent import LLMCitationAgent, cap_suggested_confidence
 from src.services.suggestion_resolver import ResolvedSuggestion
 from src.utils.markers import find_markers
+from tests.fakes import FakeAnthropic, FakePubMed, message, submit_msg, text_block, tool_use_block
 
 
-class FakePubMed:
-    def __init__(self, articles=None):
-        self.articles = articles or {}
-
-    def fetch_articles(self, pmids):
-        return [self.articles[p] for p in pmids if p in self.articles]
-
-    def fetch_article(self, pmid):
-        return self.articles.get(pmid)
-
-    def search(self, query, max_results=20):
-        return [], 0
-
-
-def text_response(text):
-    return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)])
-
-
-def make_agent(responses, articles=None):
-    agent = LLMCitationAgent(anthropic_api_key="sk-test", model="m", pubmed_client=FakePubMed(articles))
-    agent.client = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: responses.pop(0)))
-    return agent
+def make_agent(script, articles=None):
+    client = FakeAnthropic(script)
+    agent = LLMCitationAgent(anthropic_api_key="sk-test", model="m",
+                             pubmed_client=FakePubMed(articles=articles), client=client,
+                             search_biorxiv=False, search_europepmc=False)
+    return agent, client
 
 
 def cand(pmid="", doi="", title="T", authors=(), year=2024, retracted=False):
@@ -44,12 +29,14 @@ def cand(pmid="", doi="", title="T", authors=(), year=2024, retracted=False):
 def sentence(text):
     s = SentenceRecord(id="S001", raw_text=text, clean_text=text.split(" (")[0] + ".")
     s.markers = find_markers(text)
+    s.marker_types = [m.kind for m in s.markers]
     s.marker_type = s.markers[0].kind
     s.marker_count = len(s.markers)
     return s
 
 
-def answer(selected, **extra):
+def evaluation_msg(selected, **extra):
+    """The agent's answer through the submit_suggested_evaluation tool."""
     data = {
         "selected": selected,
         "unresolved": extra.pop("unresolved", []),
@@ -63,7 +50,8 @@ def answer(selected, **extra):
         "all_pmids_considered": [],
     }
     data.update(extra)
-    return text_response(json.dumps(data))
+    return message(tool_use_block("submit_suggested_evaluation", data, id="tu_eval"),
+                   stop_reason="tool_use")
 
 
 def test_identifier_suggestions_are_scored_and_pinned():
@@ -77,7 +65,7 @@ def test_identifier_suggestions_are_scored_and_pinned():
         ResolvedSuggestion(marker.suggestions[1], [b], source="pubmed"),
     ]
     # The agent scores A, but tries to swap B for a different paper
-    agent = make_agent([answer([
+    agent, client = make_agent([evaluation_msg([
         {"suggestion": "PMID: 1", "pmid": "1", "score": 85, "why": "directly shows it"},
         {"suggestion": "doi: 10.1000/b", "pmid": "99", "score": 95, "why": "better"},
     ])], articles={"99": other})
@@ -91,6 +79,11 @@ def test_identifier_suggestions_are_scored_and_pinned():
     assert any(w.code == "suggested_unscored" for w in ev.warnings)
     assert ev.confidence_level == ConfidenceLevel.MEDIUM   # unscored suggestion caps HIGH
     assert ev.abstract_snippets == ["Spines grow."]
+    # Request shape: the evaluation tool is offered last; the records were pre-loaded
+    call = client.calls[0]
+    assert call["tools"][-1]["name"] == "submit_suggested_evaluation"
+    prompt = call["messages"][0]["content"]
+    assert "Paper A" in prompt and "Paper B" in prompt and "(PMID: 1; doi: 10.1000/b)" in prompt
 
 
 def test_weak_match_warning_and_alternative():
@@ -99,7 +92,7 @@ def test_weak_match_warning_and_alternative():
     a = cand(pmid="1", title="Paper A")
     alt = cand(pmid="5", title="Alternative")
     resolved = [ResolvedSuggestion(marker.suggestions[0], [a], source="pubmed")]
-    agent = make_agent([answer(
+    agent, _ = make_agent([evaluation_msg(
         [{"suggestion": "PMID: 1", "pmid": "1", "score": 20, "why": "unrelated"}],
         alternatives=[{"pmid": "5", "why": "this one fits"}],
         confidence="LOW", confidence_score=25,
@@ -120,15 +113,17 @@ def test_author_year_pick_is_validated_and_ambiguity_flagged():
     wrong = cand(pmid="3", title="Wrong author", authors=["Jones"], year=2024)
     resolved = [ResolvedSuggestion(marker.suggestions[0], [good, also], source="pubmed", total_matches=2)]
 
-    agent = make_agent([answer([{"suggestion": "Battison et al. 2024", "pmid": "2", "score": 80, "why": "topic fits"}])])
+    agent, _ = make_agent([evaluation_msg(
+        [{"suggestion": "Battison et al. 2024", "pmid": "2", "score": 80, "why": "topic fits"}])])
     ev = agent.evaluate_suggested(s, marker, resolved)
     assert [c.pmid for c in ev.selected] == ["2"]
     assert any(w.code == "suggested_ambiguous" for w in ev.warnings)
     assert ev.confidence_level == ConfidenceLevel.MEDIUM
 
     # A pick whose authors do not match is discarded -> unresolved
-    agent = make_agent([answer([{"suggestion": "Battison et al. 2024", "pmid": "3", "score": 80, "why": "?"}])],
-                       articles={"3": wrong})
+    agent, _ = make_agent([evaluation_msg(
+        [{"suggestion": "Battison et al. 2024", "pmid": "3", "score": 80, "why": "?"}])],
+        articles={"3": wrong})
     ev = agent.evaluate_suggested(s, marker, resolved)
     assert ev.selected == []
     assert any(w.code == "suggested_unresolved" for w in ev.warnings)
@@ -143,7 +138,7 @@ def test_duplicate_identifiers_cited_once_and_retraction_flagged():
         ResolvedSuggestion(marker.suggestions[0], [a], source="pubmed"),
         ResolvedSuggestion(marker.suggestions[1], [a], source="pubmed"),
     ]
-    agent = make_agent([answer([
+    agent, _ = make_agent([evaluation_msg([
         {"suggestion": "PMID: 1", "pmid": "1", "score": 90, "why": "yes"},
         {"suggestion": "doi: 10.1000/a", "pmid": "1", "score": 90, "why": "yes"},
     ])])
@@ -160,54 +155,95 @@ def test_extra_search_adds_agent_found_reference():
     a = cand(pmid="1", title="Suggested")
     found = cand(pmid="7", title="Found by search")
     resolved = [ResolvedSuggestion(marker.suggestions[0], [a], source="pubmed")]
-    agent = make_agent([answer([
-        {"suggestion": "PMID: 1", "pmid": "1", "score": 70, "why": "ok"},
-        {"suggestion": "REF", "pmid": "7", "score": 88, "why": "supports"},
-    ])], articles={"7": found})
+    agent, client = make_agent([
+        message(tool_use_block("search_pubmed", {"query": "spines"}, id="tu_1"), stop_reason="tool_use"),
+        evaluation_msg([
+            {"suggestion": "PMID: 1", "pmid": "1", "score": 70, "why": "ok"},
+            {"suggestion": "REF", "pmid": "7", "score": 88, "why": "supports"},
+        ]),
+    ], articles={"7": found})
     ev = agent.evaluate_suggested(s, marker, resolved)
     assert [c.pmid for c in ev.selected] == ["1", "7"]
     assert ev.slot_sizes == [2]
+    assert len(client.calls) == 2 and ev.search_query == "spines"
 
 
-def test_unparseable_answer_falls_back_to_resolved_records():
+def test_prose_answer_then_deadline_falls_back_to_resolved_records():
     s = sentence("Claim (PMID: 1).")
     marker = s.markers[0]
     a = cand(pmid="1", title="Paper A")
     resolved = [ResolvedSuggestion(marker.suggestions[0], [a], source="pubmed")]
-    agent = make_agent([text_response("Sorry, I cannot do that.")])
+    # Prose every round, and still prose at the deadline: the resolved record is used as-is
+    from src.pipeline.llm_citation_agent import MAX_AGENT_ROUNDS
+    script = [message(text_block("Sorry, I cannot do that."), stop_reason="end_turn")
+              for _ in range(MAX_AGENT_ROUNDS + 1)]
+    agent, client = make_agent(script)
     ev = agent.evaluate_suggested(s, marker, resolved)
     assert [c.pmid for c in ev.selected] == ["1"]
     assert ev.confidence_level == ConfidenceLevel.UNRESOLVED
     assert any(w.code == "suggested_unscored" for w in ev.warnings)
+    redirect = client.calls[1]["messages"][-1]["content"]
+    assert "submit_suggested_evaluation" in redirect
+    assert [t["name"] for t in client.calls[-1]["tools"]] == ["submit_suggested_evaluation"]
 
     # Ambiguous + failed agent -> nothing selected, but candidates kept for the chat panel
     s2 = sentence("Claim (Smith 2020).")
     m2 = s2.markers[0]
     two = [cand(pmid="1", authors=["Smith"], year=2020), cand(pmid="2", authors=["Smith"], year=2020)]
-    agent = make_agent([text_response("garbage")])
+    agent, _ = make_agent([message(text_block("garbage"), stop_reason="end_turn")
+                           for _ in range(MAX_AGENT_ROUNDS + 1)])
     ev = agent.evaluate_suggested(s2, m2, [ResolvedSuggestion(m2.suggestions[0], two, total_matches=2)])
     assert ev.selected == [] and len(ev.candidates) == 2
+
+
+def test_api_error_falls_back_to_resolved_records():
+    import anthropic
+    import httpx
+    s = sentence("Claim (PMID: 1).")
+    marker = s.markers[0]
+    resolved = [ResolvedSuggestion(marker.suggestions[0], [cand(pmid="1")], source="pubmed")]
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    err = anthropic.InternalServerError("boom", response=httpx.Response(500, request=request), body=None)
+    agent, _ = make_agent([err])
+    ev = agent.evaluate_suggested(s, marker, resolved)
+    assert [c.pmid for c in ev.selected] == ["1"] and "API error" in ev.confidence_rationale
 
 
 def test_prompt_mentions_suggestions_and_context():
     s = sentence("Claim (Battison et al. 2024).")
     marker = s.markers[0]
     resolved = [ResolvedSuggestion(marker.suggestions[0], [], error="nothing found")]
-    agent = make_agent([])
-    msg = agent._build_suggested_message(s, marker, resolved, ["synaptic neuroscience"], "after the words: X")
+    agent, _ = make_agent([])
+    ctx = ClaimContext(claim="Claim.", section="Results", preceding=["Before."],
+                       sub_claim="as shown before", trailing="and more")
+    msg = agent._build_suggested_message(ctx, marker, resolved, ["synaptic neuroscience"])
     assert "Battison et al. 2024" in msg and "NOT FOUND" in msg and "synaptic neuroscience" in msg
-    assert "after the words: X" in msg
+    assert 'ending at the marker (Battison et al. 2024): "as shown before"' in msg
+    assert "Section: Results" in msg and 'Preceding: "Before."' in msg
     assert "first author 'Battison', year 2024" in msg
+    assert msg.rstrip().endswith("call submit_suggested_evaluation.")
 
 
-def test_find_citations_still_parses_plain_answers():
-    s = SentenceRecord(id="S1", raw_text="Claim (REF).", clean_text="Claim.", marker_type=MarkerType.REF, marker_count=1)
+def test_find_citations_unchanged_by_the_suggested_path():
+    s = SentenceRecord(id="S1", raw_text="Claim (REF).", clean_text="Claim.",
+                       marker_type=MarkerType.REF, marker_count=1)
     a = cand(pmid="1", title="Paper A")
-    agent = make_agent([text_response(json.dumps({
-        "selected": [{"pmid": "1", "why": "x"}], "confidence": "HIGH", "confidence_score": 80,
-        "confidence_rationale": "r", "verification_status": "partial", "supporting_snippets": [],
-        "search_queries_used": ["q"], "all_pmids_considered": ["1"],
-    }))], articles={"1": a})
+    agent, client = make_agent([submit_msg([{"pmid": "1"}], confidence="HIGH", score=80,
+                                           status="partial", queries=("q",), considered=("1",))],
+                               articles={"1": a})
     ev = agent.find_citations(s)
     assert [c.pmid for c in ev.selected] == ["1"]
     assert ev.confidence_level == ConfidenceLevel.HIGH and ev.search_query == "q"
+    assert client.calls[0]["tools"][-1]["name"] == "submit_citations"
+
+
+def test_cap_helper_only_lowers_high():
+    from src.models.evidence import EvidenceRecord, Warning
+    ev = EvidenceRecord(confidence_level=ConfidenceLevel.HIGH,
+                        warnings=[Warning(code="suggested_ambiguous", message="m")])
+    cap_suggested_confidence(ev)
+    assert ev.confidence_level == ConfidenceLevel.MEDIUM
+    ev2 = EvidenceRecord(confidence_level=ConfidenceLevel.LOW,
+                         warnings=[Warning(code="suggested_unresolved", message="m")])
+    cap_suggested_confidence(ev2)
+    assert ev2.confidence_level == ConfidenceLevel.LOW

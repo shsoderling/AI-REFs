@@ -1,8 +1,10 @@
 """LLM-powered citation agent using Claude tool-use.
 
-Replaces the deterministic claim extraction, candidate retrieval,
-ranking, and verification stages with a single Claude agent loop
-that searches PubMed iteratively and selects the best citations.
+One Claude agent loop per claim: it searches the user's library, PubMed,
+Europe PMC and bioRxiv, reads abstracts (and open-access full text when
+needed) and hands back its selection through the ``submit_citations``
+tool.  Independent verification of the selection happens afterwards in
+``pipeline.verification``.
 
 Two entry points:
 
@@ -10,10 +12,10 @@ Two entry points:
   support a claim (``(REF)`` / ``(REFS)`` markers).
 * :meth:`LLMCitationAgent.evaluate_suggested` -- the author already named
   the reference(s) (``(PMID: ...)``, ``(Battison et al. 2024)``, ...); the
-  agent confirms each one and scores how well it supports the claim.
+  agent confirms each one and scores how well it supports the claim,
+  answering through the ``submit_suggested_evaluation`` tool.
 """
 
-import json
 import logging
 import re
 from typing import Optional, Callable
@@ -26,14 +28,17 @@ from ..models.citation import CitationCandidate
 from ..models.evidence import (
     EvidenceRecord, ConfidenceLevel, VerificationStatus, Warning,
 )
+from ..services.claude_client import ClaudeCaller, make_client
 from ..services.pubmed_client import PubMedClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
-from ..services.suggestion_resolver import ResolvedSuggestion
-from ..services.tool_executor import (
-    ToolExecutor, extract_json, candidate_key, _article_summary,
+from ..services.search_tools import (
+    SUBMIT_CITATIONS, SUBMIT_SUGGESTED_EVALUATION, build_tool_list, find_tool_use,
 )
+from ..services.suggestion_resolver import ResolvedSuggestion
+from ..services.tool_executor import ToolExecutor, candidate_key, _article_summary
+from .claim_context import ClaimContext, bare_context
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,9 @@ MAX_AGENT_ROUNDS = 6
 
 # Below this per-citation score an author-suggested citation gets a warning.
 WEAK_MATCH_THRESHOLD = 50
+
+# Warnings that keep a suggested-citation sentence from being HIGH confidence.
+_NOT_HIGH_WARNINGS = ("suggested_unresolved", "suggested_ambiguous", "suggested_unscored")
 
 SYSTEM_PROMPT = """\
 You are a biomedical citation-finding assistant. Find references that \
@@ -56,8 +64,8 @@ Step 1 (round 1): If available, search the user library first. Then search PubMe
 with 1-2 well-crafted queries. Optionally also search Europe PMC for broader coverage.
 Step 2 (round 2): Fetch articles for the most promising PMIDs from Step 1.
 Step 3 (round 3): Read the abstracts. If you found good matches, STOP and \
-return your JSON answer. If not, do ONE more targeted search.
-Step 4 (round 4 max): Fetch any new articles, then STOP and return your JSON answer.
+call submit_citations. If not, do ONE more targeted search.
+Step 4 (round 4 max): Fetch any new articles, then STOP and call submit_citations.
 
 DO NOT keep searching endlessly. After 2-3 searches and 1-2 fetches, you should \
 have enough information to make a selection. Select the best available match even \
@@ -66,34 +74,19 @@ if it is not perfect.
 For a (REF) marker, select exactly 1 best reference. For a (REFS) marker, \
 select up to {max_refs} references.
 
-Prefer peer-reviewed primary research over reviews. Prefer recent publications \
-when relevance is equal.
+{preferences}
+
+Never select a retracted article. If an abstract is ambiguous and the article \
+reports full_text_available, call get_fulltext_passages with a few keywords \
+before deciding. Cite only the sentence marked as the CLAIM; surrounding text \
+is context to help you understand it.
 
 If the tool `search_user_library` is available, call it in round 1 before
 external searches and strongly prefer those results when they support the claim.
 
-CRITICAL: When you are ready to give your answer, respond with ONLY a JSON \
-object. No other text before or after. No markdown fencing. Just the raw JSON:
-{{
-  "selected": [
-    {{
-      "pmid": "12345678",
-      "doi": "",
-      "title": "",
-      "why": "Brief explanation of why this paper supports the claim"
-    }}
-  ],
-  "confidence": "HIGH" | "MEDIUM" | "LOW",
-  "confidence_score": 0-100,
-  "confidence_rationale": "Why you are this confident",
-  "verification_status": "verified" | "partial" | "indirect" | "weak",
-  "supporting_snippets": ["Relevant quote from abstract..."],
-  "search_queries_used": ["query1", "query2"],
-  "all_pmids_considered": ["12345678", "23456789"]
-}}
-
-If no supporting references exist, return the same JSON with "selected": [] \
-and "confidence": "LOW".
+When you are ready to answer, call the `submit_citations` tool exactly once. \
+Do not write the answer as text. If no supporting references exist, call \
+submit_citations with an empty "selected" list and confidence "LOW".
 """
 
 SUGGESTED_SYSTEM_PROMPT = """\
@@ -110,7 +103,8 @@ decide which one the author meant (prefer the paper whose topic matches the clai
 - an author-year citation matched nothing: search PubMed with the author's last \
 name, the year, and topic keywords from the claim, e.g. \
 "Battison[au] AND 2024[dp] AND synapse";
-- a provided record lacks an abstract and you need it to judge support.
+- a provided record lacks an abstract and you need it to judge support (call \
+get_fulltext_passages when the record reports full_text_available).
 
 Rules:
 1. Keep every suggested reference that resolves to a real paper in "selected", \
@@ -128,192 +122,47 @@ author, not substituted).
 5. Score each reference 0-100 for how directly it supports the claim \
 (100 = the paper's own findings state the claim; 50 = related but indirect; \
 10 = unrelated). Overall confidence: HIGH if every suggestion scores >= 70, \
-MEDIUM if all score >= 40, otherwise LOW.
+MEDIUM if all score >= 40, otherwise LOW. Cite only the sentence marked as the \
+CLAIM; surrounding text is context to help you understand it.
 
-CRITICAL: When you are ready to give your answer, respond with ONLY a JSON \
-object. No other text before or after. No markdown fencing. Just the raw JSON:
-{{
-  "selected": [
-    {{
-      "suggestion": "<the suggestion exactly as listed, e.g. 'PMID: 32879322'>",
-      "pmid": "12345678",
-      "doi": "",
-      "title": "",
-      "score": 0-100,
-      "why": "How this paper supports (or fails to support) the claim"
-    }}
-  ],
-  "unresolved": [
-    {{"suggestion": "<suggestion as listed>", "reason": "Why it could not be resolved"}}
-  ],
-  "alternatives": [
-    {{"pmid": "", "doi": "", "title": "", "why": "Why this would be a better citation"}}
-  ],
-  "confidence": "HIGH" | "MEDIUM" | "LOW",
-  "confidence_score": 0-100,
-  "confidence_rationale": "Why you are this confident",
-  "verification_status": "verified" | "partial" | "indirect" | "weak",
-  "supporting_snippets": ["Relevant quote from abstract..."],
-  "search_queries_used": ["query1"],
-  "all_pmids_considered": ["12345678"]
-}}
+{preferences}
+
+When you are ready to answer, call the `submit_suggested_evaluation` tool \
+exactly once. Do not write the answer as text.
 """
 
-TOOLS = [
-    {
-        "name": "search_pubmed",
-        "description": (
-            "Search PubMed for articles matching a query. Returns a list of "
-            "PubMed IDs (PMIDs) and the total number of results. Use standard "
-            "PubMed query syntax: combine terms with AND/OR, use [MeSH] tags, "
-            "field tags like [ti] (title), [tiab] (title/abstract), [au] (author). "
-            "Example: 'Rac1 AND dendritic spine AND hippocampus'"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "PubMed search query"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of PMIDs to return (default 20)",
-                    "default": 20
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "fetch_articles",
-        "description": (
-            "Fetch full metadata for one or more PubMed articles by their PMIDs. "
-            "Returns title, authors, year, journal, abstract, DOI, MeSH terms "
-            "for each article. Use this after search_pubmed to read abstracts "
-            "and evaluate relevance."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pmids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of PubMed IDs to fetch"
-                }
-            },
-            "required": ["pmids"]
-        }
-    },
-]
 
-USER_LIBRARY_TOOL = {
-    "name": "search_user_library",
-    "description": (
-        "Search the user's local AI REFs library. Use this first when available. "
-        "Returns full citation metadata for matching references."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query for the user library"
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum results to return (default 10)",
-                "default": 10
-            }
-        },
-        "required": ["query"]
-    }
-}
+def build_preference_text(prefer_reviews: bool, recency_bias: bool) -> str:
+    """Prompt sentences for the Input tab's review/recency preferences."""
+    if prefer_reviews:
+        reviews = ("Prefer an authoritative review when one directly covers the claim; "
+                   "otherwise choose peer-reviewed primary research.")
+    else:
+        reviews = "Prefer peer-reviewed primary research over reviews."
+    if recency_bias:
+        recency = "Prefer recent publications when relevance is equal."
+    else:
+        recency = ("Do not weigh publication date; choose the most relevant, "
+                   "well-established source.")
+    return f"{reviews} {recency}"
 
-BIORXIV_TOOL = {
-    "name": "search_biorxiv",
-    "description": (
-        "Search bioRxiv preprints by keywords. Returns matching preprints with "
-        "title, authors, year, abstract, and DOI. Use this to supplement PubMed "
-        "results with recent preprints that may not yet be indexed."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "keywords": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Search keywords"
-            },
-            "category": {
-                "type": "string",
-                "description": "Optional bioRxiv category (e.g. 'neuroscience', 'cell_biology')",
-                "default": ""
-            }
-        },
-        "required": ["keywords"]
-    }
-}
 
-BIORXIV_FETCH_TOOL = {
-    "name": "fetch_biorxiv_preprint",
-    "description": (
-        "Fetch full metadata for a specific bioRxiv or medRxiv preprint by its DOI "
-        "(e.g. '10.1101/2024.01.15.123456'). Returns title, authors, year, abstract, DOI."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "doi": {
-                "type": "string",
-                "description": "The DOI of the preprint",
-            },
-        },
-        "required": ["doi"],
-    },
-}
+def cap_suggested_confidence(evidence: EvidenceRecord) -> None:
+    """An unresolved, ambiguous, or unscored author suggestion is never HIGH.
 
-EUROPEPMC_TOOL = {
-    "name": "search_europepmc",
-    "description": (
-        "Search Europe PMC for articles and preprints. Europe PMC indexes PubMed, "
-        "PMC full-text articles, and preprints. Supports full-text keyword search "
-        "and returns full metadata (PMID, DOI, title, authors, abstract) in one call. "
-        "Use this to supplement PubMed results or to find articles not yet in PubMed. "
-        "Example: 'CRISPR base editing liver disease therapy'"
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query (free text or Europe PMC query syntax)"
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results to return (default 20)",
-                "default": 20
-            }
-        },
-        "required": ["query"]
-    }
-}
+    Applied when the evaluation is built and again after the independent
+    verifier (which may raise the level on the papers it could check).
+    """
+    if evidence.confidence_level == ConfidenceLevel.HIGH and any(
+            w.code in _NOT_HIGH_WARNINGS for w in evidence.warnings):
+        evidence.confidence_level = ConfidenceLevel.MEDIUM
 
-EUROPEPMC_FETCH_TOOL = {
-    "name": "fetch_europepmc_article",
-    "description": (
-        "Fetch a single article from Europe PMC by DOI or PMID when you have a "
-        "specific identifier and need the full metadata."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "doi": {"type": "string", "description": "Article DOI (optional if pmid is given)", "default": ""},
-            "pmid": {"type": "string", "description": "PubMed ID (optional if doi is given)", "default": ""},
-        },
-        "required": [],
-    },
-}
+
+_SELF_REFERENCE = re.compile(
+    r'\b(our|we|our lab|our group|our previous|our prior|our recent|'
+    r'our earlier|our extensive|we previously|we have shown|'
+    r'we developed|we reported)\b', re.IGNORECASE
+)
 
 
 class LLMCitationAgent:
@@ -334,37 +183,45 @@ class LLMCitationAgent:
         max_refs: int = 3,
         orcid_id: Optional[str] = None,
         log_callback: Optional[Callable[[str, str], None]] = None,
+        client=None,
+        prefer_reviews: bool = False,
+        recency_bias: bool = True,
+        use_full_text: bool = True,
     ):
-        self.client = anthropic.Anthropic(api_key=anthropic_api_key)
+        if client is None:
+            client = make_client(anthropic_api_key)
+        self.client = client
         self.model = model
+        self.caller = ClaudeCaller(client, model, log=log_callback)
         self.pubmed = pubmed_client
         self.biorxiv = biorxiv_client
         self.europepmc = europepmc_client
         self.reference_library = reference_library
         self.search_biorxiv = search_biorxiv and biorxiv_client is not None
         self.search_europepmc = search_europepmc and europepmc_client is not None
+        self.use_full_text = use_full_text and self.search_europepmc
         self.prefer_user_library = prefer_user_library
         self.max_library_results = max(3, min(max_library_results, 50))
         self.max_refs = max_refs
         self.orcid_id = orcid_id
+        self.preferences = build_preference_text(prefer_reviews, recency_bias)
         self._log = log_callback or (lambda *a: None)
 
-        # Build tool list
-        self.tools = list(TOOLS)
-        if self.reference_library:
-            self.tools.insert(0, USER_LIBRARY_TOOL)
-        if self.search_biorxiv:
-            self.tools.append(BIORXIV_TOOL)
-            self.tools.append(BIORXIV_FETCH_TOOL)
-        if self.search_europepmc:
-            self.tools.append(EUROPEPMC_TOOL)
-            self.tools.append(EUROPEPMC_FETCH_TOOL)
+        self.tools = self._tool_list(SUBMIT_CITATIONS)
+        self.suggested_tools = self._tool_list(SUBMIT_SUGGESTED_EVALUATION)
+
+    def _tool_list(self, final_tool: dict) -> list[dict]:
+        return build_tool_list(
+            user_library=self.reference_library is not None,
+            biorxiv=self.search_biorxiv,
+            europepmc=self.search_europepmc,
+            fulltext=self.use_full_text,
+            final_tool=final_tool,
+        )
 
     def _emit(self, level: str, msg: str):
         getattr(logger, level, logger.info)(msg)
         self._log(level, msg)
-
-    # ── Shared helpers ──────────────────────────────────────────────
 
     def _make_executor(self, all_candidates: dict[str, CitationCandidate]) -> ToolExecutor:
         return ToolExecutor(
@@ -376,192 +233,161 @@ class LLMCitationAgent:
             status_callback=lambda msg: self._emit("info", f"    {msg}"),
         )
 
-    def _context_notes(self, sentence: SentenceRecord, domain_context: list[str] = None) -> str:
-        """Domain / library / ORCID hints appended to the user message."""
-        notes = ""
+    # ── prompt assembly ──────────────────────────────────────────────
+
+    def _extra_instructions(self, context: ClaimContext, domain_context: list[str] = None) -> str:
+        parts = []
         if domain_context:
-            notes += f"\nDocument research domains: {', '.join(domain_context)}"
+            parts.append(f"Document research domains: {', '.join(domain_context)}")
 
         if self.reference_library:
             if self.prefer_user_library:
-                notes += (
-                    "\nA user reference library is available. You should search it first "
+                parts.append(
+                    "A user reference library is available. You should search it first "
                     f"and prefer those papers when relevance is comparable. Use "
                     f"`max_results={self.max_library_results}` when calling search_user_library."
                 )
             else:
-                notes += (
-                    "\nA user reference library is available; search it first, then balance "
+                parts.append(
+                    "A user reference library is available; search it first, then balance "
                     f"against external literature. Use `max_results={self.max_library_results}` "
                     "when calling search_user_library."
                 )
 
         # Detect self-referencing language (our, we, our lab, etc.)
-        if self.orcid_id:
-            self_ref_patterns = re.compile(
-                r'\b(our|we|our lab|our group|our previous|our prior|our recent|'
-                r'our earlier|our extensive|we previously|we have shown|'
-                r'we developed|we reported)\b', re.IGNORECASE
+        if self.orcid_id and _SELF_REFERENCE.search(f"{context.claim} {context.paragraph}"):
+            parts.append(
+                f"IMPORTANT: This sentence references the document author's OWN work. "
+                f"The author's ORCID is {self.orcid_id}. "
+                f"Search PubMed using the author's ORCID: {self.orcid_id}[auid] "
+                f"combined with relevant topic keywords. This will help find the "
+                f"correct self-cited paper."
             )
-            if self_ref_patterns.search(sentence.clean_text):
-                notes += (
-                    f"\nIMPORTANT: This sentence references the document author's OWN work. "
-                    f"The author's ORCID is {self.orcid_id}. "
-                    f"Search PubMed using the author's ORCID: {self.orcid_id}[auid] "
-                    f"combined with relevant topic keywords. This will help find the "
-                    f"correct self-cited paper."
-                )
-        return notes
+        return "\n".join(parts)
 
-    def _run_agent_loop(
+    def _user_message(self, context: ClaimContext, num_refs: int,
+                      domain_context: list[str] = None) -> str:
+        return context.to_agent_message(num_refs, self._extra_instructions(context, domain_context))
+
+    # ── agent loop ───────────────────────────────────────────────────
+
+    def _run_loop(
         self,
         system: str,
         messages: list[dict],
+        tools: list[dict],
+        final_tool: dict,
         executor: ToolExecutor,
         all_candidates: dict[str, CitationCandidate],
         queries_used: list[str],
-    ) -> Optional[str]:
-        """Run the tool-use loop and return Claude's final text answer.
+    ) -> Optional[dict]:
+        """Run the tool-use loop until *final_tool* is called.
 
-        Returns None when the round limit was hit and even the forced final
-        answer failed.  API errors propagate to the caller.
+        Returns the final tool's input, or None when the model still had
+        not called it after the deadline call (the only tool offered then is
+        the final one). API errors propagate to the caller.
         """
+        name = final_tool["name"]
         for round_num in range(MAX_AGENT_ROUNDS):
             self._emit("info", f"    Agent round {round_num + 1}...")
+            response = self.caller.create(system=system, messages=messages, tools=tools)
 
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system,
-                tools=self.tools,
-                messages=messages,
-            )
+            submit = find_tool_use(response, name)
+            if submit is not None:
+                return dict(submit.input or {})
 
             if response.stop_reason == "tool_use":
                 tool_results = []
                 for block in response.content:
-                    if block.type == "tool_use":
-                        tool_result = executor.execute(block.name, block.input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": tool_result,
-                        })
-                        if block.name in ("search_pubmed", "search_europepmc"):
-                            queries_used.append(block.input.get("query", ""))
-
-                messages.append({"role": "assistant", "content": response.content})
-
-                # Inject deadline nudge after round 3 to prevent endless searching
-                remaining = MAX_AGENT_ROUNDS - round_num - 1
-                if round_num >= 3 and remaining <= 3:
+                    if block.type != "tool_use":
+                        continue
+                    result = executor.execute(block.name, block.input)
                     tool_results.append({
-                        "type": "text",
-                        "text": (
-                            f"[SYSTEM: You have {remaining} round(s) left. "
-                            "You MUST return your final JSON answer now. "
-                            "Select the best match from what you have found so far, "
-                            "even if it is not perfect. Do NOT call any more tools. "
-                            "Respond with ONLY the JSON object.]"
-                        ),
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
                     })
+                    if block.name == "search_pubmed":
+                        queries_used.append(block.input.get("query", ""))
+                messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
 
             elif response.stop_reason == "end_turn":
-                text = "".join(
-                    block.text for block in response.content if hasattr(block, "text")
-                )
-                self._emit("debug", f"    Raw final response ({len(text)} chars): {text[:300]}")
-                return text
-
+                # Prose instead of the tool: ask for the tool call.
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": (
+                    f"Call {name} now with your selection. "
+                    "Do not answer in text."
+                )})
             else:
                 self._emit("warning", f"    Unexpected stop_reason: {response.stop_reason}")
                 break
 
-        # Hit max rounds — force one final answer from Claude
+        # Deadline: one more call where the only tool is the final one.
         self._emit("warning", f"    Hit max rounds ({MAX_AGENT_ROUNDS}), forcing final answer...")
-        try:
-            seen_summary = []
-            for key, cand in list(all_candidates.items())[:20]:
-                ident = f"PMID {cand.pmid}" if cand.pmid else f"DOI {cand.doi}" if cand.doi else key
-                seen_summary.append(f"- {ident}: {cand.title} ({cand.year})")
-            summary_text = "\n".join(seen_summary) if seen_summary else "(no articles fetched)"
-
-            messages.append({"role": "user", "content": (
-                f"DEADLINE REACHED. You must answer NOW.\n\n"
-                f"Articles you have seen:\n{summary_text}\n\n"
-                f"Select the best match(es) from the articles above and return "
-                f"your JSON answer immediately. If none are relevant, return "
-                f'an empty "selected" list. Respond with ONLY the JSON object.'
-            )})
-
-            final_response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system,
-                tools=[],  # No tools — force text-only response
-                messages=messages,
-            )
-            final_text = "".join(
-                block.text for block in final_response.content if hasattr(block, "text")
-            )
-            if final_text.strip():
-                self._emit("debug", f"    Forced final response: {final_text[:200]}")
-                return final_text
-        except Exception as e:
-            self._emit("warning", f"    Forced final answer failed: {e}")
+        seen_summary = []
+        for key, cand in list(all_candidates.items())[:20]:
+            ident = f"PMID {cand.pmid}" if cand.pmid else (f"DOI {cand.doi}" if cand.doi else key)
+            seen_summary.append(f"- {ident}: {cand.title} ({cand.year})")
+        summary_text = "\n".join(seen_summary) if seen_summary else "(no articles fetched)"
+        messages.append({"role": "user", "content": (
+            f"DEADLINE REACHED. You must answer NOW by calling {name}.\n\n"
+            f"Articles you have seen:\n{summary_text}\n\n"
+            f"Select the best match(es) from the articles above. If none are "
+            f"relevant, submit an empty \"selected\" list."
+        )})
+        response = self.caller.create(
+            system=system, messages=messages,
+            tools=build_tool_list(final_tool=final_tool)[-1:],
+        )
+        submit = find_tool_use(response, name)
+        if submit is not None:
+            return dict(submit.input or {})
         return None
-
-    # ── (REF) / (REFS): search for citations ────────────────────────
 
     def find_citations(
         self,
         sentence: SentenceRecord,
         domain_context: list[str] = None,
+        context: Optional[ClaimContext] = None,
     ) -> EvidenceRecord:
-        """Run the agent loop for a single sentence. Returns an EvidenceRecord."""
+        """Run the agent loop for a single sentence. Returns an EvidenceRecord.
+
+        ``context`` carries the section, neighbouring sentences and, for a
+        multi-marker sentence, the sub-claim and exclusions; without it the
+        bare sentence is used.
+        """
+        if context is None:
+            context = bare_context(sentence)
         marker_type = sentence.marker_type or MarkerType.REF
-        # Multi-marker sentences are handled by the orchestrator, which calls
+        # Multi-(REF) sentences are handled by the orchestrator, which calls
         # find_citations once per marker with marker_count=1.
-        if marker_type == MarkerType.REFS:
-            num_refs = self.max_refs
-        else:
-            num_refs = 1
+        num_refs = self.max_refs if marker_type == MarkerType.REFS else 1
 
-        system = SYSTEM_PROMPT.format(max_refs=num_refs, max_rounds=MAX_AGENT_ROUNDS)
+        system = SYSTEM_PROMPT.format(max_refs=num_refs, max_rounds=MAX_AGENT_ROUNDS,
+                                      preferences=self.preferences)
+        messages = [{"role": "user", "content": self._user_message(context, num_refs, domain_context)}]
 
-        user_message = (
-            f"Find {'1 reference' if num_refs == 1 else f'{num_refs} references'} "
-            f"that support this claim:\n\n"
-            f"\"{sentence.clean_text}\"{self._context_notes(sentence, domain_context)}"
-        )
-        messages = [{"role": "user", "content": user_message}]
-
+        # Track all candidates seen across rounds
         all_pmids_seen: dict[str, CitationCandidate] = {}
         queries_used: list[str] = []
         executor = self._make_executor(all_pmids_seen)
         evidence = EvidenceRecord(sentence_id=sentence.id)
 
         try:
-            text = self._run_agent_loop(system, messages, executor, all_pmids_seen, queries_used)
-            if text is not None:
-                evidence = self._parse_response(text, sentence, all_pmids_seen, queries_used)
-                self._emit(
-                    "info",
-                    f"    Result: {len(evidence.selected)} ref(s), "
-                    f"confidence={evidence.confidence_level.value}"
-                )
-                return evidence
+            data = self._run_loop(system, messages, self.tools, SUBMIT_CITATIONS,
+                                  executor, all_pmids_seen, queries_used)
+            if data is not None:
+                return self._finish(data, sentence, all_pmids_seen, queries_used)
 
-            # True fallback if forced answer also fails
+            # The model still did not submit: record what we have.
             evidence.candidates = list(all_pmids_seen.values())
             evidence.search_query = " | ".join(queries_used)
             evidence.confidence_level = ConfidenceLevel.LOW
             evidence.confidence_rationale = (
-                f"Agent hit {MAX_AGENT_ROUNDS}-round limit without completing"
+                f"Agent hit {MAX_AGENT_ROUNDS}-round limit without submitting a selection"
             )
-            if not evidence.selected:
-                evidence.retrieval_error = "AI agent found no supporting citations"
+            evidence.retrieval_error = "AI agent found no supporting citations"
             return evidence
 
         except anthropic.AuthenticationError as e:
@@ -579,6 +405,107 @@ class LLMCitationAgent:
             evidence.confidence_level = ConfidenceLevel.UNRESOLVED
             return evidence
 
+    def _finish(self, data: dict, sentence: SentenceRecord,
+                all_candidates: dict[str, CitationCandidate], queries_used: list[str]) -> EvidenceRecord:
+        evidence = self._parse_submission(data, sentence, all_candidates, queries_used)
+        self._emit(
+            "info",
+            f"    Result: {len(evidence.selected)} ref(s), "
+            f"confidence={evidence.confidence_level.value}"
+        )
+        return evidence
+
+    def _parse_submission(
+        self,
+        data: dict,
+        sentence: SentenceRecord,
+        all_candidates: dict[str, CitationCandidate],
+        queries_used: list[str],
+    ) -> EvidenceRecord:
+        """Turn the submit_citations tool input into an EvidenceRecord."""
+        evidence = EvidenceRecord(sentence_id=sentence.id)
+        data = data or {}
+
+        # Selected citations — support both PMID and DOI keys
+        selected_keys = []
+        for sel in data.get("selected", []) or []:
+            if not isinstance(sel, dict):
+                continue
+            pmid = str(sel.get("pmid", "") or "").strip()
+            doi = str(sel.get("doi", "") or "").strip()
+            title = str(sel.get("title", "") or "").strip()
+            if pmid:
+                selected_keys.append(pmid)
+            elif doi:
+                selected_keys.append(doi)
+            elif title:
+                selected_keys.append(title)
+
+        # Fetch any selected PMIDs we haven't seen yet (DOIs are already tracked)
+        missing_pmids = [k for k in selected_keys if k not in all_candidates and k.isdigit()]
+        if missing_pmids:
+            for a in self.pubmed.fetch_articles(missing_pmids):
+                all_candidates[a.pmid] = a
+
+        evidence.selected = [all_candidates[k] for k in selected_keys if k in all_candidates]
+        self._apply_common_fields(evidence, data, all_candidates, queries_used)
+        return evidence
+
+    def _apply_common_fields(
+        self,
+        evidence: EvidenceRecord,
+        data: dict,
+        all_candidates: dict[str, CitationCandidate],
+        queries_used: list[str],
+    ) -> None:
+        """Confidence, verification, snippets, queries and candidate list."""
+        # All candidates considered (PMIDs and DOIs)
+        considered = data.get("all_pmids_considered", []) or []
+        if not isinstance(considered, list):
+            considered = []
+        for p in considered:
+            p = str(p)
+            if p not in all_candidates and p.isdigit():
+                for a in self.pubmed.fetch_articles([p]):
+                    all_candidates[a.pmid] = a
+        evidence.candidates = list(all_candidates.values())
+
+        conf_map = {
+            "HIGH": ConfidenceLevel.HIGH,
+            "MEDIUM": ConfidenceLevel.MEDIUM,
+            "LOW": ConfidenceLevel.LOW,
+        }
+        evidence.confidence_level = conf_map.get(str(data.get("confidence", "LOW")).upper(),
+                                                 ConfidenceLevel.LOW)
+        try:
+            evidence.confidence_score = float(data.get("confidence_score", 0))
+        except (TypeError, ValueError):
+            evidence.confidence_score = 0.0
+        evidence.confidence_rationale = str(data.get("confidence_rationale", "") or "")
+
+        # Verification (the agent's own view; the verifier may override it)
+        ver_map = {
+            "verified": VerificationStatus.VERIFIED,
+            "partial": VerificationStatus.PARTIAL,
+            "indirect": VerificationStatus.INDIRECT,
+            "weak": VerificationStatus.WEAK,
+        }
+        evidence.verification_status = ver_map.get(
+            str(data.get("verification_status", "not_checked")).lower(),
+            VerificationStatus.NOT_CHECKED,
+        )
+
+        # Snippets and queries
+        snippets = data.get("supporting_snippets", []) or []
+        if not isinstance(snippets, list):
+            snippets = [snippets]
+        evidence.abstract_snippets = [str(s) for s in snippets if s]
+        queries = data.get("search_queries_used", []) or []
+        if not isinstance(queries, list):
+            queries = [queries]
+        evidence.search_query = " | ".join([str(q) for q in queries if q] or queries_used)
+        evidence.search_result_count = len(all_candidates)
+
     # ── Author-suggested citations: verify and score ────────────────
 
     def evaluate_suggested(
@@ -587,7 +514,7 @@ class LLMCitationAgent:
         marker: MarkerSpec,
         resolved: list[ResolvedSuggestion],
         domain_context: list[str] = None,
-        context_text: str = "",
+        context: Optional[ClaimContext] = None,
     ) -> EvidenceRecord:
         """Confirm the author's suggested citation(s) for one marker and score them.
 
@@ -596,8 +523,11 @@ class LLMCitationAgent:
             marker: the suggested marker (its ``suggestions`` drive the prompt).
             resolved: resolver output, one entry per suggestion, same order.
             domain_context: inferred document domains.
-            context_text: full sentence when the claim is a sub-clause of it.
+            context: section / neighbouring sentences and, for a sentence with
+                several markers, the sub-claim this marker belongs to.
         """
+        if context is None:
+            context = bare_context(sentence)
         extra_refs = self._extra_search_count(marker)
         extra_rule = ""
         if extra_refs:
@@ -609,6 +539,7 @@ class LLMCitationAgent:
             )
         system = SUGGESTED_SYSTEM_PROMPT.format(
             max_rounds=MAX_AGENT_ROUNDS, extra_search_rule=extra_rule,
+            preferences=self.preferences,
         )
 
         # Pre-load the resolved records so the agent's identifiers resolve later.
@@ -619,31 +550,20 @@ class LLMCitationAgent:
                 if key and key not in all_candidates:
                     all_candidates[key] = cand
 
-        user_message = self._build_suggested_message(
-            sentence, marker, resolved, domain_context, context_text,
-        )
-        messages = [{"role": "user", "content": user_message}]
+        messages = [{"role": "user", "content": self._build_suggested_message(
+            context, marker, resolved, domain_context)}]
         queries_used: list[str] = []
         executor = self._make_executor(all_candidates)
 
         try:
-            text = self._run_agent_loop(system, messages, executor, all_candidates, queries_used)
-            if text is None:
+            data = self._run_loop(system, messages, self.suggested_tools,
+                                  SUBMIT_SUGGESTED_EVALUATION, executor, all_candidates,
+                                  queries_used)
+            if data is None:
                 self._emit("warning", "    Agent did not answer; using resolved records directly")
                 return self._fallback_from_resolved(
                     sentence, marker, resolved, all_candidates,
                     "AI evaluation did not complete; citation resolved by identifier only",
-                )
-            try:
-                data = extract_json(text)
-                if not isinstance(data, dict):
-                    raise ValueError("response is not a JSON object")
-            except (json.JSONDecodeError, ValueError) as e:
-                self._emit("error", f"    Failed to parse agent response: {e}")
-                self._emit("debug", f"    Raw response: {text[:500]}")
-                return self._fallback_from_resolved(
-                    sentence, marker, resolved, all_candidates,
-                    f"AI response could not be parsed ({e}); citation resolved by identifier only",
                 )
             evidence = self._evidence_from_suggested_data(
                 data, sentence, marker, resolved, all_candidates, queries_used,
@@ -677,21 +597,25 @@ class LLMCitationAgent:
 
     def _build_suggested_message(
         self,
-        sentence: SentenceRecord,
+        context: ClaimContext,
         marker: MarkerSpec,
         resolved: list[ResolvedSuggestion],
         domain_context: list[str],
-        context_text: str,
     ) -> str:
-        lines = [f'Claim: "{sentence.clean_text}"']
-        if context_text and context_text.strip() != sentence.clean_text.strip():
-            lines.append(f'Full sentence for context: "{context_text}"')
-        notes = self._context_notes(sentence, domain_context)
-        if notes:
-            lines.append(notes.strip())
-        lines.append("")
-        lines.append(f"The author wrote the marker {marker.text} here. Suggested references:")
-        lines.append("")
+        lines = ["CLAIM — the author cites the reference(s) below for this sentence:",
+                 f'"{context.claim}"']
+        if context.sub_claim:
+            line = f'Specifically the part ending at the marker {marker.text}: "{context.sub_claim}"'
+            if context.trailing:
+                line += f' (followed by: "{context.trailing[:80]}")'
+            lines.append(line)
+        block = context.to_context_block()
+        if block:
+            lines += ["", block]
+        extras = self._extra_instructions(context, domain_context)
+        if extras:
+            lines += ["", extras]
+        lines += ["", f"The author wrote the marker {marker.text} here. Suggested references:", ""]
 
         for i, r in enumerate(resolved, 1):
             s = r.suggestion
@@ -717,11 +641,11 @@ class LLMCitationAgent:
                     "keywords if none of these fits."
                 )
                 for cand in r.candidates:
-                    lines.append("    - " + json.dumps(_article_summary(cand), ensure_ascii=False))
+                    lines.append("    - " + _json(_article_summary(cand)))
             else:
                 cand = r.candidates[0]
                 lines.append(f"    Resolved via {r.source or 'lookup'}: "
-                             + json.dumps(_article_summary(cand, include_mesh=True), ensure_ascii=False))
+                             + _json(_article_summary(cand, include_mesh=True)))
                 if cand.is_retracted:
                     lines.append("    WARNING: this record is flagged as RETRACTED.")
             lines.append("")
@@ -732,45 +656,11 @@ class LLMCitationAgent:
                 f"The author also asked for {extra} additional supporting reference(s); "
                 f"search for them and include them with \"suggestion\": \"REF\"."
             )
-        lines.append("Evaluate the suggested reference(s) against the claim and answer with the JSON object.")
+        lines.append("Evaluate the suggested reference(s) against the claim and call "
+                     "submit_suggested_evaluation.")
         return "\n".join(lines)
 
-    # ── Response parsing ────────────────────────────────────────────
-
-    def _parse_response(
-        self,
-        text: str,
-        sentence: SentenceRecord,
-        all_candidates: dict[str, CitationCandidate],
-        queries_used: list[str],
-    ) -> EvidenceRecord:
-        """Parse Claude's final JSON response into an EvidenceRecord."""
-        evidence = EvidenceRecord(sentence_id=sentence.id)
-
-        try:
-            data = extract_json(text)
-            if not isinstance(data, dict):
-                raise ValueError("response is not a JSON object")
-        except (json.JSONDecodeError, ValueError) as e:
-            self._emit("error", f"    Failed to parse agent response: {e}")
-            self._emit("debug", f"    Raw response: {text[:500]}")
-            evidence.retrieval_error = f"Failed to parse agent response: {e}"
-            evidence.confidence_level = ConfidenceLevel.UNRESOLVED
-            evidence.candidates = list(all_candidates.values())
-            evidence.search_query = " | ".join(queries_used)
-            return evidence
-
-        # Selected citations — support both PMID and DOI keys
-        raw_selected = data.get("selected") or []
-        if not isinstance(raw_selected, list):
-            raw_selected = []
-        evidence.selected = [
-            cand for cand in (
-                self._lookup_selection(sel, all_candidates) for sel in raw_selected
-            ) if cand is not None
-        ]
-        self._apply_common_fields(evidence, data, all_candidates, queries_used)
-        return evidence
+    # ── Response parsing (suggested markers) ────────────────────────
 
     def _lookup_selection(
         self, sel: dict, all_candidates: dict[str, CitationCandidate],
@@ -793,68 +683,13 @@ class LLMCitationAgent:
         if title and title.lower() in by_title:
             return by_title[title.lower()]
         if pmid and pmid.isdigit():
-            fetched = self.pubmed.fetch_articles([pmid])
-            for a in fetched:
+            for a in self.pubmed.fetch_articles([pmid]):
                 all_candidates[a.pmid] = a
                 return a
-        if pmid and pmid in all_candidates:
-            return all_candidates[pmid]
-        if doi and doi in all_candidates:
-            return all_candidates[doi]
-        if title and title in all_candidates:
-            return all_candidates[title]
+        for key in (pmid, doi, title):
+            if key and key in all_candidates:
+                return all_candidates[key]
         return None
-
-    def _apply_common_fields(
-        self,
-        evidence: EvidenceRecord,
-        data: dict,
-        all_candidates: dict[str, CitationCandidate],
-        queries_used: list[str],
-    ):
-        """Confidence, verification, snippets, queries and candidate list."""
-        considered_ids = data.get("all_pmids_considered") or []
-        if not isinstance(considered_ids, list):
-            considered_ids = []
-        for p in considered_ids:
-            p = str(p)
-            if p.isdigit() and p not in all_candidates:
-                fetched = self.pubmed.fetch_articles([p])
-                for a in fetched:
-                    all_candidates[a.pmid] = a
-        evidence.candidates = list(all_candidates.values())
-
-        conf_str = str(data.get("confidence", "LOW")).upper()
-        conf_map = {
-            "HIGH": ConfidenceLevel.HIGH,
-            "MEDIUM": ConfidenceLevel.MEDIUM,
-            "LOW": ConfidenceLevel.LOW,
-        }
-        evidence.confidence_level = conf_map.get(conf_str, ConfidenceLevel.LOW)
-        try:
-            evidence.confidence_score = float(data.get("confidence_score", 0))
-        except (TypeError, ValueError):
-            evidence.confidence_score = 0.0
-        evidence.confidence_rationale = str(data.get("confidence_rationale", "") or "")
-
-        ver_str = str(data.get("verification_status", "not_checked")).lower()
-        ver_map = {
-            "verified": VerificationStatus.VERIFIED,
-            "partial": VerificationStatus.PARTIAL,
-            "indirect": VerificationStatus.INDIRECT,
-            "weak": VerificationStatus.WEAK,
-        }
-        evidence.verification_status = ver_map.get(ver_str, VerificationStatus.NOT_CHECKED)
-
-        snippets = data.get("supporting_snippets") or []
-        if not isinstance(snippets, list):
-            snippets = [snippets]
-        evidence.abstract_snippets = [str(s) for s in snippets if s]
-        queries = data.get("search_queries_used") or queries_used
-        if not isinstance(queries, list):
-            queries = [queries]
-        evidence.search_query = " | ".join(str(q) for q in queries if q)
-        evidence.search_result_count = len(all_candidates)
 
     def _evidence_from_suggested_data(
         self,
@@ -865,7 +700,7 @@ class LLMCitationAgent:
         all_candidates: dict[str, CitationCandidate],
         queries_used: list[str],
     ) -> EvidenceRecord:
-        """Turn the agent's JSON for a suggested marker into an EvidenceRecord.
+        """Turn the submit_suggested_evaluation input into an EvidenceRecord.
 
         The author's suggestions define the slots: one selected citation per
         suggestion (in marker order), followed by any extra (REF) searches.
@@ -873,6 +708,7 @@ class LLMCitationAgent:
         the agent cannot silently substitute a different paper.
         """
         evidence = EvidenceRecord(sentence_id=sentence.id)
+        data = data or {}
         raw_selected = data.get("selected") or []
         entries = [e for e in raw_selected if isinstance(e, dict)] if isinstance(raw_selected, list) else []
 
@@ -1036,12 +872,11 @@ class LLMCitationAgent:
             key = candidate_key(cand)
             if key and key not in all_candidates:
                 all_candidates[key] = cand
-            ident = f"PMID {cand.pmid}" if cand.pmid else (f"doi:{cand.doi}" if cand.doi else "")
             evidence.warnings.append(Warning(
                 code="suggested_alternative",
                 message=(
                     f"The AI suggests an alternative citation: \"{cand.title[:70]}\" "
-                    f"{ident}. {str(alt.get('why', '') or '').strip()}"
+                    f"{self._ident(cand)}. {str(alt.get('why', '') or '').strip()}"
                 ).strip(),
                 severity="low",
             ))
@@ -1054,19 +889,10 @@ class LLMCitationAgent:
                 "None of the author-suggested citations could be resolved"
                 if resolved else "No citation could be confirmed for this marker"
             )
-        elif evidence.confidence_level == ConfidenceLevel.HIGH and any(
-            w.code in ("suggested_unresolved", "suggested_ambiguous", "suggested_unscored")
-            for w in evidence.warnings
-        ):
-            # An unresolved, ambiguous, or unscored suggestion is never HIGH confidence
-            evidence.confidence_level = ConfidenceLevel.MEDIUM
+        cap_suggested_confidence(evidence)
         return evidence
 
     # ── Suggested-citation helpers ──────────────────────────────────
-
-    @staticmethod
-    def _unresolved_count(evidence: EvidenceRecord) -> int:
-        return sum(1 for w in evidence.warnings if w.code == "suggested_unresolved")
 
     @staticmethod
     def _entry_score(entry: Optional[dict]) -> Optional[float]:
@@ -1115,7 +941,9 @@ class LLMCitationAgent:
         if s.kind == SuggestionKind.PMCID:
             return bool(cand.pmcid) and cand.pmcid.strip().upper() == s.value.upper()
         if s.kind == SuggestionKind.DOI:
-            norm = lambda d: re.sub(r"^https?://(?:dx\.)?doi\.org/", "", (d or "").strip(), flags=re.I).lower().rstrip(".")
+            def norm(d: str) -> str:
+                d = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", (d or "").strip(), flags=re.I)
+                return d.lower().rstrip(".")
             return bool(cand.doi) and norm(cand.doi) == norm(s.value)
         return False
 
@@ -1229,3 +1057,8 @@ class LLMCitationAgent:
         if not evidence.selected:
             evidence.retrieval_error = reason
         return evidence
+
+
+def _json(obj) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False)

@@ -4,6 +4,19 @@ import sys
 import os
 import logging
 
+# Corporate TLS-inspection compatibility (e.g., Zscaler, Netskope, Palo Alto).
+# Delegate TLS trust to the OS keychain instead of certifi's bundled CA list.
+# This handles corporate-MITM root certs even when they have non-strict X509v3
+# extensions (e.g., Zscaler's Root CA has Basic Constraints not marked
+# critical, which Python 3.13 + OpenSSL 3.x refuses to trust by default).
+# Must run BEFORE any module imports `ssl` / `httpx` / `requests` / `anthropic`.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    # truststore is optional; fall back to certifi if unavailable
+    pass
+
 # When running as a frozen PyInstaller bundle, the 'src' package isn't on
 # sys.path and relative imports fail.  Fix that before importing anything
 # from the project.

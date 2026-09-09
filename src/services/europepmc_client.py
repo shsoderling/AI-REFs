@@ -11,16 +11,30 @@ import time
 import json
 import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
 from ..models.citation import CitationCandidate, Author
 from ..storage.cache_db import CacheDB
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
-EUROPEPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+EUROPEPMC_REST_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+EUROPEPMC_SEARCH_URL = f"{EUROPEPMC_REST_BASE}/search"
+
+FULLTEXT_UNAVAILABLE = {"unavailable": True}
+
+
+def normalize_pmcid(pmcid: str) -> str:
+    """'pmc123', ' PMC123 ' or '123' -> 'PMC123'; '' when empty."""
+    value = (pmcid or "").strip().upper()
+    if not value:
+        return ""
+    if not value.startswith("PMC"):
+        value = "PMC" + value
+    return value
 
 
 class EuropePMCClient:
@@ -33,27 +47,29 @@ class EuropePMCClient:
         """
         self.cache = cache_db or CacheDB()
         self._session = requests.Session()
-        self._last_request_time = 0.0
         self._min_interval = 0.5  # Conservative rate limiting
         self._max_retries = 3
+        self._limiter = RateLimiter(self._min_interval)
 
     def _rate_limit(self):
-        """Enforce rate limiting between requests."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce rate limiting between requests (shared across threads)."""
+        self._limiter.wait(self._min_interval)
 
-    def _request(self, params: dict) -> Optional[dict]:
-        """Make a GET request with rate limiting and retry. Returns parsed JSON."""
+    def _request(self, params: dict, url: str = EUROPEPMC_SEARCH_URL,
+                 raw: bool = False) -> Optional[Any]:
+        """GET with rate limiting and retry.
+
+        Returns parsed JSON, or the response text when ``raw``; ``None`` on
+        failure.  A 404 (no such record) returns ``None`` without retrying.
+        """
         for attempt in range(self._max_retries):
             self._rate_limit()
             try:
-                resp = self._session.get(
-                    EUROPEPMC_SEARCH_URL, params=params, timeout=30
-                )
+                resp = self._session.get(url, params=params, timeout=30)
                 if resp.status_code == 200:
-                    return resp.json()
+                    return resp.text if raw else resp.json()
+                elif resp.status_code == 404:
+                    return None
                 elif resp.status_code == 429:
                     wait = 2 ** attempt
                     logger.warning(f"Europe PMC rate limited (429), waiting {wait}s")
@@ -218,7 +234,6 @@ class EuropePMCClient:
 
         # PMID / PMCID
         pmid = str(result.get("pmid", "")) if result.get("pmid") else ""
-        pmcid = str(result.get("pmcid", "")) if result.get("pmcid") else ""
 
         # DOI
         doi = result.get("doi", "") or ""
@@ -276,6 +291,10 @@ class EuropePMCClient:
         pub_type_list = result.get("pubTypeList", {}).get("pubType", [])
         is_review = "review" in [pt.lower() for pt in pub_type_list] if pub_type_list else False
 
+        # Full-text availability
+        pmcid = normalize_pmcid(str(result.get("pmcid", "") or ""))
+        is_open_access = str(result.get("isOpenAccess", "")).upper() == "Y"
+
         return CitationCandidate(
             pmid=pmid,
             pmcid=pmcid,
@@ -294,7 +313,38 @@ class EuropePMCClient:
             publication_types=publication_types,
             is_retracted=False,
             is_review=is_review,
+            is_open_access=is_open_access,
         )
+
+    # ── Full text (open-access PMC articles) ──────────────────────
+
+    def fetch_full_text(self, pmcid: str) -> Optional[list[tuple[str, str]]]:
+        """Body paragraphs of an open-access article as (section, paragraph).
+
+        Returns ``None`` when Europe PMC has no full text for the PMC id.
+        Results (and misses) are cached for the cache TTL.
+        """
+        from .jats import parse_jats_body
+
+        pmcid = normalize_pmcid(pmcid)
+        if not pmcid:
+            return None
+        cache_key = f"europepmc:fulltext:{pmcid}"
+        cached = self.cache.get_article(cache_key)
+        if cached is not None:
+            if cached.get("unavailable"):
+                return None
+            return [tuple(p) for p in cached.get("paragraphs", [])]
+
+        xml_text = self._request({}, url=f"{EUROPEPMC_REST_BASE}/{pmcid}/fullTextXML", raw=True)
+        paragraphs = parse_jats_body(xml_text) if xml_text else []
+        if not paragraphs:
+            self.cache.put_article(cache_key, FULLTEXT_UNAVAILABLE)
+            logger.info(f"Europe PMC full text: none for {pmcid}")
+            return None
+        self.cache.put_article(cache_key, {"paragraphs": [list(p) for p in paragraphs]})
+        logger.info(f"Europe PMC full text: {len(paragraphs)} paragraphs for {pmcid}")
+        return paragraphs
 
     def _parse_authors(self, result: dict) -> list[Author]:
         """Parse authors from Europe PMC result.

@@ -5,25 +5,30 @@ Can run headlessly or emit Qt signals for GUI progress updates.
 
 import json
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional, Callable
 
 from ..models.project import ProjectState, PipelineStage
-from ..models.sentence import SentenceRecord, MarkerType
+from ..models.embedded import DocumentTier
 from ..models.markers import MarkerSpec
+from ..models.sentence import SentenceRecord, MarkerType
 from ..models.evidence import EvidenceRecord, ConfidenceLevel, Warning
 from ..services.docx_io import DocxHandler
 from ..services.pubmed_client import PubMedClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
+from ..services.model_catalog import resolve_model_id
 from ..services.suggestion_resolver import SuggestionResolver
-from ..services.tool_executor import candidate_key
 from ..storage.cache_db import CacheDB
 from .document_parser import DocumentParser
 from .marker_locator import MarkerLocator
-from .llm_citation_agent import LLMCitationAgent
+from .llm_citation_agent import LLMCitationAgent, cap_suggested_confidence
 from .global_qa import GlobalQA
 from .existing_citation_parser import ExistingCitationParser
+from .renumbering import CitationKeyIndex
+from .claim_context import ClaimContext, bare_context, build_claim_context, sub_claims_for
+from .verification import CitationVerifier, deterministic_checks
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +70,8 @@ def _infer_domains_with_llm(
         excerpt += " ..."
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        from ..services.claude_client import make_client
+        client = make_client(api_key)
         response = client.messages.create(
             model=model,
             max_tokens=150,
@@ -88,8 +94,15 @@ def _infer_domains_with_llm(
         logger.warning(f"LLM domain inference failed: {exc}")
         return []
 
-TOTAL_STAGES_FRESH = 4
-TOTAL_STAGES_INSERT = 5
+TOTAL_STAGES_FRESH = 5
+TOTAL_STAGES_INSERT = 6
+
+_CONFIDENCE_ORDER = {
+    ConfidenceLevel.HIGH: 3,
+    ConfidenceLevel.MEDIUM: 2,
+    ConfidenceLevel.LOW: 1,
+    ConfidenceLevel.UNRESOLVED: 0,
+}
 
 
 class PipelineOrchestrator:
@@ -109,6 +122,9 @@ class PipelineOrchestrator:
         self._log = log_callback or (lambda *a: None)
         self._paused = False
         self._cancelled = False
+        # sentence id -> one ClaimContext per selected citation (built during
+        # search, reused by verification)
+        self._contexts: dict[str, list[ClaimContext]] = {}
 
     def pause(self):
         self._paused = True
@@ -152,13 +168,42 @@ class PipelineOrchestrator:
             self._progress("Analyze Existing Citations", 0, total_stages)
 
             handler = DocxHandler(self.project.input_docx_path)
-            citation_parser = ExistingCitationParser(handler)
-            self.project.existing_citations = citation_parser.analyze()
-
             existing = self.project.existing_citations
+            is_tracked = (existing is not None and existing.tracking is not None
+                          and existing.tracking.tier == DocumentTier.TRACKED)
+            if not is_tracked:
+                citation_parser = ExistingCitationParser(
+                    handler, keep_uncited=settings.keep_uncited_entries)
+                self.project.existing_citations = citation_parser.analyze()
+                existing = self.project.existing_citations
+            else:
+                self._emit("info", "  Tracked document: citations read from embedded fields")
             self._emit("info", f"  Found {len(existing.bib_entries)} existing references")
             self._emit("info", f"  References heading at paragraph {existing.references_heading_para_idx}")
             self._emit("info", f"  Max existing number: {existing.max_existing_number}")
+
+            # Recover PMIDs/DOIs for entries that don't print one, so new
+            # candidates can be deduplicated against them.
+            needs_ids = sum(1 for e in existing.bib_entries.values()
+                            if not e.pmid and not e.doi and not e.record_uuid)
+            if settings.enrich_existing_refs and settings.ncbi_email and needs_ids:
+                self._emit("info",
+                           f"  Matching {needs_ids} entries without PMID/DOI "
+                           f"against PubMed...")
+                from .existing_enrichment import ExistingRefEnricher
+                enrich_cache = CacheDB()
+                enrich_pubmed = PubMedClient(
+                    email=settings.ncbi_email,
+                    api_key=settings.ncbi_api_key or "",
+                    cache_db=enrich_cache,
+                )
+                enricher = ExistingRefEnricher(
+                    enrich_pubmed, cache=enrich_cache, log_callback=self._log,
+                )
+                enriched = enricher.enrich(
+                    existing, should_cancel=lambda: self._cancelled)
+                self._emit("info",
+                           f"  Recovered identifiers for {enriched}/{needs_ids} entries")
 
             if self._cancelled:
                 return self.project
@@ -170,13 +215,15 @@ class PipelineOrchestrator:
         self._emit("info", f"Stage {stage_offset + 1}: Parsing document...")
         self._progress("Parse Document", stage_offset, total_stages)
 
+        # The marker grammar of this run is recorded on the project: export
+        # must re-scan the DOCX with exactly this configuration.
+        marker_config = self.project.marker_config
+        self.project.run_marker_config = marker_config
+
         handler = DocxHandler(self.project.input_docx_path)
         stop_at = -1
         if is_insert and self.project.existing_citations:
-            stop_at = self.project.existing_citations.references_heading_para_idx
-        marker_config = self.project.marker_config
-        # Remember the grammar this run used so export scans the DOCX the same way
-        self.project.run_marker_config = marker_config
+            stop_at = self.project.existing_citations.body_end_para_idx
         parser = DocumentParser(handler, stop_at_para=stop_at, marker_config=marker_config)
         sentences = parser.parse()
         self.project.sentences = sentences
@@ -193,13 +240,10 @@ class PipelineOrchestrator:
         sentences = locator.locate(sentences)
         marked = locator.get_marked_sentences(sentences)
 
-        n_search = sum(1 for s in marked for m in s.markers if m.kind != MarkerType.SUGGESTED)
         n_suggested = sum(1 for s in marked for m in s.markers if m.kind == MarkerType.SUGGESTED)
-        self._emit(
-            "info",
-            f"Found {len(marked)} sentences with markers: {n_search} (REF)/(REFS) to search, "
-            f"{n_suggested} author-suggested citation marker(s) to verify",
-        )
+        self._emit("info", f"Found {len(marked)} sentences with markers"
+                           + (f" ({n_suggested} author-suggested citation marker(s))"
+                              if n_suggested else ""))
 
         if not marked:
             self._emit("info", "No markers found in document. Nothing to process.")
@@ -210,7 +254,7 @@ class PipelineOrchestrator:
         if settings.domain_inference and settings.anthropic_api_key:
             self._emit("info", "Inferring document research domains...")
             self.project.inferred_domains = _infer_domains_with_llm(
-                sentences, settings.anthropic_api_key, settings.claude_model,
+                sentences, settings.anthropic_api_key, resolve_model_id(settings.claude_model),
             )
             self._emit("info", f"Inferred domains: {self.project.inferred_domains}")
 
@@ -222,6 +266,12 @@ class PipelineOrchestrator:
         self.project.current_stage = PipelineStage.AI_CITATION_SEARCH
         self._emit("info", f"Stage {stage_offset + 3}: AI-powered citation search...")
         self._progress("AI Citation Search", stage_offset + 2, total_stages)
+
+        # Discard evidence from any previous run — sentence IDs are sequential
+        # (S001, S002, ...), so stale records would silently attach to the
+        # wrong sentences after the document is edited or replaced.
+        self.project.evidence_map = {}
+        self._contexts = {}
 
         cache = CacheDB()
         pubmed = PubMedClient(
@@ -239,6 +289,8 @@ class PipelineOrchestrator:
                 f"Using user library: {user_library.db_path}",
             )
 
+        # Looks up author-suggested citations (library, PubMed, Europe PMC,
+        # bioRxiv/medRxiv) before the agent scores them.
         resolver = SuggestionResolver(
             pubmed=pubmed,
             europepmc=europepmc if settings.search_europepmc else None,
@@ -250,7 +302,7 @@ class PipelineOrchestrator:
 
         agent = LLMCitationAgent(
             anthropic_api_key=settings.anthropic_api_key,
-            model=settings.claude_model,
+            model=resolve_model_id(settings.claude_model),
             pubmed_client=pubmed,
             biorxiv_client=biorxiv,
             europepmc_client=europepmc,
@@ -262,44 +314,40 @@ class PipelineOrchestrator:
             max_refs=settings.max_refs_for_refs,
             orcid_id=settings.orcid_id,
             log_callback=self._log,
+            prefer_reviews=settings.prefer_reviews,
+            recency_bias=settings.recency_bias,
         )
 
         try:
-            for i, sent in enumerate(marked):
-                self._check_pause()
-                if self._cancelled:
-                    return self.project
+            workers = self._effective_parallelism()
+            if workers > 1:
+                self._emit("info", f"  Running {workers} sentence searches in parallel")
 
-                self._emit(
-                    "info",
-                    f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}..."
-                )
+            def search_one(i: int, sent: SentenceRecord):
+                return self._run_sentence(i, sent, marked, sentences, agent, resolver)
 
-                # A lone (REF)/(REFS) marker is a plain search.  Anything else
-                # (several markers, or an author-suggested citation) is handled
-                # marker by marker so each slot gets its own citations.
-                if len(sent.markers) <= 1 and not sent.has_suggested_marker:
-                    evidence = agent.find_citations(
-                        sent, self.project.inferred_domains
-                    )
-                    evidence.slot_sizes = [len(evidence.selected)]
-                else:
-                    evidence = self._find_citations_per_marker(
-                        agent, resolver, sent, self.project.inferred_domains
-                    )
-                self.project.evidence_map[sent.id] = evidence
-
-                if not evidence.selected:
-                    self._emit("warning", f"  No citations found for {sent.id}")
+            for sent, evidence in self._run_pool(workers, marked, search_one):
+                if evidence is not None:
+                    self.project.evidence_map[sent.id] = evidence
 
             self._check_pause()
             if self._cancelled:
                 return self.project
 
-            # ── Stage 4: Global QA ────────────────────────────────────────
+            # ── Stage 4: Verification ─────────────────────────────────────
+            self.project.current_stage = PipelineStage.VERIFICATION
+            self._emit("info", f"Stage {stage_offset + 4}: Verifying citations...")
+            self._progress("Verify Citations", stage_offset + 3, total_stages)
+            self._verify_selections(marked, agent, pubmed, biorxiv, europepmc)
+
+            self._check_pause()
+            if self._cancelled:
+                return self.project
+
+            # ── Stage 5: Global QA ────────────────────────────────────────
             self.project.current_stage = PipelineStage.GLOBAL_QA
-            self._emit("info", f"Stage {stage_offset + 4}: Running global QA...")
-            self._progress("Global QA", stage_offset + 3, total_stages)
+            self._emit("info", f"Stage {stage_offset + 5}: Running global QA...")
+            self._progress("Global QA", stage_offset + 4, total_stages)
 
             qa = GlobalQA()
             self.project.evidence_map = qa.run(sentences, self.project.evidence_map)
@@ -321,46 +369,140 @@ class PipelineOrchestrator:
 
         return self.project
 
+    def _verify_selections(self, marked, agent: LLMCitationAgent, pubmed, biorxiv, europepmc):
+        """Deterministic checks for every selection, then the LLM verifier
+        when enabled. Each sentence's verdicts are aligned with its
+        selected references."""
+        settings = self.project.settings
+        verifier = None
+        if settings.verify_citations and settings.anthropic_api_key:
+            verifier = CitationVerifier(
+                agent.caller,
+                europepmc if settings.search_europepmc else None,
+                use_full_text=settings.use_full_text,
+                log=self._log,
+            )
+        else:
+            self._emit("info", "  Independent verification is off; running retraction/preprint checks only")
+
+        def verify_one(i: int, sent: SentenceRecord) -> bool:
+            self._check_pause()
+            if self._cancelled:
+                return False
+            evidence = self.project.evidence_map.get(sent.id)
+            if evidence is None or not evidence.selected:
+                return False
+            deterministic_checks(evidence, biorxiv=biorxiv, europepmc=europepmc,
+                                 pubmed=pubmed, log=self._log)
+            if verifier is None:
+                return False
+            contexts = self._contexts.get(sent.id) or [bare_context(sent)]
+            verifier.verify_evidence(contexts, evidence)
+            if sent.has_suggested_marker:
+                # The verifier may raise the level for the papers it could
+                # check; an unresolved or ambiguous suggestion still caps it.
+                cap_suggested_confidence(evidence)
+            return True
+
+        checked = sum(1 for _, done in self._run_pool(self._effective_parallelism(), marked, verify_one)
+                      if done)
+        if verifier is not None:
+            self._emit("info", f"  Verified selections for {checked} sentence(s)")
+
+    # ── concurrency helpers ──────────────────────────────────────────
+
+    def _effective_parallelism(self) -> int:
+        """Worker threads for the per-sentence stages: 1 without an NCBI API
+        key (3 requests/s would be exceeded), else the setting clamped to 1–8."""
+        settings = self.project.settings
+        if not settings.ncbi_api_key:
+            return 1
+        return max(1, min(int(settings.parallel_searches or 1), 8))
+
+    def _run_pool(self, workers: int, items: list, func):
+        """Apply ``func(index, item)`` to every item on ``workers`` threads and
+        yield ``(item, result)`` in the original order.
+
+        Cancel makes pending items return quickly (each checks the flag);
+        an exception cancels the rest and is re-raised.
+        """
+        if workers <= 1:
+            for i, item in enumerate(items):
+                yield item, func(i, item)
+            return
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="airefs-search") as pool:
+            futures: list[Future] = [pool.submit(func, i, item) for i, item in enumerate(items)]
+            try:
+                for item, fut in zip(items, futures):
+                    yield item, fut.result()
+            except BaseException:
+                self._cancelled = True
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    def _run_sentence(self, i: int, sent: SentenceRecord, marked: list, sentences: list,
+                      agent: LLMCitationAgent,
+                      resolver: Optional[SuggestionResolver] = None) -> Optional[EvidenceRecord]:
+        """Search one sentence (one call, or one per marker); None when cancelled."""
+        self._check_pause()
+        if self._cancelled:
+            return None
+
+        self._emit("info", f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}...")
+
+        # Sentences with several markers that include at least one (REF), and
+        # any sentence with an author-suggested citation, are handled marker
+        # by marker.  All-(REFS) sentences keep the single combined search.
+        base_ctx = build_claim_context(sentences, sent)
+        if sent.searched_per_marker:
+            evidence = self._find_citations_per_marker(
+                agent, sent, self.project.inferred_domains, base_ctx, resolver,
+            )
+        else:
+            self._contexts[sent.id] = [base_ctx]
+            evidence = agent.find_citations(
+                sent, self.project.inferred_domains, context=base_ctx
+            )
+            evidence.slot_sizes = [len(evidence.selected)]
+        if not evidence.selected:
+            self._emit("warning", f"  No citations found for {sent.id}")
+        return evidence
+
     def _find_citations_per_marker(
         self,
         agent: LLMCitationAgent,
-        resolver: SuggestionResolver,
         sentence: SentenceRecord,
         domain_context: list[str] = None,
+        base_context: ClaimContext = None,
+        resolver: Optional[SuggestionResolver] = None,
     ) -> EvidenceRecord:
         """Handle a sentence marker by marker and merge the results.
 
         * ``(REF)`` / ``(REFS)`` markers are searched independently, each told
           which papers earlier markers already took so the sentence does not
-          cite the same paper twice.
+          cite the same paper twice.  If a duplicate still slips through, the
+          next-best unique candidate from the result set is used.
         * Author-suggested markers are resolved (library, PubMed, Europe PMC,
           bioRxiv) and then scored by the agent against the claim.
 
         The merged ``EvidenceRecord`` keeps one contiguous block of
         ``selected`` citations per marker; ``slot_sizes`` records the block
         lengths so review and export know which citations belong to which
-        marker.
+        marker.  One :class:`ClaimContext` per selected citation is kept for
+        the verifier.
         """
-        markers = list(sentence.markers)
-        if not markers:
-            # Legacy record without marker specs: fall back to a plain search
-            evidence = agent.find_citations(sentence, domain_context)
-            evidence.slot_sizes = [len(evidence.selected)]
-            return evidence
+        from ..models.sentence import SentenceRecord as SR
 
-        # Text segments between markers: segments[i] precedes marker i,
-        # segments[-1] follows the last marker.
-        raw = sentence.raw_text
-        segments: list[str] = []
-        prev = 0
-        for m in markers:
-            segments.append(raw[prev:m.start])
-            prev = m.end
-        segments.append(raw[prev:])
+        if base_context is None:
+            base_context = build_claim_context(self.project.sentences, sentence)
+        markers = self._marker_specs(sentence)
+        parts = sub_claims_for(sentence)
+        num_markers = len(markers)
+        multi = num_markers > 1
+        self._contexts[sentence.id] = []   # one context per *selected* citation
 
-        multi = len(markers) > 1
         if multi:
-            self._emit("info", f"  {len(markers)} markers: handling each independently")
+            self._emit("info", f"  Multi-marker: splitting into {num_markers} independent searches")
 
         combined = EvidenceRecord(sentence_id=sentence.id)
         combined.slot_sizes = []
@@ -373,50 +515,51 @@ class PipelineOrchestrator:
         total_score = 0.0
         scored_slots = 0
 
-        assigned_keys: set[str] = set()  # PMIDs / DOIs already used in this sentence
+        # Track already-assigned papers to prevent duplicates.  The key index
+        # treats PMID/DOI/title as aliases of one identity, so the same paper
+        # found via different identifiers still counts as a duplicate.
+        key_index = CitationKeyIndex()
+        assigned_keys: set[str] = set()         # canonical identity keys
+        assigned_identifiers: set[str] = set()  # human-readable PMIDs/DOIs for the prompt
 
-        confidence_order = {
-            ConfidenceLevel.HIGH: 3,
-            ConfidenceLevel.MEDIUM: 2,
-            ConfidenceLevel.LOW: 1,
-            ConfidenceLevel.UNRESOLVED: 0,
-        }
-
-        def _keys(cand) -> set[str]:
-            keys = {candidate_key(cand)}
+        def _assign(cand):
+            assigned_keys.add(key_index.key_for_candidate(cand))
             if cand.pmid:
-                keys.add(cand.pmid)
+                assigned_identifiers.add(cand.pmid)
             if cand.doi:
-                keys.add(cand.doi)
-            return {k for k in keys if k}
+                assigned_identifiers.add(cand.doi)
 
         # Resolve every author-suggested marker up front so that (REF)/(REFS)
         # searches earlier in the sentence are told to avoid those papers.
         pre_resolved: dict[int, list] = {}
-        for idx, marker in enumerate(markers):
-            if marker.kind != MarkerType.SUGGESTED or not marker.suggestions:
-                continue
-            resolved = resolver.resolve_all(marker.suggestions)
-            pre_resolved[idx] = resolved
-            for r in resolved:
-                if r.candidates and not r.ambiguous:
-                    for cand in r.candidates:
-                        assigned_keys |= _keys(cand)
+        if resolver is not None:
+            for idx, marker in enumerate(markers):
+                if marker.kind != MarkerType.SUGGESTED or not marker.suggestions:
+                    continue
+                resolved = resolver.resolve_all(marker.suggestions)
+                pre_resolved[idx] = resolved
+                for r in resolved:
+                    if r.candidates and not r.ambiguous:
+                        for cand in r.candidates:
+                            _assign(cand)
 
         for idx, marker in enumerate(markers):
             self._check_pause()
             if self._cancelled:
                 return combined
 
-            before = segments[idx].strip()
-            after = segments[idx + 1].strip() if idx + 1 < len(segments) else ""
-            label = f"[{idx + 1}/{len(markers)}] {marker.text}" if multi else marker.text
-            self._emit("info", f"    Marker {label}")
-
+            sub_text, trailing = parts[idx] if idx < len(parts) else ("", "")
+            label = f"[{idx + 1}/{num_markers}] {marker.text}" if multi else marker.text
+            self._emit("info", f"    Marker {label}: {sub_text[:50]}...")
             chosen: list = []
 
             if marker.kind == MarkerType.SUGGESTED:
-                resolved = pre_resolved.get(idx) or resolver.resolve_all(marker.suggestions)
+                if resolver is not None:
+                    resolved = pre_resolved.get(idx)
+                    if resolved is None:
+                        resolved = resolver.resolve_all(marker.suggestions)
+                else:
+                    resolved = []
                 for r in resolved:
                     if r.candidates:
                         self._emit(
@@ -426,12 +569,8 @@ class PipelineOrchestrator:
                     else:
                         self._emit("warning", f"      {r.suggestion.label}: {r.error}")
 
-                position_note = ""
-                if multi and before:
-                    position_note = (
-                        f'The marker {marker.text} appears right after the words: "{before[-160:]}"'
-                    )
-                temp = SentenceRecord(
+                ctx = base_context.with_marker(sub_text if multi else "", trailing if multi else "", [])
+                temp = SR(
                     id=f"{sentence.id}_m{idx}",
                     paragraph_index=sentence.paragraph_index,
                     sentence_index=sentence.sentence_index,
@@ -440,12 +579,11 @@ class PipelineOrchestrator:
                     section=sentence.section,
                     marker_type=MarkerType.SUGGESTED,
                     marker_count=1,
+                    marker_types=[MarkerType.SUGGESTED],
                     markers=[marker],
                     keywords=sentence.keywords,
                 )
-                ev = agent.evaluate_suggested(
-                    temp, marker, resolved, domain_context, context_text=position_note,
-                )
+                ev = agent.evaluate_suggested(temp, marker, resolved, domain_context, context=ctx)
                 chosen = list(ev.selected)
                 if ev.confidence_level != ConfidenceLevel.UNRESOLVED:
                     total_score += ev.confidence_score
@@ -454,59 +592,44 @@ class PipelineOrchestrator:
             else:
                 # (REF) -> one citation, (REFS) -> up to max_refs
                 want_many = marker.kind == MarkerType.REFS
-                if multi:
-                    sub_claim = (
-                        f'From the sentence: "{sentence.clean_text}"\n\n'
-                        f'Find {"citations" if want_many else "a citation"} specifically for this part: "{before}"'
-                    )
-                    if after:
-                        sub_claim += f' (followed by: "{after[:80]}")'
-                else:
-                    sub_claim = sentence.clean_text
-
-                if assigned_keys:
-                    exclusion_list = ", ".join(sorted(assigned_keys))
-                    sub_claim += (
-                        f"\n\nIMPORTANT: The following identifiers have already been "
-                        f"assigned to other markers in this sentence. You MUST "
-                        f"find a DIFFERENT paper -- do NOT select any of these: "
-                        f"{exclusion_list}"
-                    )
-
-                temp = SentenceRecord(
+                ctx = base_context.with_marker(sub_text if multi else "", trailing if multi else "",
+                                               sorted(assigned_identifiers))
+                temp = SR(
                     id=f"{sentence.id}_m{idx}",
                     paragraph_index=sentence.paragraph_index,
                     sentence_index=sentence.sentence_index,
                     raw_text=sentence.raw_text,
-                    clean_text=sub_claim,
+                    clean_text=sentence.clean_text,
                     section=sentence.section,
                     marker_type=marker.kind,
                     marker_count=1,
+                    marker_types=[marker.kind],
                     markers=[marker],
                     keywords=sentence.keywords,
                 )
-                ev = agent.find_citations(temp, domain_context)
+                ev = agent.find_citations(temp, domain_context, context=ctx)
 
                 limit = agent.max_refs if want_many else 1
                 for cand in ev.selected:
                     if len(chosen) >= limit:
                         break
-                    if _keys(cand) & assigned_keys:
+                    if key_index.key_for_candidate(cand) in assigned_keys:
                         self._emit(
                             "warning",
                             f"      Agent returned a paper already used in this sentence "
-                            f"({candidate_key(cand)}); looking for an alternative...",
+                            f"({cand.pmid or cand.doi or cand.title[:40]}); looking for an alternative...",
                         )
                         continue
                     chosen.append(cand)
+                    _assign(cand)
                 if ev.selected and not chosen:
                     # Everything the agent picked is already used in this
-                    # sentence: fall back to the next-best unique paper it
-                    # looked at (same behaviour as the earlier multi-(REF) code).
+                    # sentence: fall back to the next-best unique paper it saw.
                     for alt in ev.candidates:
-                        if _keys(alt) & assigned_keys:
+                        if key_index.key_for_candidate(alt) in assigned_keys:
                             continue
                         chosen.append(alt)
+                        _assign(alt)
                         self._emit("info", f"      Using alternative: {alt.title[:60]}")
                         break
                     if not chosen:
@@ -515,7 +638,8 @@ class PipelineOrchestrator:
                 scored_slots += 1
 
             for cand in chosen:
-                assigned_keys |= _keys(cand)
+                _assign(cand)
+                self._contexts[sentence.id].append(ctx)
 
             if not chosen:
                 self._emit("warning", f"      No citation for marker {label}")
@@ -538,15 +662,14 @@ class PipelineOrchestrator:
             if ev.verification_status.value != "not_checked" and not multi:
                 combined.verification_status = ev.verification_status
 
-            ev_conf_order = confidence_order.get(ev.confidence_level, 0)
-            if ev_conf_order < confidence_order.get(worst_confidence, 3):
+            if _CONFIDENCE_ORDER.get(ev.confidence_level, 0) < _CONFIDENCE_ORDER.get(worst_confidence, 3):
                 worst_confidence = ev.confidence_level
 
-        # Merge results (deduplicate candidates by key, keeping first occurrence)
+        # Merge results (deduplicate candidates by identity, keeping first occurrence)
         seen: set[str] = set()
         merged_candidates = []
         for cand in all_candidates:
-            key = candidate_key(cand)
+            key = key_index.key_for_candidate(cand)
             if key and key in seen:
                 continue
             seen.add(key)
@@ -563,10 +686,22 @@ class PipelineOrchestrator:
         )
         if combined.selected and combined.retrieval_error and not multi:
             combined.retrieval_error = ""
+        cap_suggested_confidence(combined)
 
         self._emit(
             "info",
-            f"  Result: {len(combined.selected)} citation(s) across {len(markers)} marker(s), "
+            f"  Result: {len(combined.selected)} citation(s) across {num_markers} marker(s), "
             f"confidence={combined.confidence_level.value}"
         )
         return combined
+
+    # Name used before author-suggested markers existed.
+    _find_citations_per_ref = _find_citations_per_marker
+
+    @staticmethod
+    def _marker_specs(sentence: SentenceRecord) -> list[MarkerSpec]:
+        """The sentence's markers, synthesised from the marker types when a
+        record (an older project, a hand-built test sentence) has no spans."""
+        if sentence.markers:
+            return list(sentence.markers)
+        return [MarkerSpec(text=f"({t.value})", kind=t) for t in sentence.effective_marker_types()]

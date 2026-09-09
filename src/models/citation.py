@@ -20,11 +20,40 @@ class Author(BaseModel):
         return self.display
 
 
+PLACEHOLDER_TITLE_PREFIX = "(No citation found"
+
+
+def make_placeholder_citation() -> "CitationCandidate":
+    """A stand-in for an unresolved marker slot. Never export as a real reference."""
+    placeholder = CitationCandidate(
+        title=f"{PLACEHOLDER_TITLE_PREFIX} — click Replace to search)",
+        pmid="", doi="", year=0, journal="",
+    )
+    placeholder.composite_score = 0.0
+    placeholder.score_rationale = "No citation found for this marker"
+    return placeholder
+
+
+def is_valid_citation(citation: "CitationCandidate") -> bool:
+    """True if this is a real citation (not empty, not a placeholder slot)."""
+    if not citation:
+        return False
+    if citation.title.startswith(PLACEHOLDER_TITLE_PREFIX):
+        return False
+    return bool(citation.title or citation.pmid or citation.doi)
+
+
 class CitationCandidate(BaseModel):
     """A candidate reference retrieved from PubMed or bioRxiv."""
     pmid: str = Field(default="", description="PubMed ID")
-    pmcid: str = Field(default="", description="PubMed Central ID, e.g. PMC11413553")
     doi: str = Field(default="")
+    pmcid: str = Field(default="", description="PubMed Central ID, e.g. PMC7000000")
+    record_uuid: str = Field(default="", description="Stable opaque identity minted at first export; "
+                                                     "carried in the document's citation fields")
+    raw_entry: str = Field(default="", description="Verbatim bibliography text for records adopted "
+                                                   "from a plain-text document")
+    author_count: int = Field(default=0, description="Real number of authors when the stored list "
+                                                     "was truncated (0: len(authors))")
     title: str = Field(default="")
     source: str = Field(default="literature", description="Origin: pubmed, europepmc, biorxiv, user_library, ...")
     authors: list[Author] = Field(default_factory=list)
@@ -44,10 +73,11 @@ class CitationCandidate(BaseModel):
     retraction_notice: str = Field(default="")
     has_erratum: bool = Field(default=False)
 
-    # Scoring (populated by Ranker)
-    relevance_score: float = Field(default=0.0)
-    recency_score: float = Field(default=0.0)
-    journal_score: float = Field(default=0.0)
+    # Full text / preprint provenance
+    is_open_access: bool = Field(default=False, description="Open-access full text available in PMC")
+    published_doi: str = Field(default="", description="DOI of the journal version of a preprint, if known")
+
+    # Scoring (user library matches and review-tab annotations)
     composite_score: float = Field(default=0.0)
     score_rationale: str = Field(default="")
     matching_keywords: list[str] = Field(default_factory=list)

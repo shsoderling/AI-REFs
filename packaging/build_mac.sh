@@ -5,7 +5,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_NAME="AI REFs"
-VERSION="1.1.0"
+VERSION="1.3.0"
 DMG_NAME="${APP_NAME} ${VERSION}"
 DMG_FILE="${SCRIPT_DIR}/dist/${DMG_NAME}.dmg"
 
@@ -115,8 +115,9 @@ else
         SetFile -a C "${MOUNT_DIR}" 2>/dev/null || true
     fi
 
-    # Set Finder window position and size via AppleScript
-    osascript <<EOF
+    # Set Finder window position and size via AppleScript (cosmetic: skipped
+    # when Finder automation is not permitted for the terminal)
+    osascript <<EOF || echo "Finder layout step skipped (automation not permitted); DMG still valid"
 tell application "Finder"
     tell disk "$DMG_NAME"
         open

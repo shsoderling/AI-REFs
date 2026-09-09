@@ -9,6 +9,7 @@ from .sentence import SentenceRecord
 from .evidence import EvidenceRecord
 from .existing_refs import ExistingCitationMap
 from .markers import MarkerConfig
+from .embedded import TrackingReport
 
 
 class CitationStyle(str, Enum):
@@ -98,6 +99,7 @@ class PipelineStage(str, Enum):
     PARSING = "parsing"
     MARKER_LOCATION = "marker_location"
     AI_CITATION_SEARCH = "ai_citation_search"
+    VERIFICATION = "verification"
     GLOBAL_QA = "global_qa"
     EXISTING_CITATION_ANALYSIS = "existing_citation_analysis"
     COMPLETE = "complete"
@@ -109,7 +111,6 @@ class ProjectSettings(BaseModel):
     """User-configurable settings for the processing pipeline."""
     # Citation preferences
     citation_style: CitationStyle = Field(default=CitationStyle.NIH_GRANT)
-    custom_csl_path: Optional[str] = Field(default=None, description="Path to custom CSL file")
     max_refs_for_refs: int = Field(default=3, ge=2, le=10, description="Max references for (REFS) markers")
 
     # Author-suggested citation markers
@@ -124,9 +125,20 @@ class ProjectSettings(BaseModel):
 
     # Search preferences
     recency_bias: bool = Field(default=True, description="Prefer more recent publications")
-    recency_weight: float = Field(default=0.2, ge=0.0, le=1.0, description="Weight for recency in scoring")
     prefer_reviews: bool = Field(default=False, description="Prefer review articles over primary research")
     domain_inference: bool = Field(default=True, description="Auto-detect research domain from document")
+    parallel_searches: int = Field(
+        default=3, ge=1, le=8,
+        description="Sentences searched concurrently (clamped to 1 without an NCBI API key)",
+    )
+    verify_citations: bool = Field(
+        default=True,
+        description="Independently verify each selected paper against its claim and quote the evidence",
+    )
+    use_full_text: bool = Field(
+        default=True,
+        description="Read open-access full text from Europe PMC when an abstract is not enough",
+    )
 
     # ORCID
     orcid_id: Optional[str] = Field(default=None, description="User's ORCID for self-cite detection")
@@ -134,17 +146,49 @@ class ProjectSettings(BaseModel):
     # PubMed
     ncbi_api_key: Optional[str] = Field(default=None, description="NCBI API key for higher rate limits")
     ncbi_email: str = Field(default="", description="Email for NCBI E-utilities (required)")
-    max_candidates_per_sentence: int = Field(default=15, ge=5, le=50)
 
     # Anthropic / Claude
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API key for Claude-powered citation search")
-    claude_model: str = Field(default="claude-haiku-4-5-20251001", description="Claude model for citation agent")
+    claude_model: str = Field(
+        default="newest",
+        description="Claude model id for the citation agent; 'newest' means the most recently "
+                    "released model on the Input tab's list (see services.model_catalog)",
+    )
 
     # bioRxiv
     search_biorxiv: bool = Field(default=True, description="Also search bioRxiv preprints")
 
     # Europe PMC
     search_europepmc: bool = Field(default=True, description="Also search Europe PMC")
+
+    # Insert mode
+    enrich_existing_refs: bool = Field(
+        default=True,
+        description="Look up existing bibliography entries lacking PMID/DOI "
+                    "on PubMed so they can be deduplicated against new finds",
+    )
+
+    # Tracked documents
+    embed_citation_fields: bool = Field(
+        default=True,
+        description="Write each citation as a hidden Word field carrying its record, so a "
+                    "later session reopens the document exactly (EndNote-style tracking)",
+    )
+    keep_uncited_entries: bool = Field(
+        default=False,
+        description="Keep bibliography entries whose citations were all deleted",
+    )
+
+    # Export safety
+    min_match_ratio: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Insert mode refuses to rebuild the bibliography when fewer than "
+                    "this fraction of parsed entries were matched to in-text citations",
+    )
+    allow_export_with_tracked_changes: bool = Field(
+        default=False,
+        description="Export a document whose citations carry pending tracked changes",
+    )
 
     # User reference library
     reference_library_enabled: bool = Field(
@@ -164,14 +208,14 @@ class ProjectSettings(BaseModel):
         description="Maximum user-library matches to return per query",
     )
 
-    # Output
-    include_abstracts_in_report: bool = Field(default=True)
-    generate_ris: bool = Field(default=False)
-    generate_bibtex: bool = Field(default=False)
+
+PROJECT_SCHEMA_VERSION = 2
 
 
 class ProjectState(BaseModel):
     """Complete state of an AI REFs project, enabling save/load/resume."""
+    schema_version: int = Field(default=PROJECT_SCHEMA_VERSION)
+
     # Project metadata
     project_name: str = Field(default="Untitled Project")
     project_path: Optional[str] = Field(default=None, description="Path to .airefsproj file")
@@ -201,14 +245,16 @@ class ProjectState(BaseModel):
     inferred_domains: list[str] = Field(default_factory=list)
     document_keywords: list[str] = Field(default_factory=list)
 
-    # Bibliography tracking
-    bibliography_pmids: list[str] = Field(default_factory=list, description="Ordered list of PMIDs for bibliography")
-    pmid_to_bib_number: dict[str, int] = Field(default_factory=dict, description="PMID -> bibliography entry number")
-
     # Insert mode: adding references to a pre-cited document
     is_insert_mode: bool = Field(default=False, description="True when adding refs to a pre-cited document")
     existing_citations: Optional[ExistingCitationMap] = Field(default=None, description="Parsed pre-existing citations (insert mode only)")
 
+    # Tracked document mirror (written at export; the document is the source of truth)
+    doc_id: str = Field(default="", description="Identity of the tracked document, carried in its bibliography field")
+    doc_tracking: Optional[TrackingReport] = Field(default=None, description="How the loaded document was read")
+    record_order: list[str] = Field(default_factory=list, description="Record uuids in bibliography order at the last export")
+    uncited: list[str] = Field(default_factory=list, description="Record uuids kept without a citation at the last export")
+    entry_hashes: list[str] = Field(default_factory=list, description="Hashes of the bibliography entries written at the last export")
     # Marker grammar the last pipeline run used.  Export must scan the DOCX
     # with exactly this configuration, whatever the settings say now, so the
     # markers it replaces are the markers the sentences were built from.

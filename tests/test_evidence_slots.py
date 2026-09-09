@@ -52,8 +52,9 @@ def test_remove_and_insert_keep_slots_consistent():
 
 
 def test_is_resolved_includes_skipped():
-    ev = EvidenceRecord(review_decision=ReviewDecision.REJECTED)
+    ev = EvidenceRecord(review_decision=ReviewDecision.SKIPPED)
     assert ev.is_resolved and ev.is_skipped
+    assert not EvidenceRecord(review_decision=ReviewDecision.REJECTED).is_resolved
     assert not EvidenceRecord().is_resolved
 
 

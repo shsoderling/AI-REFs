@@ -8,10 +8,14 @@ from PySide6.QtWidgets import (
     QFileDialog, QGroupBox, QFormLayout, QLineEdit, QSpinBox,
     QComboBox, QCheckBox, QFrame, QSplitter, QTextEdit, QScrollArea
 )
-from PySide6.QtCore import Signal, Qt, QSettings
+from PySide6.QtCore import Signal, Qt, QSettings, QThread
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 from ..models.project import ProjectSettings, CitationStyle
+from ..services.model_catalog import (
+    NEWEST_MODEL, ModelInfo, ModelSource, cache_is_stale, load_cached_models,
+    load_models, refresh_models,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,25 +93,24 @@ HELP_TEXTS = {
     ),
     "claude_model": (
         "<h3>Claude Model</h3>"
-        "<p>Choose which Claude model performs the citation search. Each model offers a "
-        "different balance of speed, cost, and quality.</p>"
+        "<p>Choose which Claude model performs the citation search. The list is fetched "
+        "from Anthropic for your API key, so new models appear here as soon as they are "
+        "released (newest first); click the refresh button to update it. Your selection "
+        "is never changed for you.</p>"
         "<p><b>What it does:</b> The selected model reads each marked sentence, decides "
         "what to search for, evaluates candidate papers, and picks the best match. "
         "A smarter model finds better references but costs more and runs slower.</p>"
-        "<p><b>Options:</b></p>"
+        "<p><b>Tiers:</b></p>"
         "<ul>"
-        "<li><b>Haiku 4.5</b> &mdash; Fastest and cheapest. Good for straightforward "
-        "claims with obvious keywords. Best for quick drafts or budget-conscious use. "
-        "~$0.01&ndash;0.05 per document.</li>"
-        "<li><b>Sonnet 4.5</b> &mdash; Balanced. Recommended for most use cases. "
-        "Better at nuanced claims and multi-step reasoning. "
-        "~$0.05&ndash;0.30 per document.</li>"
-        "<li><b>Opus 4.6</b> &mdash; Highest quality. Best for complex interdisciplinary "
-        "papers or when citation accuracy is critical. "
-        "~$0.30&ndash;2.00 per document.</li>"
+        "<li><b>Haiku</b> &mdash; Fastest and cheapest. Good for straightforward claims "
+        "with obvious keywords, quick drafts, or budget-conscious use.</li>"
+        "<li><b>Sonnet</b> &mdash; Balanced speed, cost and quality; a good everyday choice.</li>"
+        "<li><b>Opus</b> &mdash; Strongest reasoning in the standard tier; best for nuanced "
+        "or interdisciplinary claims where the right paper is not obvious.</li>"
+        "<li><b>Fable</b> &mdash; Anthropic's most capable tier, at the highest price.</li>"
         "</ul>"
-        "<p><i>Tip: Start with Haiku for a quick test run, then re-run with Sonnet or "
-        "Opus for your final submission.</i></p>"
+        "<p>New projects default to the newest model on the list; pick a cheaper tier "
+        "here if cost matters more than nuance.</p>"
     ),
     "input_format": (
         "<h3>Input Document Format</h3>"
@@ -276,6 +279,23 @@ class DropZone(QFrame):
         self.label.setStyleSheet("color: #4CAF50; font-size: 14px; border: none;")
 
 
+class _ModelRefreshThread(QThread):
+    """Fetch the model list off the GUI thread; results come back as signals."""
+    succeeded = Signal(object)      # list[ModelInfo]
+    failed = Signal(str)
+
+    def __init__(self, api_key: str, parent=None):
+        super().__init__(parent)
+        self._api_key = api_key
+
+    def run(self):
+        try:
+            self.succeeded.emit(refresh_models(self._api_key))
+        except Exception as exc:                        # network, auth, SDK: all reported
+            logger.warning(f"Model list refresh failed: {exc}")
+            self.failed.emit(str(exc)[:160] or type(exc).__name__)
+
+
 class InputsTab(QWidget):
     """Tab for document loading and pipeline settings."""
     file_selected = Signal(str)
@@ -286,8 +306,11 @@ class InputsTab(QWidget):
         self._current_file = None
         self._help_buttons: list[HelpButton] = []
         self._active_help_key: str | None = None
+        self._refresh_thread: _ModelRefreshThread | None = None
         self._setup_ui()
+        self._populate_models_from_cache()
         self._load_saved_settings()
+        self._auto_refresh_models()
 
     def _make_form_row_with_help(self, label_text: str, widget: QWidget, help_key: str) -> QHBoxLayout:
         """Create a form row: Label  [widget]  [?]"""
@@ -467,6 +490,31 @@ class InputsTab(QWidget):
         self.europepmc_check.setChecked(True)
         form.addRow("Europe PMC:", self.europepmc_check)
 
+        # Full text
+        self.fulltext_check = QCheckBox("Read open-access full text (Europe PMC) when needed")
+        self.fulltext_check.setChecked(True)
+        form.addRow("Full text:", self.fulltext_check)
+
+        # Independent verification
+        self.verify_check = QCheckBox("Verify each selected paper against its claim")
+        self.verify_check.setChecked(True)
+        form.addRow("Verification:", self.verify_check)
+
+        # Parallel sentence searches
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setValue(3)
+        self.parallel_spin.setToolTip(
+            "Sentences searched at the same time. More than 1 needs an NCBI API key "
+            "(the pipeline falls back to 1 without one).")
+        form.addRow("Parallel searches:", self.parallel_spin)
+
+        # Existing-reference enrichment (insert mode)
+        self.enrich_check = QCheckBox(
+            "Look up existing refs on PubMed to avoid duplicates (insert mode)")
+        self.enrich_check.setChecked(True)
+        form.addRow("Enrich existing:", self.enrich_check)
+
         layout.addWidget(settings_group)
 
         # ── NCBI / ORCID ────────────────────────────────────────────
@@ -506,15 +554,27 @@ class InputsTab(QWidget):
             self._make_form_row_with_help("Anthropic API Key:", self.anthropic_key_edit, "anthropic_api_key")
         )
 
+        # Model list: discovered from the Models API (see services.model_catalog),
+        # never hard-coded. Combo item data = model id, tooltip = model id.
         self.model_combo = QComboBox()
-        self.model_combo.addItems([
-            "Haiku 4.5 (Fast, cheapest)",
-            "Sonnet 4.5 (Balanced)",
-            "Opus 4.6 (Highest quality)",
-        ])
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.refresh_models_btn = QPushButton("\u21bb")
+        self.refresh_models_btn.setFixedWidth(32)
+        self.refresh_models_btn.setToolTip("Fetch the current list of Claude models for this API key")
+        self.refresh_models_btn.clicked.connect(self.request_model_refresh)
+        model_row = QWidget()
+        model_row_layout = QHBoxLayout(model_row)
+        model_row_layout.setContentsMargins(0, 0, 0, 0)
+        model_row_layout.setSpacing(4)
+        model_row_layout.addWidget(self.model_combo, stretch=1)
+        model_row_layout.addWidget(self.refresh_models_btn)
         ai_layout.addLayout(
-            self._make_form_row_with_help("Claude Model:", self.model_combo, "claude_model")
+            self._make_form_row_with_help("Claude Model:", model_row, "claude_model")
         )
+        self.model_status_label = QLabel("")
+        self.model_status_label.setWordWrap(True)
+        self.model_status_label.setStyleSheet("QLabel { color: #666; font-size: 11px; }")
+        ai_layout.addWidget(self.model_status_label)
 
         layout.addWidget(ai_group)
 
@@ -636,6 +696,10 @@ class InputsTab(QWidget):
             claude_model=self._get_model_id(),
             search_biorxiv=self.biorxiv_check.isChecked(),
             search_europepmc=self.europepmc_check.isChecked(),
+            enrich_existing_refs=self.enrich_check.isChecked(),
+            use_full_text=self.fulltext_check.isChecked(),
+            verify_citations=self.verify_check.isChecked(),
+            parallel_searches=self.parallel_spin.value(),
         )
 
     def set_settings(self, settings: ProjectSettings):
@@ -666,42 +730,192 @@ class InputsTab(QWidget):
         self._set_model_by_id(settings.claude_model)
         self.biorxiv_check.setChecked(settings.search_biorxiv)
         self.europepmc_check.setChecked(settings.search_europepmc)
+        self.enrich_check.setChecked(settings.enrich_existing_refs)
+        self.fulltext_check.setChecked(settings.use_full_text)
+        self.verify_check.setChecked(settings.verify_citations)
+        self.parallel_spin.setValue(settings.parallel_searches)
+
+    # ── Claude model list ─────────────────────────────────────────────
+
+    _LEGACY_MODEL_INDEX = {         # the previous hard-coded combo, by position
+        0: "claude-haiku-4-5",
+        1: "claude-sonnet-4-6",
+        2: "claude-opus-4-8",
+    }
+    _MISSING_SUFFIX = "  (saved \u2014 not in the current list)"
+
+    def _populate_models_from_cache(self):
+        models, source = load_models()
+        fetched_text = None
+        if source == ModelSource.CACHE:
+            _, fetched_at = load_cached_models()
+            if fetched_at is not None:
+                fetched_text = fetched_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        self.set_model_list(models, source, fetched_at_text=fetched_text)
+
+    def _auto_refresh_models(self):
+        """Refresh in the background when a key is known and the cache is old."""
+        if not self.anthropic_key_edit.text().strip():
+            return
+        _, fetched_at = load_cached_models()
+        if cache_is_stale(fetched_at):
+            self.request_model_refresh()
+
+    def set_model_list(self, models: list[ModelInfo], source: ModelSource,
+                       fetched_at_text: str | None = None):
+        """Fill the combo (newest first) and keep the current selection."""
+        previous = self.current_model_id() if self.model_combo.count() else ""
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for m in models:
+            self.model_combo.addItem(m.display_name, m.id)
+            self.model_combo.setItemData(self.model_combo.count() - 1, m.id, Qt.ItemDataRole.ToolTipRole)
+        self.model_combo.blockSignals(False)
+        if previous:
+            self._set_model_by_id(previous)
+        n = len(models)
+        if source == ModelSource.LIVE:
+            text = f"Model list updated from Anthropic: {n} model{'s' if n != 1 else ''} available to this key."
+        elif source == ModelSource.CACHE:
+            when = f" (fetched {fetched_at_text})" if fetched_at_text else ""
+            text = f"Model list from the last check{when}; click \u21bb to refresh."
+        else:
+            text = ("Using the built-in model list; enter your Anthropic API key and click "
+                    "\u21bb to fetch the current models.")
+        self.model_status_label.setText(text)
+
+    def current_model_id(self) -> str:
+        data = self.model_combo.currentData()
+        if data:
+            return str(data)
+        return self.model_combo.itemData(0) or NEWEST_MODEL
 
     def _get_model_id(self) -> str:
-        """Map combo box index to Anthropic model ID."""
-        model_map = {
-            0: "claude-haiku-4-5-20251001",
-            1: "claude-sonnet-4-5-20250929",
-            2: "claude-opus-4-6",
-        }
-        return model_map.get(self.model_combo.currentIndex(), "claude-haiku-4-5-20251001")
+        """The selected model id (kept for callers of the old name)."""
+        return self.current_model_id()
 
     def _set_model_by_id(self, model_id: str):
-        """Set model combo box from Anthropic model ID."""
-        model_to_index = {
-            "claude-haiku-4-5-20251001": 0,
-            "claude-sonnet-4-5-20250929": 1,
-            "claude-opus-4-6": 2,
-        }
-        self.model_combo.setCurrentIndex(model_to_index.get(model_id, 0))
+        """Select a model by id; 'newest' (or empty) is the first entry. An id that
+        is not on the list (a retired model, or one from another account) is
+        appended so the project keeps working, and labelled as such."""
+        model_id = (model_id or "").strip()
+        if not model_id or model_id == NEWEST_MODEL:
+            self.model_combo.setCurrentIndex(0)
+            return
+        for i in range(self.model_combo.count()):
+            if self.model_combo.itemData(i) == model_id:
+                self.model_combo.setCurrentIndex(i)
+                return
+        self.model_combo.addItem(f"{model_id}{self._MISSING_SUFFIX}", model_id)
+        self.model_combo.setItemData(self.model_combo.count() - 1, model_id, Qt.ItemDataRole.ToolTipRole)
+        self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
 
     def set_detection_flags(self, detect_ids: bool, detect_author_year: bool):
         """Set the two suggested-citation checkboxes."""
         self.suggested_ids_check.setChecked(bool(detect_ids))
         self.author_year_check.setChecked(bool(detect_author_year))
 
-    def set_insert_mode(self, enabled: bool, num_existing: int):
-        """Show or hide the insert-mode indicator."""
-        if enabled:
-            self.insert_mode_label.setText(
-                f"Insert mode: {num_existing} existing references detected. "
-                f"Only new markers ((REF), (REFS), and author-suggested citations such as "
-                f"(PMID: …) or (Smith et al. 2020)) will be processed. "
-                f"Existing citations will be renumbered automatically."
-            )
-            self.insert_mode_label.setVisible(True)
+    def request_model_refresh(self):
+        """Fetch the model list for the typed key, off the GUI thread."""
+        api_key = self.anthropic_key_edit.text().strip()
+        if not api_key:
+            self.model_status_label.setText(
+                "Enter your Anthropic API key above, then click \u21bb to fetch the model list.")
+            return
+        if self._refresh_thread is not None and self._refresh_thread.isRunning():
+            return
+        self.refresh_models_btn.setEnabled(False)
+        self.model_status_label.setText("Fetching the model list from Anthropic\u2026")
+        self._refresh_thread = _ModelRefreshThread(api_key, self)
+        self._refresh_thread.succeeded.connect(self._on_models_refreshed)
+        self._refresh_thread.failed.connect(self._on_models_refresh_failed)
+        self._refresh_thread.finished.connect(lambda: self.refresh_models_btn.setEnabled(True))
+        self._refresh_thread.start()
+
+    def _on_models_refreshed(self, models: object):
+        if models:
+            self.set_model_list(list(models), ModelSource.LIVE)
         else:
+            self.model_status_label.setText(
+                "Anthropic returned no Claude models for this key; keeping the current list.")
+
+    def _on_models_refresh_failed(self, reason: str):
+        self.model_status_label.setText(
+            f"Could not fetch the model list from Anthropic ({reason}); keeping the current list.")
+
+    def wait_for_model_refresh(self, timeout_ms: int = 5000):
+        """Block until a running refresh has finished and its result was applied (tests)."""
+        from PySide6.QtWidgets import QApplication
+        if self._refresh_thread is not None:
+            self._refresh_thread.wait(timeout_ms)
+        QApplication.processEvents()
+
+    # Banner text and colour per document mode (see MainWindow._document_mode)
+    _MODE_STYLES = {
+        "ok": ("#e8f5e9", "#a5d6a7", "#2e7d32"),        # green
+        "warn": ("#fff8e1", "#ffe082", "#8d6e00"),      # amber
+        "error": ("#ffebee", "#ef9a9a", "#b71c1c"),     # red
+    }
+
+    def set_document_mode(self, mode: str, report=None, num_existing: int = 0):
+        """Show what AI REFs found in the loaded document.
+
+        mode: 'fresh' (no banner), 'legacy' (plain-text citations found),
+        'foreign' (another manager's fields; export disabled),
+        'analysis-failed' (nothing trusted; export disabled). Later modes:
+        'tracked', 'stripped', 'newer-version'.
+        """
+        first_problem = ""
+        if report is not None and getattr(report, "problems", None):
+            first_problem = report.problems[0]
+        texts = {
+            "legacy": (
+                f"Insert mode: {num_existing} existing references detected. "
+                "Only new (REF)/(REFS) markers will be processed. "
+                "Existing citations will be renumbered automatically.", "ok"),
+            "tracked": (
+                f"Tracked document: {num_existing} references recognised from embedded "
+                "AI REFs data. New (REF)/(REFS) markers will be added and everything "
+                "renumbered.", "ok"),
+            "foreign": (
+                "This document contains citation fields from another reference manager "
+                "(EndNote/Zotero/Mendeley). AI REFs will not modify it; export is disabled.",
+                "warn"),
+            "stripped": (
+                "This document was exported by AI REFs but its tracking data is gone "
+                "(edited in Google Docs or Pages?). Falling back to text-based detection.",
+                "warn"),
+            "analysis-failed": (
+                "AI REFs could not analyse the existing citations"
+                + (f": {first_problem}" if first_problem else "")
+                + ". Export is disabled.", "error"),
+            "newer-version": (
+                "This document was created by a newer version of AI REFs; it is opened "
+                "read-only. Export is disabled.", "error"),
+        }
+        if mode not in texts:
             self.insert_mode_label.setVisible(False)
+            return
+        text, level = texts[mode]
+        issues = list(getattr(report, "reconcile", None) or [])
+        if issues:
+            shown = [f"• {i.message}" for i in issues[:4]]
+            if len(issues) > 4:
+                shown.append(f"• … and {len(issues) - 4} more")
+            text += "\n" + "\n".join(shown)
+        bg, border, fg = self._MODE_STYLES[level]
+        self.insert_mode_label.setStyleSheet(
+            "QLabel {"
+            f"  background-color: {bg};"
+            f"  border: 1px solid {border};"
+            "  border-radius: 6px;"
+            "  padding: 8px 12px;"
+            f"  color: {fg};"
+            "  font-size: 13px;"
+            "}"
+        )
+        self.insert_mode_label.setText(text)
+        self.insert_mode_label.setVisible(True)
 
     # ── Settings persistence ──────────────────────────────────────────
 
@@ -720,12 +934,30 @@ class InputsTab(QWidget):
         val = s.value("anthropic_api_key", "")
         if val:
             self.anthropic_key_edit.setText(val)
-        model_idx = s.value("claude_model_index", None)
-        if model_idx is not None:
-            self.model_combo.setCurrentIndex(int(model_idx))
+        model_id = s.value("claude_model_id", None)
+        if model_id:
+            self._set_model_by_id(str(model_id))
+        else:
+            legacy_idx = s.value("claude_model_index", None)
+            if legacy_idx is not None:              # profile from the hard-coded list
+                try:
+                    migrated = self._LEGACY_MODEL_INDEX.get(int(legacy_idx))
+                except (TypeError, ValueError):
+                    migrated = None
+                if migrated:
+                    self._set_model_by_id(migrated)
+                    s.setValue("claude_model_id", migrated)
+                s.remove("claude_model_index")
+                s.sync()
         style_idx = s.value("citation_style_index", None)
         if style_idx is not None:
             self.style_combo.setCurrentIndex(int(style_idx))
+        parallel = s.value("parallel_searches", None)
+        if parallel is not None:
+            try:
+                self.parallel_spin.setValue(int(parallel))
+            except (TypeError, ValueError):
+                pass
         self.suggested_ids_check.setChecked(s.value("detect_suggested_ids", True, type=bool))
         self.author_year_check.setChecked(s.value("detect_author_year", True, type=bool))
         logger.info("Loaded saved settings")
@@ -737,8 +969,10 @@ class InputsTab(QWidget):
         s.setValue("ncbi_api_key", self.api_key_edit.text().strip())
         s.setValue("orcid_id", self.orcid_edit.text().strip())
         s.setValue("anthropic_api_key", self.anthropic_key_edit.text().strip())
-        s.setValue("claude_model_index", self.model_combo.currentIndex())
+        s.setValue("claude_model_id", self.current_model_id())
+        s.remove("claude_model_index")
         s.setValue("citation_style_index", self.style_combo.currentIndex())
+        s.setValue("parallel_searches", self.parallel_spin.value())
         s.setValue("detect_suggested_ids", self.suggested_ids_check.isChecked())
         s.setValue("detect_author_year", self.author_year_check.isChecked())
         s.sync()

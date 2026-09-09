@@ -13,6 +13,7 @@ from PySide6.QtCore import Signal, Slot, Qt, QTimer
 
 from ...models.citation import CitationCandidate
 from ...models.project import ProjectSettings
+from ...services.model_catalog import resolve_model_id
 from ...services.orcid_client import fetch_orcid_name
 from .chat_worker import ChatSearchWorker
 
@@ -181,15 +182,50 @@ class ChatPanel(QFrame):
 
     # ── Public API ───────────────────────────────────────────────
 
+    def cancel_active_search(self):
+        """Cancel any running chat search; do not block the UI.
+
+        The worker checks its flag between rounds and exits without emitting,
+        so no stale replies land on a different sentence's context.
+        """
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            logger.info("Cancelled active chat search")
+        self.status_label.setText("")
+        self._enable_input()
+
+    def shutdown_workers(self, wait_ms: int = 3000):
+        """Cancel and wait for all workers — call before app shutdown.
+
+        Destroying a running QThread crashes Qt, so this blocks (bounded)
+        until the threads exit.
+        """
+        for worker in (self._worker, self._fetch_worker):
+            if worker and worker.isRunning():
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                if not worker.wait(wait_ms):
+                    logger.warning("Chat worker did not stop in time; terminating")
+                    worker.terminate()
+                    worker.wait(1000)
+
     def open_for_sentence(
         self,
         sentence_id: str,
         claim_text: str,
         settings: ProjectSettings,
+        context_text: str = "",
     ):
-        """Initialize the chat panel for a specific sentence."""
+        """Initialize the chat panel for a specific sentence.
+
+        ``context_text`` (section, neighbouring sentences) is handed to the
+        search worker so it understands the claim; it is never cited.
+        """
+        # A search may still be running for the previous sentence
+        self.cancel_active_search()
         self._settings = settings
         self._claim_text = claim_text
+        self._context_text = context_text or ""
         self._sentence_id = sentence_id
         self._conversation = []
         self._all_candidates = {}
@@ -377,7 +413,7 @@ class ChatPanel(QFrame):
             messages=list(self._conversation),
             claim_text=self._claim_text,
             anthropic_api_key=self._settings.anthropic_api_key,
-            model=self._settings.claude_model,
+            model=resolve_model_id(self._settings.claude_model),
             ncbi_email=self._settings.ncbi_email or "",
             ncbi_api_key=self._settings.ncbi_api_key or "",
             search_biorxiv=self._settings.search_biorxiv,
@@ -387,6 +423,9 @@ class ChatPanel(QFrame):
             max_library_results=self._settings.max_library_results,
             prior_candidates=self._all_candidates,
             parent=self,
+            prefer_reviews=self._settings.prefer_reviews,
+            recency_bias=self._settings.recency_bias,
+            context_text=getattr(self, "_context_text", ""),
         )
         self._worker.status_update.connect(self._on_status)
         self._worker.assistant_message.connect(self._on_assistant_reply)

@@ -16,6 +16,7 @@ import requests
 
 from ..models.citation import CitationCandidate, Author
 from ..storage.cache_db import CacheDB
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +34,13 @@ class PubMedClient:
         self.api_key = api_key
         self.cache = cache_db or CacheDB()
         self._session = requests.Session()
-        self._last_request_time = 0.0
         # NCBI allows 3 req/s without key, 10 req/s with key
         self._min_interval = 0.11 if api_key else 0.35
+        self._limiter = RateLimiter(self._min_interval)
 
     def _rate_limit(self):
-        """Enforce NCBI rate limiting."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce NCBI rate limiting (shared across threads)."""
+        self._limiter.wait(self._min_interval)
 
     def _base_params(self) -> dict:
         """Common parameters for all E-utility requests."""
@@ -214,6 +212,51 @@ class PubMedClient:
                     return pmids, total
         return [], 0
 
+    # ── ECitMatch: resolve a bibliographic citation to a PMID ────────
+
+    def citation_match(self, journal: str, year: int, volume: str,
+                       first_page: str, author_last: str) -> Optional[str]:
+        """Match a citation to a PMID via NCBI's citation matcher.
+
+        All fields are required by ecitmatch; returns the PMID string or
+        None if not found / ambiguous.
+        """
+        if not (journal and year and volume and first_page and author_last):
+            return None
+
+        bdata = f"{journal}|{year}|{volume}|{first_page}|{author_last}|key|"
+        cache_key = f"pubmed:ecitmatch:{bdata}"
+        cached = self.cache.get_search(cache_key)
+        if cached is not None:
+            return cached or None  # "" caches a miss
+
+        self._rate_limit()
+        params = {
+            **self._base_params(),
+            "db": "pubmed",
+            "retmode": "xml",
+            "bdata": bdata,
+        }
+        try:
+            resp = self._session.get(f"{EUTILS_BASE}/ecitmatch.cgi",
+                                     params=params, timeout=30)
+            resp.raise_for_status()
+            pmid = ""
+            # Response is one line per citation: the PMID (or NOT_FOUND /
+            # AMBIGUOUS) is the field after the supplied key.
+            for line in resp.text.strip().splitlines():
+                parts = line.strip().split("|")
+                if len(parts) >= 7 and parts[6].strip().isdigit():
+                    pmid = parts[6].strip()
+                    break
+            self.cache.put_search(cache_key, pmid)
+            logger.info(f"ECitMatch '{journal} {year};{volume}:{first_page}' "
+                        f"-> {pmid or 'not found'}")
+            return pmid or None
+        except Exception as e:
+            logger.warning(f"ECitMatch error: {e}")
+            return None
+
     # ── EFetch: get full article metadata ───────────────────────────
 
     def fetch_article(self, pmid: str) -> Optional[CitationCandidate]:
@@ -382,7 +425,7 @@ class PubMedClient:
             if id_elem.get("EIdType") == "doi":
                 doi = id_elem.text or ""
                 break
-        # Also check PubmedData ArticleIdList (DOI fallback and PMCID)
+        # PubmedData ArticleIdList: DOI fallback and the PMC id
         pmcid = ""
         pubmed_data = elem.find("PubmedData")
         if pubmed_data is not None:

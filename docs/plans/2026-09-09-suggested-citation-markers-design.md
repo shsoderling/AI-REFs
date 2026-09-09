@@ -116,6 +116,37 @@ suggested markers, duplicate exclusion across markers, results concatenated with
 * Before a run, a dialog reports how many suggested markers were found and offers
   "Verify all" / "Only (REF)/(REFS)" (this run only) / Cancel.
 
+## Merge onto the tracked-document architecture (2026-09-09)
+
+The feature was first built against the February snapshot and then re-applied
+on top of the September line (tracked AIREFS fields, headless `docx_export`,
+tool-based agent, concurrent orchestrator, independent verifier). What changed
+in the port:
+
+* **Agent.** `evaluate_suggested` answers through a `submit_suggested_evaluation`
+  tool (`services/search_tools.py`) instead of a JSON text reply; the loop,
+  deadline call and error handling are shared with `find_citations` (`_run_loop`).
+* **Orchestrator.** `SentenceRecord.searched_per_marker` is true for any sentence
+  with a suggested marker (plus the existing mixed (REF) rule); such sentences go
+  through `_find_citations_per_marker`, which keeps `slot_sizes` and one
+  `ClaimContext` per selected citation for the verifier. All-(REFS) sentences keep
+  the single combined search (`slot_count == 1`, whole list at every marker).
+  After verification `cap_suggested_confidence` re-applies the HIGH cap.
+* **Export.** `renumber_plan.build_renumber_plan` scans the DOCX with
+  `export_marker_config`, matches markers to slots by order *and* text
+  (`export_slots`), and records an action per marker; `docx_export.write_new_markers`
+  writes them right to left within a paragraph at their own offsets, and markers
+  left as written take no number and no field (`plan.written_count` feeds
+  `validate_before_save`).
+* **Review decisions.** "Leave unchanged" is `ReviewDecision.SKIPPED` (resolved;
+  export keeps the text). `REJECTED` keeps its earlier meaning (not resolved; a
+  (REF)/(REFS) marker exports as `[?]`).
+* **Review tab.** The reference cards are the source of truth; `selected` and
+  `slot_sizes` are rebuilt from them (grouped by `SingleRefWidget.slot`) once every
+  card is decided. Several papers picked for one marker of a multi-marker sentence
+  all go into that marker's slot.
+* **Clients.** `claude_client.make_client` accepts SDK builds on `httpx2`.
+
 ## Assumptions made without user input
 
 1. A poorly matching suggestion stays selected (with a warning and score); the

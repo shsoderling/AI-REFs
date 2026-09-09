@@ -22,10 +22,17 @@ class MarkerLocator:
         self.config = config or MarkerConfig.all_on()
 
     def locate(self, sentences: list[SentenceRecord]) -> list[SentenceRecord]:
-        """Scan sentences for markers and populate marker fields."""
+        """Scan sentences for markers and populate the marker fields.
+
+        ``markers`` holds every marker with its span and suggestions;
+        ``marker_types`` records each marker's kind in document order (a
+        sentence can mix (REF), (REFS) and suggested citations, and the
+        per-marker splitting downstream must know which is which).
+        """
         for sent in sentences:
             markers = find_markers(sent.raw_text, self.config)
             sent.markers = markers
+            sent.marker_types = [m.kind for m in markers]
             sent.marker_count = len(markers)
             sent.marker_type = markers[0].kind if markers else None
 
@@ -40,5 +47,5 @@ class MarkerLocator:
         return sentences
 
     def get_marked_sentences(self, sentences: list[SentenceRecord]) -> list[SentenceRecord]:
-        """Return only sentences that contain markers."""
+        """Return only sentences that have markers."""
         return [s for s in sentences if s.marker_type is not None]

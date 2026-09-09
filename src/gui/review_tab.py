@@ -9,21 +9,24 @@ from PySide6.QtWidgets import (
     QSplitter, QFrame, QComboBox, QLineEdit, QScrollArea,
     QMessageBox
 )
-from PySide6.QtCore import Signal, Slot, Qt, QThread
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Signal, Slot, Qt, QThread, QTimer, QUrl
+from PySide6.QtGui import QColor, QFont, QDesktopServices
 
+from ..models.embedded import DocumentTier
 from ..models.project import ProjectState
 from ..models.sentence import SentenceRecord, MarkerType
+from ..pipeline.claim_context import build_claim_context
 from ..models.evidence import (
-    EvidenceRecord, ConfidenceLevel, ReviewDecision, VerificationStatus
+    EvidenceRecord, ConfidenceLevel, ReviewDecision, VerificationStatus, CitationVerdict, Verdict,
 )
-from ..models.citation import CitationCandidate
+from ..models.citation import (
+    CitationCandidate, is_valid_citation, make_placeholder_citation,
+)
 from ..services.pubmed_client import PubMedClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.ref_library import ReferenceLibrary
 from ..storage.cache_db import CacheDB
-from ..pipeline.export_slots import is_placeholder, PLACEHOLDER_TITLE_PREFIX
 from .styles import (
     COLOR_HIGH, COLOR_MEDIUM, COLOR_LOW, COLOR_UNRESOLVED, COLOR_ACCEPTED, COLOR_SKIPPED,
 )
@@ -32,24 +35,66 @@ from .widgets.chat_panel import ChatPanel
 logger = logging.getLogger(__name__)
 
 
-class SingleRefWidget(QFrame):
-    """Widget for reviewing a single reference within a multi-ref (REFS) sentence.
+def _follow_wrapped_height(widget: QWidget):
+    """Keep a widget's minimum height equal to what its word-wrapped content
+    needs at the current width.
 
-    Shows citation info with individual Accept / Replace / Remove controls.
+    A QScrollArea sizes its content widget from minimum size hints, and the
+    minimum hint of word-wrapped labels is a single line; without this the
+    reference cards overlap when the panel is narrow. The check runs after
+    the pending layout pass, when the labels know their new width."""
+    def sync():
+        try:
+            height = widget.sizeHint().height()
+        except RuntimeError:            # widget already deleted
+            return
+        if height > 0 and height != widget.minimumHeight():
+            widget.setMinimumHeight(height)
+    QTimer.singleShot(0, sync)
+
+
+class WrappedLabel(QLabel):
+    """A word-wrapping label whose minimum height follows its wrapped text."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        _follow_wrapped_height(self)
+
+
+class SingleRefWidget(QFrame):
+    """Widget for reviewing one reference of a sentence: (REF) sentences show
+    one, (REFS) and multi-marker sentences show one per reference.
+
+    Shows citation info with individual Keep / View / Replace controls, plus
+    Remove when the sentence has more than one slot.  ``slot`` is the marker
+    the reference belongs to (a sentence handled marker by marker keeps one
+    block of references per marker); ``slot_label`` is that marker's text,
+    shown when the sentence has several markers.
     """
     ref_accepted = Signal(int)              # index of accepted ref
     ref_replace_requested = Signal(int, str)  # index, PMID/DOI string
     ref_chat_requested = Signal(int)         # index — open chat panel for this ref
     ref_removed = Signal(int)               # index of removed ref
 
+    ABSTRACT_EXCERPT_CHARS = 220
+
     def __init__(self, index: int, citation: CitationCandidate, accepted: bool = False,
-                 parent=None, slot_label: str = ""):
+                 parent=None, allow_remove: bool = True,
+                 verdict: Optional[CitationVerdict] = None,
+                 slot: int = 0, slot_label: str = ""):
         super().__init__(parent)
         self.index = index
         self.citation = citation
+        self.verdict = verdict
+        self.slot = slot
+        self.slot_label = slot_label
         self._accepted = accepted
         self._removed = False
-        self.slot_label = slot_label  # marker text when the sentence has several markers
+        self._allow_remove = allow_remove
         self._setup_ui()
 
     def _setup_ui(self):
@@ -78,6 +123,8 @@ class SingleRefWidget(QFrame):
         meta = f"{self.citation.first_author_year} | {self.citation.journal_abbrev or self.citation.journal}"
         if self.citation.pmid:
             meta += f" | PMID: {self.citation.pmid}"
+        if self.citation.pmcid:
+            meta += f" | PMCID: {self.citation.pmcid}"
         if self.citation.doi:
             meta += f" | DOI: {self.citation.doi}"
         meta_label = QLabel(meta)
@@ -87,8 +134,22 @@ class SingleRefWidget(QFrame):
 
         # Row 3: Score
         score_label = QLabel(f"Score: {self.citation.composite_score:.0f} | {self.citation.score_rationale}")
+        score_label.setWordWrap(True)
         score_label.setStyleSheet("font-size: 11px; color: #777;")
         layout.addWidget(score_label)
+
+        # Row 3b: Abstract excerpt (when the record carries one)
+        self.abstract_label = QLabel("")
+        self.abstract_label.setWordWrap(True)
+        self.abstract_label.setStyleSheet("font-size: 11px; color: #666; font-style: italic;")
+        layout.addWidget(self.abstract_label)
+        self._set_abstract(self.citation.abstract)
+
+        # Row 3c: Independent verification verdict
+        self.verdict_label = QLabel("")
+        self.verdict_label.setWordWrap(True)
+        layout.addWidget(self.verdict_label)
+        self._set_verdict(self.verdict)
 
         # Row 4: Action buttons
         btn_layout = QHBoxLayout()
@@ -100,7 +161,18 @@ class SingleRefWidget(QFrame):
             "border-radius: 3px; font-size: 11px; font-weight: bold;"
         )
         self.accept_btn.clicked.connect(self._on_accept)
+        # A placeholder ("No citation found") cannot be kept: replace it instead
+        self.accept_btn.setEnabled(is_valid_citation(self.citation))
         btn_layout.addWidget(self.accept_btn)
+
+        self.view_btn = QPushButton("👁 View It")
+        self.view_btn.setStyleSheet(
+            "background-color: #3498db; color: white; padding: 4px 12px; "
+            "border-radius: 3px; font-size: 11px; font-weight: bold;"
+        )
+        self.view_btn.clicked.connect(self._on_view)
+        self.view_btn.setEnabled(bool(self.citation.doi or self.citation.pmid))
+        btn_layout.addWidget(self.view_btn)
 
         self.replace_btn = QPushButton("Replace")
         self.replace_btn.setStyleSheet(
@@ -116,6 +188,7 @@ class SingleRefWidget(QFrame):
             "border-radius: 3px; font-size: 11px; font-weight: bold;"
         )
         self.remove_btn.clicked.connect(self._on_remove)
+        self.remove_btn.setVisible(self._allow_remove)
         btn_layout.addWidget(self.remove_btn)
 
         self.pmid_input = QLineEdit()
@@ -144,9 +217,51 @@ class SingleRefWidget(QFrame):
         # Apply initial state
         if self._accepted:
             self._mark_accepted()
-        elif is_placeholder(self.citation):
-            self.accept_btn.setEnabled(False)
-            self.accept_btn.setToolTip("Nothing to keep: replace this slot or remove it")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        _follow_wrapped_height(self)
+
+    _VERDICT_COLORS = {
+        Verdict.SUPPORTS: COLOR_HIGH,
+        Verdict.PARTIAL: COLOR_MEDIUM,
+        Verdict.NOT_SUPPORTED: COLOR_LOW,
+        Verdict.UNVERIFIED: COLOR_UNRESOLVED,
+    }
+
+    def _set_verdict(self, verdict: Optional[CitationVerdict]):
+        self.verdict = verdict
+        if verdict is None:
+            self.verdict_label.setText("")
+            self.verdict_label.setVisible(False)
+            return
+        label = verdict.verdict.value.replace("_", " ")
+        text = f"Verification: {label}"
+        if verdict.quote:
+            quote = verdict.quote[:140].rstrip() + ("…" if len(verdict.quote) > 140 else "")
+            text += f" — “{quote}”"
+            if not verdict.quote_found:
+                text += " (quote not found in the paper)"
+        if verdict.source:
+            text += f" ({verdict.source.replace('_', ' ')})"
+        elif verdict.reason:
+            text += f" — {verdict.reason}"
+        color = self._VERDICT_COLORS.get(verdict.verdict, COLOR_UNRESOLVED)
+        self.verdict_label.setText(text)
+        self.verdict_label.setStyleSheet(f"font-size: 11px; color: {color}; font-weight: bold;")
+        self.verdict_label.setVisible(True)
+
+    def _set_abstract(self, abstract: str):
+        text = (abstract or "").strip()
+        if text:
+            excerpt = text[:self.ABSTRACT_EXCERPT_CHARS].rstrip()
+            if len(text) > self.ABSTRACT_EXCERPT_CHARS:
+                excerpt += "…"
+            self.abstract_label.setText(f"Abstract: {excerpt}")
+            self.abstract_label.setVisible(True)
+        else:
+            self.abstract_label.setText("")
+            self.abstract_label.setVisible(False)
 
     def _update_frame_style(self):
         if self._removed:
@@ -169,6 +284,16 @@ class SingleRefWidget(QFrame):
         self._accepted = True
         self._mark_accepted()
         self.ref_accepted.emit(self.index)
+
+    def _on_view(self):
+        """Open the article in the default browser."""
+        if self.citation.doi:
+            url = f"https://doi.org/{self.citation.doi}"
+        elif self.citation.pmid:
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{self.citation.pmid}"
+        else:
+            return
+        QDesktopServices.openUrl(QUrl(url))
 
     def _mark_accepted(self):
         self._accepted = True
@@ -214,6 +339,8 @@ class SingleRefWidget(QFrame):
         """Called after successful fetch — update display for the replaced ref."""
         self.citation = new_citation
         self._accepted = True
+        self._set_abstract(new_citation.abstract)
+        self._set_verdict(None)          # a user-chosen paper has not been verified
         self._update_frame_style()
         self.accept_btn.setEnabled(False)
         self.accept_btn.setText("✓ Replaced")
@@ -221,6 +348,7 @@ class SingleRefWidget(QFrame):
         self.remove_btn.setVisible(False)
         self.pmid_input.setVisible(False)
         self.fetch_btn.setVisible(False)
+        self.view_btn.setEnabled(bool(new_citation.doi or new_citation.pmid))
         self.status_label.setText(f"✓ Replaced → {new_citation.title[:50]}...")
         self.status_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #2980b9;")
 
@@ -327,7 +455,7 @@ class SentenceListItem(QListWidgetItem):
         if self.evidence and self.evidence.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED):
             self.setForeground(QColor(COLOR_ACCEPTED))
             return
-        if self.evidence and self.evidence.review_decision == ReviewDecision.REJECTED:
+        if self.evidence and self.evidence.review_decision == ReviewDecision.SKIPPED:
             self.setForeground(QColor(COLOR_SKIPPED))
             return
 
@@ -351,6 +479,7 @@ class SentenceListItem(QListWidgetItem):
 class ReviewTab(QWidget):
     """Tab for reviewing and accepting/modifying citation assignments."""
     export_requested = Signal()
+    preview_requested = Signal()  # Emitted to preview insert-mode final numbering
     project_modified = Signal()  # Emitted when a review decision changes
     library_updated = Signal()   # Emitted after refs are added to the active library
 
@@ -363,6 +492,7 @@ class ReviewTab(QWidget):
         self._per_ref_accepted: dict[int, bool] = {}  # index -> accepted
         self._per_ref_removed: dict[int, bool] = {}   # index -> removed
         self._chat_replace_index = None   # per-ref index when chat replaces one ref (int or None)
+        self._fetch_worker = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -399,9 +529,16 @@ class ReviewTab(QWidget):
         self.add_to_lib_btn.setEnabled(False)
         self.add_to_lib_btn.clicked.connect(self._on_add_new_refs_to_library)
 
+        # Insert-mode only: preview the merged final numbering before export.
+        self.preview_btn = QPushButton("Preview Numbering")
+        self.preview_btn.setVisible(False)
+        self.preview_btn.clicked.connect(
+            lambda _checked=False: self.preview_requested.emit())
+
         top_actions = QVBoxLayout()
         top_actions.setSpacing(6)
         top_actions.addWidget(self.export_btn)
+        top_actions.addWidget(self.preview_btn)
         top_actions.addWidget(self.add_to_lib_btn)
         top_layout.addLayout(top_actions)
 
@@ -492,8 +629,8 @@ class ReviewTab(QWidget):
 
         self.skip_btn = QPushButton("Leave unchanged")
         self.skip_btn.setToolTip(
-            "Keep this marker's original text on export (for example when a "
-            "parenthetical is not really a citation, or you want to handle it yourself)"
+            "Keep this sentence's marker(s) exactly as written on export (for example "
+            "when a parenthetical is not really a citation, or you want to handle it yourself)"
         )
         self.skip_btn.clicked.connect(self._on_skip)
         self.skip_btn.setEnabled(False)
@@ -525,6 +662,7 @@ class ReviewTab(QWidget):
         """Load project data into the review tab."""
         self._configure_reference_library(project)
         self._project = project
+        self.preview_btn.setVisible(bool(project and project.is_insert_mode))
         self._refresh_sentence_list()
         self._update_status()
 
@@ -565,6 +703,7 @@ class ReviewTab(QWidget):
                 continue
             ins, upd = self._ref_library.upsert_candidate(
                 citation, source=f"accepted_{source}",
+                merge=bool(citation.record_uuid),   # read back from a document: never degrade a row
             )
             if ins:
                 imported += 1
@@ -611,8 +750,17 @@ class ReviewTab(QWidget):
             + (" — Ready to export!" if all_done and total > 0 else "")
         )
 
-        self.export_btn.setEnabled(all_done and total > 0)
-        if all_done and total > 0:
+        # A tracked document can be exported with no new markers at all:
+        # that renumbers it after edits made in Word.
+        existing = self._project.existing_citations
+        tracking = existing.tracking if existing is not None else None
+        tracked = tracking is not None and tracking.tier == DocumentTier.TRACKED
+        read_only = tracking is not None and (
+            tracking.tier in (DocumentTier.FAILED, DocumentTier.NEWER_VERSION)
+            or tracking.foreign_field_count > 0)
+        exportable = ((all_done and total > 0) or (tracked and all_done)) and not read_only
+        self.export_btn.setEnabled(exportable)
+        if exportable:
             self.export_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         else:
             self.export_btn.setStyleSheet("background-color: #ccc; color: #666;")
@@ -649,21 +797,27 @@ class ReviewTab(QWidget):
 
     @staticmethod
     def _is_valid_citation(citation: CitationCandidate) -> bool:
-        return not is_placeholder(citation)
+        return is_valid_citation(citation)
 
-    def _current_sentence(self) -> Optional[SentenceRecord]:
-        if not self._project or not self._current_sentence_id:
+    def _get_current_sentence(self) -> Optional[SentenceRecord]:
+        """The SentenceRecord for the currently selected sentence, if any."""
+        return self._sentence_by_id(self._current_sentence_id)
+
+    def _sentence_by_id(self, sentence_id: Optional[str]) -> Optional[SentenceRecord]:
+        if not self._project or not sentence_id:
             return None
         for s in self._project.sentences:
-            if s.id == self._current_sentence_id:
+            if s.id == sentence_id:
                 return s
         return None
 
     @staticmethod
     def _n_slots(sentence: Optional[SentenceRecord]) -> int:
+        """Citation slots of a sentence: one per marker when it was handled
+        marker by marker, else one shared by every marker."""
         if sentence is None:
             return 1
-        return max(len(sentence.markers), sentence.marker_count, 1)
+        return max(sentence.slot_count, 1)
 
     @staticmethod
     def _has_full_style_fields(citation: CitationCandidate) -> bool:
@@ -828,6 +982,7 @@ class ReviewTab(QWidget):
             ins, upd = self._ref_library.upsert_candidate(
                 enriched,
                 source=f"manual_add_{source}",
+                merge=bool(citation.record_uuid),
             )
             if ins:
                 imported += 1
@@ -866,11 +1021,25 @@ class ReviewTab(QWidget):
         self._per_ref_accepted.clear()
         self._per_ref_removed.clear()
 
-    def _show_per_ref_mode(self, evidence: EvidenceRecord, sentence: SentenceRecord = None):
-        """Build individual reference widgets for a multi-ref sentence.
+    def _ref_widgets(self) -> list[SingleRefWidget]:
+        return [w for w in self._per_ref_widgets if isinstance(w, SingleRefWidget)]
 
-        For multi-(REF) sentences, ensures one widget per marker even if some
-        citations are missing. Missing slots show a placeholder with a Replace button.
+    def _connect_ref_widget(self, widget: SingleRefWidget):
+        widget.ref_accepted.connect(self._on_single_ref_accepted)
+        widget.ref_replace_requested.connect(self._on_single_ref_replace)
+        widget.ref_chat_requested.connect(self._on_single_ref_chat)
+        widget.ref_removed.connect(self._on_single_ref_removed)
+
+    def _show_per_ref_mode(self, evidence: EvidenceRecord, sentence: SentenceRecord = None):
+        """Build one reference widget per citation, grouped by marker slot.
+
+        A (REF) sentence has one slot, a (REFS) sentence one slot holding
+        every selected reference, a sentence handled marker by marker one
+        slot per marker (``EvidenceRecord.slot_sizes``). A slot without a
+        citation shows a placeholder whose Replace button opens the search.
+        The widgets are the source of truth while the user decides;
+        ``evidence.selected`` and ``slot_sizes`` are rebuilt from them in
+        ``_check_all_refs_reviewed``.
         """
         self._clear_per_ref_widgets()
 
@@ -878,79 +1047,96 @@ class ReviewTab(QWidget):
         self.ref_detail.setVisible(False)
         self.per_ref_scroll.setVisible(True)
 
-        # Hide the global accept/modify/skip controls — per-ref widgets have their own
+        # Hide the global accept/modify controls — per-ref widgets have their
+        # own; "Leave unchanged" applies to the whole sentence and stays.
         self.accept_btn.setVisible(False)
         self.modify_btn.setVisible(False)
-        self.skip_btn.setVisible(False)
         self.pmid_edit.setVisible(False)
+        self.skip_btn.setVisible(True)
 
-        # Header row: "Accept All" + "Leave unchanged"
-        header_row = QWidget(self.per_ref_container)
-        header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        accept_all_btn = QPushButton("✓ Accept All References")
-        accept_all_btn.setStyleSheet(
-            "background-color: #27ae60; color: white; padding: 6px 16px; "
-            "border-radius: 4px; font-size: 12px; font-weight: bold;"
-        )
-        accept_all_btn.clicked.connect(self._on_accept_all_refs)
-        header_layout.addWidget(accept_all_btn)
-        skip_all_btn = QPushButton("Leave unchanged")
-        skip_all_btn.setToolTip("Keep every marker in this sentence exactly as written")
-        skip_all_btn.clicked.connect(self._on_skip)
-        header_layout.addWidget(skip_all_btn)
-        if evidence.review_decision == ReviewDecision.REJECTED:
-            note = QLabel("Left unchanged: keeps its original text on export "
-                          "(accept or replace references to change that)")
-            note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
-            note.setWordWrap(True)
-            header_layout.addWidget(note)
-        header_layout.addStretch()
-        # Insert before the stretch
-        self.per_ref_layout.insertWidget(0, header_row)
-        self._per_ref_widgets.append(header_row)  # track for cleanup
+        n_slots = self._n_slots(sentence)
+        if n_slots > 1:
+            evidence.normalize_slots(n_slots)
+        else:
+            evidence.slot_sizes = [len(evidence.selected)]
+        ranges = evidence.slot_ranges(n_slots)
+        markers = sentence.markers if sentence else []
+        show_slot_labels = n_slots > 1
+
+        # (slot, citation or None, index into selected or -1)
+        rows: list[tuple[int, Optional[CitationCandidate], int]] = []
+        for slot, (start, end) in enumerate(ranges):
+            if start == end:
+                rows.append((slot, None, -1))
+                continue
+            for i in range(start, end):
+                rows.append((slot, evidence.selected[i], i))
+        if not rows:
+            rows.append((0, None, -1))
+
+        several = len(rows) > 1
+        offset = 0
+        if several:
+            # "Accept All" only makes sense for several references
+            accept_all_btn = QPushButton("✓ Accept All References")
+            accept_all_btn.setStyleSheet(
+                "background-color: #27ae60; color: white; padding: 6px 16px; "
+                "border-radius: 4px; font-size: 12px; font-weight: bold;"
+            )
+            accept_all_btn.clicked.connect(self._on_accept_all_refs)
+            self.per_ref_layout.insertWidget(0, accept_all_btn)
+            self._per_ref_widgets.append(accept_all_btn)  # track for cleanup
+            offset = 1
+
+        info_lines = []
+        if evidence.review_decision == ReviewDecision.SKIPPED:
+            info_lines.append("Left unchanged: this sentence's marker(s) keep their original "
+                              "text on export (keep or replace a reference to change that).")
+        if sentence is not None:
+            summary = self._suggested_summary(sentence)
+            if summary:
+                info_lines.append(summary)
+        if evidence.confidence_rationale:
+            info_lines.append(f"AI assessment: {evidence.confidence_rationale}")
+        if info_lines:
+            info = WrappedLabel("\n".join(info_lines))
+            info.setStyleSheet("font-size: 11px; color: #34495e; padding: 4px 2px;")
+            self.per_ref_layout.insertWidget(offset, info)
+            self._per_ref_widgets.append(info)
+            offset += 1
 
         already_resolved = evidence.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED)
 
-        # One block of citations per marker slot; a slot with no citation gets
-        # a placeholder row so the user can Replace it.
-        n_slots = self._n_slots(sentence)
-        evidence.normalize_slots(n_slots)
-        for slot in range(n_slots):
-            if evidence.slot_sizes[slot] == 0:
-                placeholder = CitationCandidate(
-                    title=f"{PLACEHOLDER_TITLE_PREFIX} — click Replace to search)",
-                    pmid="", doi="", year=0, journal="", authors=[],
-                )
-                placeholder.composite_score = 0.0
-                placeholder.score_rationale = "No citation found for this marker"
-                evidence.insert_into_slot(slot, placeholder, n_slots)
-
-        markers = list(sentence.markers) if sentence else []
-        show_slot_labels = n_slots > 1
-        row = 1  # row 0 is the header
-        for slot, (start, end) in enumerate(evidence.slot_ranges(n_slots)):
+        for widget_index, (slot, citation, sel_index) in enumerate(rows):
             slot_label = ""
             if show_slot_labels:
                 slot_label = markers[slot].text if slot < len(markers) else f"marker {slot + 1}"
-            for i in range(start, end):
-                citation = evidence.selected[i]
-                placeholder_row = is_placeholder(citation)
-                widget = SingleRefWidget(
-                    i, citation,
-                    accepted=already_resolved and not placeholder_row,
-                    parent=self.per_ref_container,
-                    slot_label=slot_label,
-                )
-                widget.ref_accepted.connect(self._on_single_ref_accepted)
-                widget.ref_replace_requested.connect(self._on_single_ref_replace)
-                widget.ref_chat_requested.connect(self._on_single_ref_chat)
-                widget.ref_removed.connect(self._on_single_ref_removed)
-                self.per_ref_layout.insertWidget(row, widget)
-                row += 1
-                self._per_ref_widgets.append(widget)
-                if already_resolved and not placeholder_row:
-                    self._per_ref_accepted[i] = True
+            if citation is not None and is_valid_citation(citation):
+                verdict = evidence.verdicts[sel_index] if 0 <= sel_index < len(evidence.verdicts) else None
+                widget = SingleRefWidget(widget_index, citation, accepted=already_resolved,
+                                         parent=self.per_ref_container, allow_remove=several,
+                                         verdict=verdict, slot=slot, slot_label=slot_label)
+            else:
+                # Missing citation for this slot — show a placeholder widget.
+                # The placeholder lives only in the widget; evidence.selected
+                # is rebuilt from widget decisions in _check_all_refs_reviewed,
+                # so it can never leak into the exported bibliography.
+                widget = SingleRefWidget(widget_index, make_placeholder_citation(), accepted=False,
+                                         parent=self.per_ref_container, allow_remove=several,
+                                         slot=slot, slot_label=slot_label)
+            self._connect_ref_widget(widget)
+            # Insert before the stretch
+            self.per_ref_layout.insertWidget(offset + widget_index, widget)
+            self._per_ref_widgets.append(widget)
+            if widget._accepted:
+                self._per_ref_accepted[widget_index] = True
+
+        if evidence.abstract_snippets:
+            snippets = WrappedLabel("Supporting snippets:\n" + "\n".join(
+                f'  “{snip[:150]}…”' for snip in evidence.abstract_snippets))
+            snippets.setStyleSheet("font-size: 11px; color: #555; padding: 4px 2px;")
+            self.per_ref_layout.insertWidget(offset + len(rows), snippets)
+            self._per_ref_widgets.append(snippets)
 
     def _show_text_mode(self):
         """Switch back to the simple text view for single-ref sentences."""
@@ -1038,15 +1224,10 @@ class ReviewTab(QWidget):
         self.sentence_text.setHtml(
             f'<div style="font-size: 13px; line-height: 1.4;">{highlighted}</div>'
         )
-
         self.skip_btn.setEnabled(True)
-        suggested_info = self._suggested_summary(sentence)
-        skipped_note = ""
-        if evidence and evidence.review_decision == ReviewDecision.REJECTED:
-            skipped_note = "Left unchanged: this marker keeps its original text on export.\n\n"
 
         # Show confidence
-        if evidence and (evidence.selected or self._n_slots(sentence) > 1):
+        if evidence and evidence.selected:
             level = evidence.confidence_level
             score = evidence.confidence_score
             color_map = {
@@ -1056,51 +1237,19 @@ class ReviewTab(QWidget):
                 ConfidenceLevel.UNRESOLVED: COLOR_UNRESOLVED,
             }
             color = color_map.get(level, COLOR_UNRESOLVED)
-            self.confidence_label.setText(f"{level.value} ({score:.0f}/100)")
+            badge = f"{level.value} ({score:.0f}/100)"
+            if evidence.verification_status != VerificationStatus.NOT_CHECKED:
+                badge += f" · {evidence.verification_status.value.replace('_', ' ')}"
+            self.confidence_label.setText(badge)
             self.confidence_label.setStyleSheet(
                 f"color: white; background-color: {color}; font-size: 14px; "
                 f"font-weight: bold; padding: 4px 12px; border-radius: 4px;"
             )
 
-            # Decide: per-ref widgets when several citations or several markers
-            # are involved, text view for a single citation on a single marker.
-            # Using marker count (not citation count) keeps multi-marker
-            # sentences editable even when some markers found nothing.
-            is_multi_ref = len(evidence.selected) > 1 or self._n_slots(sentence) > 1
-
-            if is_multi_ref:
-                self._show_per_ref_mode(evidence, sentence)
-            else:
-                # Single ref — use text view
-                self._show_text_mode()
-
-                ref_text = skipped_note
-                if suggested_info:
-                    ref_text += suggested_info + "\n\n"
-                for i, sel in enumerate(evidence.selected, 1):
-                    ref_text += f"[{i}] {sel.title}\n"
-                    ref_text += f"    {sel.first_author_year} | {sel.journal_abbrev or sel.journal}\n"
-                    ref_text += f"    PMID: {sel.pmid or '-'}"
-                    if sel.pmcid:
-                        ref_text += f" | PMCID: {sel.pmcid}"
-                    if sel.doi:
-                        ref_text += f" | DOI: {sel.doi}"
-                    ref_text += f"\n    Score: {sel.composite_score:.0f} | {sel.score_rationale}\n"
-                    if sel.abstract:
-                        ref_text += f"    Abstract: {sel.abstract[:200]}...\n"
-                    ref_text += "\n"
-
-                if evidence.confidence_rationale:
-                    ref_text += f"AI assessment: {evidence.confidence_rationale}\n\n"
-
-                if evidence.abstract_snippets:
-                    ref_text += "Supporting snippets:\n"
-                    for snip in evidence.abstract_snippets:
-                        ref_text += f'  "{snip[:150]}..."\n'
-
-                self.ref_detail.setPlainText(ref_text)
-                self.accept_btn.setEnabled(True)
-                self.modify_btn.setEnabled(True)
+            # Every sentence with candidates gets per-reference widgets
+            # (Keep / View / Replace, plus Remove when there are several),
+            # whether it has one (REF) or many (REFS) references.
+            self._show_per_ref_mode(evidence, sentence)
 
             # Warnings
             if evidence.warnings:
@@ -1110,34 +1259,31 @@ class ReviewTab(QWidget):
                 self.warnings_label.setText("")
 
         else:
-            self._show_text_mode()
             self.confidence_label.setText("No candidates found")
             self.confidence_label.setStyleSheet(
                 "color: white; background-color: #999; font-size: 14px; "
                 "font-weight: bold; padding: 4px 12px; border-radius: 4px;"
             )
-            text = skipped_note
-            if suggested_info:
-                text += suggested_info + "\n\n"
-            if evidence and evidence.retrieval_error:
-                text += f"{evidence.retrieval_error}\n\n"
-            if sentence.has_suggested_marker:
-                text += (
-                    "The suggested citation could not be confirmed.\n"
-                    "Use 'Modify / Search' to find the paper, or 'Leave unchanged' to keep "
-                    "the text as written."
-                )
-            else:
-                text += "No references were found for this sentence.\nUse 'Modify' to enter a PMID manually."
-            self.ref_detail.setPlainText(text)
-            if evidence and evidence.warnings:
+            if evidence is not None and evidence.warnings:
                 self.warnings_label.setText(
-                    "Warnings: " + "; ".join(w.message for w in evidence.warnings)
-                )
+                    "Warnings: " + "; ".join(w.message for w in evidence.warnings))
             else:
                 self.warnings_label.setText("")
-            self.accept_btn.setEnabled(False)
-            self.modify_btn.setEnabled(True)
+            if evidence is not None:
+                # The pipeline ran and found nothing: a placeholder slot per
+                # marker whose Replace button opens the search.
+                self._show_per_ref_mode(evidence, sentence)
+            else:
+                self._show_text_mode()
+                text = ""
+                if sentence.has_suggested_marker:
+                    text = self._suggested_summary(sentence) + "\n\n"
+                text += ("No references were found for this sentence.\n"
+                         "Use 'Modify / Search' to find one or enter a PMID, or "
+                         "'Leave unchanged' to keep the text as written.")
+                self.ref_detail.setPlainText(text)
+                self.accept_btn.setEnabled(False)
+                self.modify_btn.setEnabled(True)
 
     def _on_accept(self):
         """Accept the current citation assignment (single-ref or whole-sentence accept)."""
@@ -1159,7 +1305,7 @@ class ReviewTab(QWidget):
             self._advance_to_next_unresolved()
 
     def _on_skip(self):
-        """Leave the current marker(s) unchanged in the exported document."""
+        """Leave the current sentence's marker(s) unchanged in the exported document."""
         if not self._current_sentence_id or not self._project:
             return
 
@@ -1168,7 +1314,7 @@ class ReviewTab(QWidget):
             evidence = EvidenceRecord(sentence_id=self._current_sentence_id)
             self._project.evidence_map[self._current_sentence_id] = evidence
 
-        evidence.review_decision = ReviewDecision.REJECTED
+        evidence.review_decision = ReviewDecision.SKIPPED
         self.project_modified.emit()
         logger.info(f"Marker left unchanged for {self._current_sentence_id}")
 
@@ -1199,24 +1345,11 @@ class ReviewTab(QWidget):
 
         self._per_ref_removed[index] = True
 
-        # Remove the citation from evidence.selected, keeping the marker slots
-        # consistent (the slot that owned it shrinks; later slots keep their
-        # citations).  Widgets after this one shift down by one so their
-        # indices keep pointing at the right citation.
-        n_slots = self._n_slots(self._current_sentence())
-        removed = evidence.remove_selected(index, n_slots)
-        if removed is not None:
-            logger.info(f"Removed ref [{index+1}] for {self._current_sentence_id}: {removed.title[:60]}")
-            for w in self._per_ref_widgets:
-                if not isinstance(w, SingleRefWidget):
-                    continue
-                if w._removed and w.index == index:
-                    w.index = -1          # retired: never matched by later lookups
-                elif w.index > index:
-                    w.index -= 1
-            self._per_ref_accepted = {
-                (i - 1 if i > index else i): v for i, v in self._per_ref_accepted.items() if i != index
-            }
+        # Do NOT mutate evidence.selected here — popping would shift every
+        # later widget's index onto the wrong citation.  The widgets are the
+        # source of truth; evidence.selected is rebuilt from their decisions
+        # in _check_all_refs_reviewed once every slot has one.
+        logger.info(f"Removed ref [{index+1}] for {self._current_sentence_id}")
 
         self._check_all_refs_reviewed()
 
@@ -1238,24 +1371,12 @@ class ReviewTab(QWidget):
         self._fetch_worker.error.connect(self._on_single_ref_fetch_error)
         self._fetch_worker.start()
 
-    @Slot(int)
-    def _on_single_ref_chat(self, index: int):
-        """Open the chat panel to replace a single reference at `index`."""
-        if not self._current_sentence_id or not self._project:
-            return
-
-        sentence = None
-        for s in self._project.sentences:
-            if s.id == self._current_sentence_id:
-                sentence = s
-                break
+    def _open_chat_for_current(self):
+        """Show the chat panel for the current sentence."""
+        sentence = self._get_current_sentence()
         if not sentence:
-            return
+            return False
 
-        # Track which per-ref index the chat should replace
-        self._chat_replace_index = index
-
-        # Show chat panel
         self.chat_panel.setVisible(True)
 
         # Resize splitter: sentence list | detail | chat = 25% | 40% | 35%
@@ -1271,7 +1392,19 @@ class ReviewTab(QWidget):
             sentence_id=self._current_sentence_id,
             claim_text=sentence.clean_text,
             settings=self._project.settings,
+            context_text=build_claim_context(self._project.sentences, sentence).to_context_block(),
         )
+        return True
+
+    @Slot(int)
+    def _on_single_ref_chat(self, index: int):
+        """Open the chat panel to replace a single reference at `index`."""
+        if not self._current_sentence_id or not self._project:
+            return
+        # Track which per-ref index the chat should replace
+        self._chat_replace_index = index
+        if not self._open_chat_for_current():
+            self._chat_replace_index = None
 
     @Slot(object)
     def _on_single_ref_fetched(self, article: CitationCandidate):
@@ -1279,58 +1412,40 @@ class ReviewTab(QWidget):
         index = self._replace_ref_index
         sentence_id = self._replace_ref_sentence_id
 
+        # Stale callback guard: the user may have switched sentences while
+        # the fetch was in flight — the widgets now belong to another sentence.
+        if sentence_id != self._current_sentence_id:
+            logger.info(f"Discarding stale fetch result for {sentence_id}")
+            return
+
         evidence = self._project.evidence_map.get(sentence_id)
         if not evidence:
             return
 
-        # Replace just the one reference at this index
+        # The widget holds the replacement; evidence.selected is rebuilt from
+        # widget decisions in _check_all_refs_reviewed.
         article.composite_score = 100.0
         article.score_rationale = "User-specified replacement"
-        index = self._put_citation_at(evidence, index, article, sentence_id)
-
-        # Also add to candidates list
         evidence.candidates = [article] + evidence.candidates
 
         logger.info(f"Replaced ref [{index+1}] for {sentence_id} with: {article.title[:60]}")
 
         # Update the widget
-        for w in self._per_ref_widgets:
-            if isinstance(w, SingleRefWidget) and not w._removed and w.index == index:
+        for w in self._ref_widgets():
+            if w.index == index:
                 w.mark_replaced(article)
                 break
 
         self._per_ref_accepted[index] = True
         self._check_all_refs_reviewed()
 
-    def _sentence_by_id(self, sentence_id: Optional[str]) -> Optional[SentenceRecord]:
-        if not self._project or not sentence_id:
-            return None
-        for s in self._project.sentences:
-            if s.id == sentence_id:
-                return s
-        return None
-
-    def _put_citation_at(self, evidence: EvidenceRecord, index: int,
-                         article: CitationCandidate, sentence_id: Optional[str] = None) -> int:
-        """Store *article* at ``selected[index]`` (or append to the last slot).
-
-        Returns the index the article ended up at.
-        """
-        sentence = self._sentence_by_id(sentence_id) if sentence_id else self._current_sentence()
-        n_slots = self._n_slots(sentence)
-        if 0 <= index < len(evidence.selected):
-            evidence.normalize_slots(n_slots)
-            evidence.selected[index] = article
-            return index
-        return evidence.insert_into_slot(n_slots - 1, article, n_slots)
-
     @Slot(str)
     def _on_single_ref_fetch_error(self, error_msg: str):
         """Handle fetch failure for a per-ref replacement."""
         index = self._replace_ref_index
 
-        for w in self._per_ref_widgets:
-            if isinstance(w, SingleRefWidget) and not w._removed and w.index == index:
+        for w in self._ref_widgets():
+            if w.index == index:
                 w.mark_fetch_error(error_msg)
                 break
 
@@ -1349,10 +1464,12 @@ class ReviewTab(QWidget):
         if not evidence:
             return
 
-        # Mark all non-removed per-ref widgets as accepted
-        for w in self._per_ref_widgets:
-            if isinstance(w, SingleRefWidget) and not w._removed and not w._accepted \
-                    and not is_placeholder(w.citation):
+        # Mark all non-removed per-ref widgets as accepted.  Placeholder slots
+        # ("No citation found") are skipped — the user must explicitly replace
+        # or remove them, otherwise Accept All would silently bless an
+        # unresolved marker.
+        for w in self._ref_widgets():
+            if not w._removed and not w._accepted and is_valid_citation(w.citation):
                 w._on_accept()
 
         # This triggers _check_all_refs_reviewed via each widget's signal
@@ -1370,43 +1487,52 @@ class ReviewTab(QWidget):
         if not evidence:
             return
 
-        # Count non-removed SingleRefWidgets and how many of those are accepted
-        active_widgets = [
-            w for w in self._per_ref_widgets
-            if isinstance(w, SingleRefWidget) and not w._removed
-        ]
-        all_active_accepted = all(w._accepted for w in active_widgets)
-        all_removed_or_accepted = all(
-            isinstance(w, SingleRefWidget) and (w._accepted or w._removed)
-            for w in self._per_ref_widgets
-            if isinstance(w, SingleRefWidget)
-        )
-
+        widgets = self._ref_widgets()
+        all_removed_or_accepted = all(w._accepted or w._removed for w in widgets)
         if not all_removed_or_accepted:
             return  # Still have undecided refs
 
+        # All refs have a decision — rebuild evidence.selected from the
+        # widgets (the single write point; avoids stale-index corruption).
+        # Each kept reference goes back into the marker slot its widget
+        # belongs to, so a sentence handled marker by marker keeps one block
+        # of references per marker (slot_sizes); an emptied slot exports as
+        # [?] for a (REF)/(REFS) marker and keeps its text for a suggested one.
+        sentence = self._get_current_sentence()
+        n_slots = self._n_slots(sentence)
+        rebuilt = []
+        rebuilt_verdicts = []
+        sizes = [0] * n_slots
+        for w in widgets:
+            if w._removed or not is_valid_citation(w.citation):
+                continue
+            rebuilt.append(w.citation)
+            sizes[min(max(w.slot, 0), n_slots - 1)] += 1
+            rebuilt_verdicts.append(w.verdict or CitationVerdict(
+                key=w.citation.pmid or w.citation.doi or w.citation.title,
+                reason="chosen by the user"))
+        evidence.selected = rebuilt
+        evidence.slot_sizes = sizes
+        evidence.verdicts = rebuilt_verdicts if evidence.verdicts else []
+
         # All refs have a decision — mark sentence as resolved
-        has_removal = any(
-            isinstance(w, SingleRefWidget) and w._removed
-            for w in self._per_ref_widgets
-        )
+        has_removal = any(w._removed for w in widgets)
         has_replacement = any(
-            isinstance(w, SingleRefWidget)
-            and w.citation.score_rationale in ("User-specified replacement", "User-selected via chat")
-            for w in self._per_ref_widgets
+            w.citation.score_rationale in ("User-specified replacement", "User-selected via chat")
+            for w in widgets
         )
 
-        if evidence.review_decision in (ReviewDecision.PENDING, ReviewDecision.REJECTED):
+        if evidence.review_decision in (ReviewDecision.PENDING, ReviewDecision.SKIPPED,
+                                        ReviewDecision.REJECTED):
             if has_removal or has_replacement:
                 evidence.review_decision = ReviewDecision.MODIFIED
             else:
                 evidence.review_decision = ReviewDecision.ACCEPTED
 
         self.project_modified.emit()
-        remaining = len(evidence.selected)
         logger.info(
             f"All refs reviewed for {self._current_sentence_id}: "
-            f"{remaining} kept, {sum(1 for w in self._per_ref_widgets if isinstance(w, SingleRefWidget) and w._removed)} removed"
+            f"{len(rebuilt)} kept, {sum(1 for w in widgets if w._removed)} removed"
         )
 
         # Update list item
@@ -1421,37 +1547,9 @@ class ReviewTab(QWidget):
         """Open the chat panel for interactive citation search."""
         if not self._current_sentence_id or not self._project:
             return
-
-        # Find the current sentence text
-        sentence = None
-        for s in self._project.sentences:
-            if s.id == self._current_sentence_id:
-                sentence = s
-                break
-
-        if not sentence:
-            return
-
         # Track that this is a whole-sentence modify (not a per-ref replace)
         self._chat_replace_index = None
-
-        # Show chat panel
-        self.chat_panel.setVisible(True)
-
-        # Resize splitter: sentence list | detail | chat = 25% | 40% | 35%
-        total = self.splitter.width() or 900
-        self.splitter.setSizes([
-            int(total * 0.25),
-            int(total * 0.40),
-            int(total * 0.35),
-        ])
-
-        # Initialize the chat panel for this sentence
-        self.chat_panel.open_for_sentence(
-            sentence_id=self._current_sentence_id,
-            claim_text=sentence.clean_text,
-            settings=self._project.settings,
-        )
+        self._open_chat_for_current()
 
     # ── Chat panel integration ───────────────────────────────────
 
@@ -1466,38 +1564,67 @@ class ReviewTab(QWidget):
             evidence = EvidenceRecord(sentence_id=self._current_sentence_id)
             self._project.evidence_map[self._current_sentence_id] = evidence
 
-        # Check if this is a per-ref replacement (REFS mode)
+        # Per-reference replacement (the Replace button on one card)
         if self._chat_replace_index is not None and citations:
             index = self._chat_replace_index
-            article = citations[0]
-            article.composite_score = 100.0
-            article.score_rationale = "User-selected via chat"
+            for article in citations:
+                article.composite_score = 100.0
+                article.score_rationale = "User-selected via chat"
+            first, extra = citations[0], list(citations[1:])
 
-            index = self._put_citation_at(evidence, index, article)
+            # A marker may cite several papers, even when it was (REF): the
+            # extra picks become new cards in the same marker slot.
+            target = next((w for w in self._ref_widgets() if w.index == index), None)
+            slot = target.slot if target is not None else 0
 
-            evidence.candidates = [article] + evidence.candidates
+            # The widgets hold the replacement; evidence.selected is rebuilt
+            # from widget decisions in _check_all_refs_reviewed.
+            evidence.candidates = citations + evidence.candidates
             logger.info(
                 f"Chat replaced ref [{index+1}] for {self._current_sentence_id}: "
-                f"{article.title[:60]}"
+                f"{first.title[:60]}" + (f" (+{len(extra)} more)" if extra else "")
             )
 
-            # Update the per-ref widget
-            for w in self._per_ref_widgets:
-                if isinstance(w, SingleRefWidget) and not w._removed and w.index == index:
-                    w.mark_replaced(article)
-                    break
-
+            if target is not None:
+                target.mark_replaced(first)
             self._per_ref_accepted[index] = True
+            if extra:
+                self._append_ref_widgets(extra, slot=slot, after=target)
             self._check_all_refs_reviewed()
         else:
-            # Whole-sentence replacement
+            # Whole-sentence selection
             for article in citations:
                 article.composite_score = 100.0
                 article.score_rationale = "User-selected via chat"
 
-            evidence.selected = citations
-            n_slots = self._n_slots(self._current_sentence())
-            evidence.slot_sizes = [len(citations)] + [0] * (n_slots - 1)
+            # On multi-ref sentences, merge with already-selected refs instead
+            # of overwriting — the user may have accepted some of them already.
+            sentence = self._get_current_sentence()
+            n_slots = self._n_slots(sentence)
+            is_multi = bool(sentence and (
+                n_slots > 1
+                or sentence.marker_type == MarkerType.REFS
+            ))
+            existing_valid = [c for c in evidence.selected if is_valid_citation(c)]
+            if is_multi and existing_valid:
+                # Keep every slot's kept references; the new papers join the
+                # first empty slot (else the last one).
+                ranges = evidence.slot_ranges(n_slots)
+                blocks = [[c for c in evidence.selected[s:e] if is_valid_citation(c)]
+                          for s, e in ranges]
+                seen = {self._citation_key(c) for c in existing_valid}
+                new = []
+                for article in citations:
+                    if self._citation_key(article) not in seen:
+                        seen.add(self._citation_key(article))
+                        new.append(article)
+                target = next((i for i, b in enumerate(blocks) if not b), len(blocks) - 1)
+                blocks[target].extend(new)
+                evidence.selected = [c for b in blocks for c in b]
+                evidence.slot_sizes = [len(b) for b in blocks]
+            else:
+                evidence.selected = list(citations)
+                evidence.slot_sizes = [len(citations)] + [0] * (n_slots - 1)
             evidence.candidates = citations + evidence.candidates
             evidence.review_decision = ReviewDecision.MODIFIED
             self.project_modified.emit()
@@ -1523,11 +1650,43 @@ class ReviewTab(QWidget):
         # Close chat panel
         self._close_chat_panel()
 
+    def _append_ref_widgets(self, citations: list, slot: int = 0, after: Optional[SingleRefWidget] = None):
+        """Add already-chosen papers as new reference cards in marker *slot*,
+        right after *after* (else after the last card).
+
+        Used when the user picks several papers for one marker: the cards
+        are marked replaced, so they count as decided.
+        """
+        ref_widgets = self._ref_widgets()
+        next_index = (max(w.index for w in ref_widgets) + 1) if ref_widgets else 0
+        anchor = after if after is not None else (ref_widgets[-1] if ref_widgets else None)
+        position = (self.per_ref_layout.indexOf(anchor) + 1) if anchor is not None else 0
+        slot_label = anchor.slot_label if anchor is not None else ""
+        for offset, citation in enumerate(citations):
+            widget = SingleRefWidget(next_index + offset, citation, accepted=False,
+                                     parent=self.per_ref_container, allow_remove=True,
+                                     slot=slot, slot_label=slot_label)
+            self._connect_ref_widget(widget)
+            widget.mark_replaced(citation)
+            self.per_ref_layout.insertWidget(position + offset, widget)
+            self._per_ref_widgets.append(widget)
+            self._per_ref_accepted[widget.index] = True
+
     def _close_chat_panel(self):
         """Hide the chat panel and restore splitter sizes."""
+        self.chat_panel.cancel_active_search()
         self.chat_panel.setVisible(False)
         self._chat_replace_index = None
         self.splitter.setSizes([350, 550, 0])
+
+    def shutdown_workers(self, wait_ms: int = 3000):
+        """Cancel and wait for all background workers — call before app close."""
+        self.chat_panel.shutdown_workers(wait_ms)
+        if self._fetch_worker and self._fetch_worker.isRunning():
+            if not self._fetch_worker.wait(wait_ms):
+                logger.warning("Fetch worker did not stop in time; terminating")
+                self._fetch_worker.terminate()
+                self._fetch_worker.wait(1000)
 
     def _advance_to_next_unresolved(self):
         """Move selection to the next unresolved sentence."""
