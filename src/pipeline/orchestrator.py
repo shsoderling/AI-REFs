@@ -9,12 +9,15 @@ from typing import Optional, Callable
 
 from ..models.project import ProjectState, PipelineStage
 from ..models.sentence import SentenceRecord, MarkerType
-from ..models.evidence import EvidenceRecord, ConfidenceLevel
+from ..models.markers import MarkerSpec
+from ..models.evidence import EvidenceRecord, ConfidenceLevel, Warning
 from ..services.docx_io import DocxHandler
 from ..services.pubmed_client import PubMedClient
 from ..services.biorxiv_client import BioRxivClient
 from ..services.europepmc_client import EuropePMCClient
 from ..services.ref_library import ReferenceLibrary
+from ..services.suggestion_resolver import SuggestionResolver
+from ..services.tool_executor import candidate_key
 from ..storage.cache_db import CacheDB
 from .document_parser import DocumentParser
 from .marker_locator import MarkerLocator
@@ -171,7 +174,10 @@ class PipelineOrchestrator:
         stop_at = -1
         if is_insert and self.project.existing_citations:
             stop_at = self.project.existing_citations.references_heading_para_idx
-        parser = DocumentParser(handler, stop_at_para=stop_at)
+        marker_config = self.project.marker_config
+        # Remember the grammar this run used so export scans the DOCX the same way
+        self.project.run_marker_config = marker_config
+        parser = DocumentParser(handler, stop_at_para=stop_at, marker_config=marker_config)
         sentences = parser.parse()
         self.project.sentences = sentences
 
@@ -183,11 +189,17 @@ class PipelineOrchestrator:
         self._emit("info", f"Stage {stage_offset + 2}: Locating markers...")
         self._progress("Locate Markers", stage_offset + 1, total_stages)
 
-        locator = MarkerLocator()
+        locator = MarkerLocator(marker_config)
         sentences = locator.locate(sentences)
         marked = locator.get_marked_sentences(sentences)
 
-        self._emit("info", f"Found {len(marked)} sentences with markers")
+        n_search = sum(1 for s in marked for m in s.markers if m.kind != MarkerType.SUGGESTED)
+        n_suggested = sum(1 for s in marked for m in s.markers if m.kind == MarkerType.SUGGESTED)
+        self._emit(
+            "info",
+            f"Found {len(marked)} sentences with markers: {n_search} (REF)/(REFS) to search, "
+            f"{n_suggested} author-suggested citation marker(s) to verify",
+        )
 
         if not marked:
             self._emit("info", "No markers found in document. Nothing to process.")
@@ -227,6 +239,15 @@ class PipelineOrchestrator:
                 f"Using user library: {user_library.db_path}",
             )
 
+        resolver = SuggestionResolver(
+            pubmed=pubmed,
+            europepmc=europepmc if settings.search_europepmc else None,
+            biorxiv=biorxiv if settings.search_biorxiv else None,
+            medrxiv=BioRxivClient(cache_db=cache, server="medrxiv") if settings.search_biorxiv else None,
+            user_library=user_library,
+            status_callback=lambda msg: self._emit("info", f"    {msg}"),
+        )
+
         agent = LLMCitationAgent(
             anthropic_api_key=settings.anthropic_api_key,
             model=settings.claude_model,
@@ -254,14 +275,17 @@ class PipelineOrchestrator:
                     f"  [{i+1}/{len(marked)}] {sent.id}: {sent.clean_text[:60]}..."
                 )
 
-                # Multi-(REF) sentences: run a SEPARATE search for each (REF) marker
-                if sent.marker_type == MarkerType.REF and sent.marker_count > 1:
-                    evidence = self._find_citations_per_ref(
-                        agent, sent, self.project.inferred_domains
-                    )
-                else:
+                # A lone (REF)/(REFS) marker is a plain search.  Anything else
+                # (several markers, or an author-suggested citation) is handled
+                # marker by marker so each slot gets its own citations.
+                if len(sent.markers) <= 1 and not sent.has_suggested_marker:
                     evidence = agent.find_citations(
                         sent, self.project.inferred_domains
+                    )
+                    evidence.slot_sizes = [len(evidence.selected)]
+                else:
+                    evidence = self._find_citations_per_marker(
+                        agent, resolver, sent, self.project.inferred_domains
                     )
                 self.project.evidence_map[sent.id] = evidence
 
@@ -297,43 +321,59 @@ class PipelineOrchestrator:
 
         return self.project
 
-    def _find_citations_per_ref(
+    def _find_citations_per_marker(
         self,
         agent: LLMCitationAgent,
+        resolver: SuggestionResolver,
         sentence: SentenceRecord,
         domain_context: list[str] = None,
-    ):
-        """Handle sentences with multiple (REF) markers by searching independently.
+    ) -> EvidenceRecord:
+        """Handle a sentence marker by marker and merge the results.
 
-        Splits the sentence at each (REF) marker to figure out which sub-claim
-        needs a citation, runs the agent once per marker, then merges results
-        into a single EvidenceRecord with one citation per slot.
+        * ``(REF)`` / ``(REFS)`` markers are searched independently, each told
+          which papers earlier markers already took so the sentence does not
+          cite the same paper twice.
+        * Author-suggested markers are resolved (library, PubMed, Europe PMC,
+          bioRxiv) and then scored by the agent against the claim.
 
-        Each subsequent marker search is told which PMIDs/DOIs were already
-        assigned so the agent avoids returning duplicates.  If a duplicate
-        still slips through, a post-search deduplication picks the next-best
-        unique candidate from the result set.
+        The merged ``EvidenceRecord`` keeps one contiguous block of
+        ``selected`` citations per marker; ``slot_sizes`` records the block
+        lengths so review and export know which citations belong to which
+        marker.
         """
-        import re
-        from ..models.evidence import EvidenceRecord, ConfidenceLevel, VerificationStatus
-        from ..models.sentence import SentenceRecord as SR
+        markers = list(sentence.markers)
+        if not markers:
+            # Legacy record without marker specs: fall back to a plain search
+            evidence = agent.find_citations(sentence, domain_context)
+            evidence.slot_sizes = [len(evidence.selected)]
+            return evidence
 
-        # Split the raw text at each (REF) to identify the sub-claims
-        parts = re.split(r'\(REF\)', sentence.raw_text)
-        num_markers = sentence.marker_count
+        # Text segments between markers: segments[i] precedes marker i,
+        # segments[-1] follows the last marker.
+        raw = sentence.raw_text
+        segments: list[str] = []
+        prev = 0
+        for m in markers:
+            segments.append(raw[prev:m.start])
+            prev = m.end
+        segments.append(raw[prev:])
 
-        self._emit("info", f"  Multi-(REF): splitting into {num_markers} independent searches")
+        multi = len(markers) > 1
+        if multi:
+            self._emit("info", f"  {len(markers)} markers: handling each independently")
 
-        # Run agent for each sub-claim independently
-        combined_evidence = EvidenceRecord(sentence_id=sentence.id)
-        all_candidates = []
-        all_snippets = []
-        all_queries = []
+        combined = EvidenceRecord(sentence_id=sentence.id)
+        combined.slot_sizes = []
+        all_candidates: list = []
+        all_snippets: list[str] = []
+        all_queries: list[str] = []
+        all_warnings: list[Warning] = []
+        rationales: list[str] = []
         worst_confidence = ConfidenceLevel.HIGH
         total_score = 0.0
+        scored_slots = 0
 
-        # Track already-assigned identifiers to prevent duplicates
-        assigned_keys: set[str] = set()  # PMIDs and DOIs already picked
+        assigned_keys: set[str] = set()  # PMIDs / DOIs already used in this sentence
 
         confidence_order = {
             ConfidenceLevel.HIGH: 3,
@@ -342,122 +382,191 @@ class PipelineOrchestrator:
             ConfidenceLevel.UNRESOLVED: 0,
         }
 
-        for marker_idx in range(num_markers):
+        def _keys(cand) -> set[str]:
+            keys = {candidate_key(cand)}
+            if cand.pmid:
+                keys.add(cand.pmid)
+            if cand.doi:
+                keys.add(cand.doi)
+            return {k for k in keys if k}
+
+        # Resolve every author-suggested marker up front so that (REF)/(REFS)
+        # searches earlier in the sentence are told to avoid those papers.
+        pre_resolved: dict[int, list] = {}
+        for idx, marker in enumerate(markers):
+            if marker.kind != MarkerType.SUGGESTED or not marker.suggestions:
+                continue
+            resolved = resolver.resolve_all(marker.suggestions)
+            pre_resolved[idx] = resolved
+            for r in resolved:
+                if r.candidates and not r.ambiguous:
+                    for cand in r.candidates:
+                        assigned_keys |= _keys(cand)
+
+        for idx, marker in enumerate(markers):
             self._check_pause()
             if self._cancelled:
-                return combined_evidence
+                return combined
 
-            # Build a descriptive sub-claim for this marker
-            sub_text = parts[marker_idx].strip() if marker_idx < len(parts) else ""
-            trailing = parts[marker_idx + 1].strip() if marker_idx + 1 < len(parts) else ""
+            before = segments[idx].strip()
+            after = segments[idx + 1].strip() if idx + 1 < len(segments) else ""
+            label = f"[{idx + 1}/{len(markers)}] {marker.text}" if multi else marker.text
+            self._emit("info", f"    Marker {label}")
 
-            sub_claim = (
-                f"From the sentence: \"{sentence.clean_text}\"\n\n"
-                f"Find a citation specifically for this part: \"{sub_text}\""
-            )
-            if trailing:
-                sub_claim += f" (followed by: \"{trailing[:80]}\")"
+            chosen: list = []
 
-            # Tell the agent which citations are already assigned to prior markers
-            if assigned_keys:
-                exclusion_list = ", ".join(sorted(assigned_keys))
-                sub_claim += (
-                    f"\n\nIMPORTANT: The following identifiers have already been "
-                    f"assigned to other (REF) markers in this sentence. You MUST "
-                    f"find a DIFFERENT paper — do NOT select any of these: "
-                    f"{exclusion_list}"
-                )
+            if marker.kind == MarkerType.SUGGESTED:
+                resolved = pre_resolved.get(idx) or resolver.resolve_all(marker.suggestions)
+                for r in resolved:
+                    if r.candidates:
+                        self._emit(
+                            "info",
+                            f"      {r.suggestion.label} -> {len(r.candidates)} record(s) via {r.source}",
+                        )
+                    else:
+                        self._emit("warning", f"      {r.suggestion.label}: {r.error}")
 
-            # Create a temporary single-marker sentence for the agent
-            temp_sentence = SR(
-                id=f"{sentence.id}_ref{marker_idx}",
-                paragraph_index=sentence.paragraph_index,
-                sentence_index=sentence.sentence_index,
-                raw_text=sentence.raw_text,
-                clean_text=sub_claim,
-                section=sentence.section,
-                marker_type=MarkerType.REF,
-                marker_count=1,  # Treat as single (REF)
-                keywords=sentence.keywords,
-            )
-
-            self._emit(
-                "info",
-                f"    Marker [{marker_idx+1}/{num_markers}]: "
-                f"{parts[marker_idx].strip()[:50]}..."
-            )
-
-            ev = agent.find_citations(temp_sentence, domain_context)
-
-            # Collect the best single citation, enforcing uniqueness
-            selected_citation = None
-            if ev.selected:
-                candidate = ev.selected[0]
-                cand_key = candidate.pmid or candidate.doi or candidate.title[:30]
-
-                if cand_key not in assigned_keys:
-                    selected_citation = candidate
-                else:
-                    # Agent returned a duplicate — pick the next-best unique candidate
-                    self._emit(
-                        "warning",
-                        f"    Agent returned duplicate ({cand_key}) for marker "
-                        f"[{marker_idx+1}], searching for alternative..."
+                position_note = ""
+                if multi and before:
+                    position_note = (
+                        f'The marker {marker.text} appears right after the words: "{before[-160:]}"'
                     )
-                    for alt in ev.candidates:
-                        alt_key = alt.pmid or alt.doi or alt.title[:30]
-                        if alt_key not in assigned_keys:
-                            selected_citation = alt
-                            self._emit(
-                                "info",
-                                f"    Using alternative: {alt.title[:60]}"
-                            )
-                            break
+                temp = SentenceRecord(
+                    id=f"{sentence.id}_m{idx}",
+                    paragraph_index=sentence.paragraph_index,
+                    sentence_index=sentence.sentence_index,
+                    raw_text=sentence.raw_text,
+                    clean_text=sentence.clean_text,
+                    section=sentence.section,
+                    marker_type=MarkerType.SUGGESTED,
+                    marker_count=1,
+                    markers=[marker],
+                    keywords=sentence.keywords,
+                )
+                ev = agent.evaluate_suggested(
+                    temp, marker, resolved, domain_context, context_text=position_note,
+                )
+                chosen = list(ev.selected)
+                if ev.confidence_level != ConfidenceLevel.UNRESOLVED:
+                    total_score += ev.confidence_score
+                    scored_slots += 1
 
-                    if not selected_citation:
+            else:
+                # (REF) -> one citation, (REFS) -> up to max_refs
+                want_many = marker.kind == MarkerType.REFS
+                if multi:
+                    sub_claim = (
+                        f'From the sentence: "{sentence.clean_text}"\n\n'
+                        f'Find {"citations" if want_many else "a citation"} specifically for this part: "{before}"'
+                    )
+                    if after:
+                        sub_claim += f' (followed by: "{after[:80]}")'
+                else:
+                    sub_claim = sentence.clean_text
+
+                if assigned_keys:
+                    exclusion_list = ", ".join(sorted(assigned_keys))
+                    sub_claim += (
+                        f"\n\nIMPORTANT: The following identifiers have already been "
+                        f"assigned to other markers in this sentence. You MUST "
+                        f"find a DIFFERENT paper -- do NOT select any of these: "
+                        f"{exclusion_list}"
+                    )
+
+                temp = SentenceRecord(
+                    id=f"{sentence.id}_m{idx}",
+                    paragraph_index=sentence.paragraph_index,
+                    sentence_index=sentence.sentence_index,
+                    raw_text=sentence.raw_text,
+                    clean_text=sub_claim,
+                    section=sentence.section,
+                    marker_type=marker.kind,
+                    marker_count=1,
+                    markers=[marker],
+                    keywords=sentence.keywords,
+                )
+                ev = agent.find_citations(temp, domain_context)
+
+                limit = agent.max_refs if want_many else 1
+                for cand in ev.selected:
+                    if len(chosen) >= limit:
+                        break
+                    if _keys(cand) & assigned_keys:
                         self._emit(
                             "warning",
-                            f"    No unique alternative found for marker [{marker_idx+1}]"
+                            f"      Agent returned a paper already used in this sentence "
+                            f"({candidate_key(cand)}); looking for an alternative...",
                         )
+                        continue
+                    chosen.append(cand)
+                if ev.selected and not chosen:
+                    # Everything the agent picked is already used in this
+                    # sentence: fall back to the next-best unique paper it
+                    # looked at (same behaviour as the earlier multi-(REF) code).
+                    for alt in ev.candidates:
+                        if _keys(alt) & assigned_keys:
+                            continue
+                        chosen.append(alt)
+                        self._emit("info", f"      Using alternative: {alt.title[:60]}")
+                        break
+                    if not chosen:
+                        self._emit("warning", f"      No unique alternative found for marker {label}")
+                total_score += ev.confidence_score
+                scored_slots += 1
 
-            if selected_citation:
-                combined_evidence.selected.append(selected_citation)
-                sel_key = selected_citation.pmid or selected_citation.doi or selected_citation.title[:30]
-                assigned_keys.add(sel_key)
-                if selected_citation.pmid:
-                    assigned_keys.add(selected_citation.pmid)
-                if selected_citation.doi:
-                    assigned_keys.add(selected_citation.doi)
-            else:
-                self._emit("warning", f"    No citation for marker [{marker_idx+1}]")
+            for cand in chosen:
+                assigned_keys |= _keys(cand)
 
+            if not chosen:
+                self._emit("warning", f"      No citation for marker {label}")
+
+            combined.selected.extend(chosen)
+            combined.slot_sizes.append(len(chosen))
             all_candidates.extend(ev.candidates)
             all_snippets.extend(ev.abstract_snippets)
+            all_warnings.extend(ev.warnings)
             if ev.search_query:
                 all_queries.append(ev.search_query)
+            if ev.confidence_rationale:
+                rationales.append(
+                    f"{marker.text}: {ev.confidence_rationale}" if multi else ev.confidence_rationale
+                )
+            if ev.retrieval_error and not chosen:
+                combined.retrieval_error = (
+                    f"{combined.retrieval_error}; " if combined.retrieval_error else ""
+                ) + (f"{marker.text}: {ev.retrieval_error}" if multi else ev.retrieval_error)
+            if ev.verification_status.value != "not_checked" and not multi:
+                combined.verification_status = ev.verification_status
 
-            # Track worst confidence across all sub-searches
             ev_conf_order = confidence_order.get(ev.confidence_level, 0)
-            worst_conf_order = confidence_order.get(worst_confidence, 3)
-            if ev_conf_order < worst_conf_order:
+            if ev_conf_order < confidence_order.get(worst_confidence, 3):
                 worst_confidence = ev.confidence_level
-            total_score += ev.confidence_score
 
-        # Merge results
-        combined_evidence.candidates = all_candidates
-        combined_evidence.abstract_snippets = all_snippets
-        combined_evidence.search_query = " | ".join(all_queries)
-        combined_evidence.search_result_count = len(all_candidates)
-        combined_evidence.confidence_level = worst_confidence
-        combined_evidence.confidence_score = total_score / max(num_markers, 1)
-        combined_evidence.confidence_rationale = (
-            f"Combined from {num_markers} independent per-marker searches"
+        # Merge results (deduplicate candidates by key, keeping first occurrence)
+        seen: set[str] = set()
+        merged_candidates = []
+        for cand in all_candidates:
+            key = candidate_key(cand)
+            if key and key in seen:
+                continue
+            seen.add(key)
+            merged_candidates.append(cand)
+        combined.candidates = merged_candidates
+        combined.abstract_snippets = all_snippets
+        combined.warnings = all_warnings
+        combined.search_query = " | ".join(q for q in all_queries if q)
+        combined.search_result_count = len(merged_candidates)
+        combined.confidence_level = worst_confidence
+        combined.confidence_score = total_score / scored_slots if scored_slots else 0.0
+        combined.confidence_rationale = " || ".join(rationales) if multi else (
+            rationales[0] if rationales else ""
         )
+        if combined.selected and combined.retrieval_error and not multi:
+            combined.retrieval_error = ""
 
         self._emit(
             "info",
-            f"  Multi-(REF) result: {len(combined_evidence.selected)}/{num_markers} "
-            f"citations found, confidence={combined_evidence.confidence_level.value}"
+            f"  Result: {len(combined.selected)} citation(s) across {len(markers)} marker(s), "
+            f"confidence={combined.confidence_level.value}"
         )
-
-        return combined_evidence
+        return combined

@@ -23,6 +23,7 @@ class Author(BaseModel):
 class CitationCandidate(BaseModel):
     """A candidate reference retrieved from PubMed or bioRxiv."""
     pmid: str = Field(default="", description="PubMed ID")
+    pmcid: str = Field(default="", description="PubMed Central ID, e.g. PMC11413553")
     doi: str = Field(default="")
     title: str = Field(default="")
     source: str = Field(default="literature", description="Origin: pubmed, europepmc, biorxiv, user_library, ...")

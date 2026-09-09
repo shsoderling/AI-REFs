@@ -5,6 +5,7 @@ COLOR_MEDIUM = "#f39c12"      # Yellow/Orange
 COLOR_LOW = "#e74c3c"         # Red
 COLOR_UNRESOLVED = "#95a5a6"  # Grey
 COLOR_ACCEPTED = "#2980b9"    # Blue
+COLOR_SKIPPED = "#7f8c8d"     # Dark grey: marker left unchanged by the user
 
 MAIN_STYLESHEET = """
 QMainWindow {

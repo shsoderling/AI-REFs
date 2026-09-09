@@ -2,8 +2,12 @@
 
 import re
 import logging
+from typing import Optional
+
+from ..models.markers import MarkerConfig
 from ..models.sentence import SentenceRecord
 from ..services.docx_io import DocxHandler
+from ..utils.markers import strip_markers
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +144,18 @@ def _is_false_boundary(text: str, dot_pos: int, after_pos: int) -> bool:
     return False
 
 
+def _balanced_paren_spans(text: str) -> list[tuple[int, int]]:
+    """(open, close) index pairs of every matched parenthesis pair in *text*."""
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for i, ch in enumerate(text):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            spans.append((stack.pop(), i))
+    return spans
+
+
 def _split_sentences(text: str) -> list[str]:
     """Split *text* into sentences, respecting scientific abbreviations.
 
@@ -149,10 +165,21 @@ def _split_sentences(text: str) -> list[str]:
     """
     boundaries: list[int] = []  # indices where we should split (start of whitespace)
 
+    # A period inside a balanced parenthetical (e.g. "(Smith, J. A., 2020)"
+    # or "(cf. Smith 2020)") never ends a sentence, otherwise a citation
+    # marker would be torn across two sentences.  Only parentheses that are
+    # actually closed count, so a stray "(" cannot swallow the paragraph.
+    protected = _balanced_paren_spans(text)
+
+    def _inside_parens(pos: int) -> bool:
+        return any(start < pos < end for start, end in protected)
+
     for m in _BOUNDARY_RE.finditer(text):
         dot_pos = m.start()       # position of . / ! / ?
         after_pos = m.end()       # first char after the whitespace
 
+        if _inside_parens(dot_pos):
+            continue
         if not _is_false_boundary(text, dot_pos, after_pos):
             boundaries.append(after_pos)
 
@@ -175,15 +202,18 @@ def _split_sentences(text: str) -> list[str]:
 class DocumentParser:
     """Parse a DOCX document into a list of SentenceRecords."""
 
-    def __init__(self, handler: DocxHandler, stop_at_para: int = -1):
+    def __init__(self, handler: DocxHandler, stop_at_para: int = -1,
+                 marker_config: Optional[MarkerConfig] = None):
         """
         Args:
             handler: DocxHandler for the source document
             stop_at_para: If >= 0, skip paragraphs at or beyond this index.
                           Used in insert mode to exclude the existing References section.
+            marker_config: Which marker kinds to strip from ``clean_text``.
         """
         self.handler = handler
         self.stop_at_para = stop_at_para
+        self.marker_config = marker_config or MarkerConfig.all_on()
 
     def parse(self) -> list[SentenceRecord]:
         """Parse the document into sentences."""
@@ -214,8 +244,8 @@ class DocumentParser:
                 sentence_counter += 1
                 sid = f"S{sentence_counter:03d}"
 
-                # Clean text (strip markers for display)
-                clean = re.sub(r'\s*\((REFS?)\)', '', raw).strip()
+                # Clean text (strip markers for display and for the claim prompt)
+                clean = strip_markers(raw, self.marker_config)
 
                 sentences.append(SentenceRecord(
                     id=sid,

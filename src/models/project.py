@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from .sentence import SentenceRecord
 from .evidence import EvidenceRecord
 from .existing_refs import ExistingCitationMap
+from .markers import MarkerConfig
 
 
 class CitationStyle(str, Enum):
@@ -111,6 +112,16 @@ class ProjectSettings(BaseModel):
     custom_csl_path: Optional[str] = Field(default=None, description="Path to custom CSL file")
     max_refs_for_refs: int = Field(default=3, ge=2, le=10, description="Max references for (REFS) markers")
 
+    # Author-suggested citation markers
+    detect_suggested_ids: bool = Field(
+        default=True,
+        description="Treat (PMID: ...), (PMC...), and (doi: ...) parentheticals as citations to verify",
+    )
+    detect_author_year: bool = Field(
+        default=True,
+        description="Treat (Author et al. YEAR) parentheticals as citations to verify",
+    )
+
     # Search preferences
     recency_bias: bool = Field(default=True, description="Prefer more recent publications")
     recency_weight: float = Field(default=0.2, ge=0.0, le=1.0, description="Weight for recency in scoring")
@@ -197,6 +208,33 @@ class ProjectState(BaseModel):
     # Insert mode: adding references to a pre-cited document
     is_insert_mode: bool = Field(default=False, description="True when adding refs to a pre-cited document")
     existing_citations: Optional[ExistingCitationMap] = Field(default=None, description="Parsed pre-existing citations (insert mode only)")
+
+    # Marker grammar the last pipeline run used.  Export must scan the DOCX
+    # with exactly this configuration, whatever the settings say now, so the
+    # markers it replaces are the markers the sentences were built from.
+    run_marker_config: Optional["MarkerConfig"] = Field(
+        default=None,
+        description="Marker detection configuration used by the last pipeline run",
+    )
+
+    @property
+    def marker_config(self) -> "MarkerConfig":
+        """MarkerConfig for a NEW pipeline run, derived from the current settings."""
+        return MarkerConfig.from_settings(self.settings)
+
+    @property
+    def export_marker_config(self) -> "MarkerConfig":
+        """MarkerConfig for export: the one the sentences were parsed with.
+
+        Project files written before suggested markers existed have sentences
+        but no recorded configuration; they were parsed with the (REF)/(REFS)
+        grammar, so that is what export uses for them.
+        """
+        if self.run_marker_config is not None:
+            return self.run_marker_config
+        if self.sentences:
+            return MarkerConfig.legacy()
+        return self.marker_config
 
     @property
     def total_markers(self) -> int:

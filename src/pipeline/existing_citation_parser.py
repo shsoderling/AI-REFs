@@ -9,7 +9,9 @@ Detects and extracts:
 import re
 import logging
 from ..models.existing_refs import ExistingBibEntry, ExistingCitationMap, InTextCitation
+from ..models.markers import MarkerConfig
 from ..services.docx_io import DocxHandler
+from ..utils.markers import find_markers
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +27,9 @@ BIB_ENTRY_PATTERN = re.compile(r'^(\d+)[.\s)\]]+\s*(.+)')
 # Pattern for bracketed in-text citations: [1], [1,2,3], [1-3]
 BRACKET_CITE_PATTERN = re.compile(r'\[(\d+(?:\s*[,\-\u2013]\s*\d+)*)\]')
 
-# Pattern for (REF) / (REFS) markers — used to detect char offsets
-MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+# Every marker kind is excluded from in-text citation scanning, whatever the
+# project settings say: digits inside "(PMID: 123)" are never citation numbers.
+_MARKER_CONFIG = MarkerConfig.all_on()
 
 
 class ExistingCitationParser:
@@ -122,16 +125,16 @@ class ExistingCitationParser:
         """Scan body paragraphs for in-text citation numbers.
 
         Finds both superscript number runs and bracketed citations like [1,2,3].
-        Skips any numbers that fall inside (REF)/(REFS) markers.
+        Skips any numbers that fall inside citation markers.
         """
         cite_map: dict[int, list[InTextCitation]] = {}
         for idx, para in enumerate(paragraphs):
             citations: list[InTextCitation] = []
 
-            # Determine character ranges occupied by (REF)/(REFS) markers
-            marker_ranges = []
-            for m in MARKER_PATTERN.finditer(para.text):
-                marker_ranges.append((m.start(), m.end()))
+            # Determine character ranges occupied by markers
+            marker_ranges = [
+                (m.start, m.end) for m in find_markers(para.text, _MARKER_CONFIG)
+            ]
 
             def _in_marker(offset: int) -> bool:
                 return any(s <= offset < e for s, e in marker_ranges)

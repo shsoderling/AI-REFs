@@ -20,10 +20,16 @@ from ..storage.cache_db import CacheDB
 logger = logging.getLogger(__name__)
 
 
+def candidate_key(article: CitationCandidate) -> str:
+    """Stable key used to track an article across tool calls: PMID > DOI > title."""
+    return article.pmid or article.doi or article.title
+
+
 def _article_summary(article: CitationCandidate, include_mesh: bool = False) -> dict:
     """Serialise a CitationCandidate to the dict format expected by Claude."""
     d = {
         "pmid": article.pmid,
+        "pmcid": article.pmcid,
         "doi": article.doi,
         "title": article.title,
         "source": article.source,

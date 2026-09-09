@@ -133,11 +133,33 @@ HELP_TEXTS = {
         "</ul>"
         "<p>When multiple <b>(REF)</b> markers appear in the same sentence, each one is "
         "resolved independently based on the surrounding context.</p>"
+        "<h3>Author-Suggested Citations</h3>"
+        "<p>If you already know which paper you mean, write it in parentheses and the "
+        "app will look it up, score how well it supports the sentence, and let you "
+        "confirm or replace it in the Review tab:</p>"
+        "<ul>"
+        "<li><b>(PMID: 32879322)</b> &mdash; PubMed ID</li>"
+        "<li><b>(PMC11413553)</b> &mdash; PubMed Central ID</li>"
+        "<li><b>(doi: 10.1101/2024.01.03.574066)</b> &mdash; DOI (journal article or preprint)</li>"
+        "<li><b>(Battison et al. 2024)</b>, <b>(Smith and Jones, 2020)</b>, "
+        "<b>(Smith 2019a)</b> &mdash; first author and year; the AI picks the matching "
+        "paper when the author published more than once that year</li>"
+        "</ul>"
+        "<p>Several citations can share one pair of parentheses, separated by commas or "
+        "semicolons, and the kinds can be mixed: <i>(PMC11413553, PMC3159129)</i>, "
+        "<i>(PMID: 32879322; Battison et al. 2024)</i>. Adding <b>REF</b> inside the "
+        "same parentheses, e.g. <i>(REF, PMID: 32879322)</i>, verifies the suggestion "
+        "and searches for one more.</p>"
+        "<p>A parenthetical only counts when its whole content is citations, so "
+        "<i>(n = 12)</i>, <i>(Fig. 2B)</i>, or <i>(December 2024)</i> are left alone. "
+        "Use the two <i>Suggested citations</i> checkboxes below to switch detection "
+        "off. Suggested citations you do not confirm keep their original text on export.</p>"
         "<h3>Insert Mode</h3>"
         "<p>If your document already has numbered citations and a References section, "
         "AI REFs automatically enters <b>insert mode</b>. In this mode:</p>"
         "<ul>"
-        "<li>Only new <b>(REF)</b>/<b>(REFS)</b> markers are processed</li>"
+        "<li>Only new markers (<b>(REF)</b>, <b>(REFS)</b>, and author-suggested "
+        "citations) are processed</li>"
         "<li>Existing citations are preserved and renumbered as needed</li>"
         "<li>The bibliography is merged automatically</li>"
         "</ul>"
@@ -404,6 +426,22 @@ class InputsTab(QWidget):
         self.max_refs_spin.setValue(3)
         form.addRow("Max refs for (REFS):", self.max_refs_spin)
 
+        # Author-suggested citation detection
+        self.suggested_ids_check = QCheckBox("Verify (PMID: …), (PMC…), and (doi: …) citations")
+        self.suggested_ids_check.setChecked(True)
+        self.suggested_ids_check.setToolTip(
+            "Look up citations you wrote by identifier and score them against the sentence"
+        )
+        form.addRow("Suggested citations:", self.suggested_ids_check)
+
+        self.author_year_check = QCheckBox("Verify (Author et al. YEAR) citations")
+        self.author_year_check.setChecked(True)
+        self.author_year_check.setToolTip(
+            "Look up author-year citations such as (Battison et al. 2024); "
+            "switch off for documents whose author-year citations should stay as they are"
+        )
+        form.addRow("", self.author_year_check)
+
         # Recency bias
         self.recency_check = QCheckBox("Prefer more recent publications")
         self.recency_check.setChecked(True)
@@ -586,6 +624,8 @@ class InputsTab(QWidget):
         return ProjectSettings(
             citation_style=selected_style,
             max_refs_for_refs=self.max_refs_spin.value(),
+            detect_suggested_ids=self.suggested_ids_check.isChecked(),
+            detect_author_year=self.author_year_check.isChecked(),
             recency_bias=self.recency_check.isChecked(),
             prefer_reviews=self.review_check.isChecked(),
             domain_inference=self.domain_check.isChecked(),
@@ -609,6 +649,7 @@ class InputsTab(QWidget):
         self.style_combo.setCurrentIndex(style_index)
 
         self.max_refs_spin.setValue(settings.max_refs_for_refs)
+        self.set_detection_flags(settings.detect_suggested_ids, settings.detect_author_year)
         self.recency_check.setChecked(settings.recency_bias)
         self.review_check.setChecked(settings.prefer_reviews)
         self.domain_check.setChecked(settings.domain_inference)
@@ -644,12 +685,18 @@ class InputsTab(QWidget):
         }
         self.model_combo.setCurrentIndex(model_to_index.get(model_id, 0))
 
+    def set_detection_flags(self, detect_ids: bool, detect_author_year: bool):
+        """Set the two suggested-citation checkboxes."""
+        self.suggested_ids_check.setChecked(bool(detect_ids))
+        self.author_year_check.setChecked(bool(detect_author_year))
+
     def set_insert_mode(self, enabled: bool, num_existing: int):
         """Show or hide the insert-mode indicator."""
         if enabled:
             self.insert_mode_label.setText(
                 f"Insert mode: {num_existing} existing references detected. "
-                f"Only new (REF)/(REFS) markers will be processed. "
+                f"Only new markers ((REF), (REFS), and author-suggested citations such as "
+                f"(PMID: …) or (Smith et al. 2020)) will be processed. "
                 f"Existing citations will be renumbered automatically."
             )
             self.insert_mode_label.setVisible(True)
@@ -679,6 +726,8 @@ class InputsTab(QWidget):
         style_idx = s.value("citation_style_index", None)
         if style_idx is not None:
             self.style_combo.setCurrentIndex(int(style_idx))
+        self.suggested_ids_check.setChecked(s.value("detect_suggested_ids", True, type=bool))
+        self.author_year_check.setChecked(s.value("detect_author_year", True, type=bool))
         logger.info("Loaded saved settings")
 
     def _save_settings(self):
@@ -690,6 +739,8 @@ class InputsTab(QWidget):
         s.setValue("anthropic_api_key", self.anthropic_key_edit.text().strip())
         s.setValue("claude_model_index", self.model_combo.currentIndex())
         s.setValue("citation_style_index", self.style_combo.currentIndex())
+        s.setValue("detect_suggested_ids", self.suggested_ids_check.isChecked())
+        s.setValue("detect_author_year", self.author_year_check.isChecked())
         s.sync()
 
     @property

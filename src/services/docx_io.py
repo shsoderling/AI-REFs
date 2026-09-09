@@ -9,9 +9,10 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-logger = logging.getLogger(__name__)
+from ..models.markers import MarkerConfig
+from ..utils.markers import find_markers as _find_marker_specs
 
-MARKER_PATTERN = re.compile(r'\((REFS?)\)')
+logger = logging.getLogger(__name__)
 
 
 class DocxHandler:
@@ -29,33 +30,51 @@ class DocxHandler:
         """Return full document text."""
         return "\n".join(p.text for p in self.doc.paragraphs)
 
-    def find_markers(self) -> list[dict]:
-        """Find all (REF) and (REFS) markers in the document.
+    def find_markers(self, config: Optional[MarkerConfig] = None) -> list[dict]:
+        """Find all citation markers in the document.
+
+        ``config`` selects which marker kinds are recognised; it must match the
+        configuration the pipeline ran with so that export replaces exactly the
+        markers that were processed.
 
         Returns list of dicts with keys:
-            paragraph, para_index, location, marker_type,
+            paragraph, para_index, location, marker_type, text,
             full_paragraph_text, marker_order_in_para.
         """
+        config = config or MarkerConfig.all_on()
         markers = []
         for para_idx, para in enumerate(self.doc.paragraphs):
             text = para.text
-            marker_in_para = 0
-            for match in MARKER_PATTERN.finditer(text):
+            for order, spec in enumerate(_find_marker_specs(text, config)):
                 markers.append({
                     'paragraph': para,
                     'para_index': para_idx,
-                    'location': match.span(),
-                    'marker_type': match.group(1),
+                    'location': (spec.start, spec.end),
+                    'marker_type': spec.kind.value,
+                    'text': spec.text,
+                    'spec': spec,
                     'full_paragraph_text': text,
-                    'marker_order_in_para': marker_in_para,
+                    'marker_order_in_para': order,
                 })
-                marker_in_para += 1
         logger.info(f"Found {len(markers)} markers in document")
         return markers
 
+    @staticmethod
+    def _nth_index(text: str, needle: str, occurrence: int) -> int:
+        """Index of the *occurrence*-th (0-based) *needle* in *text*, or -1."""
+        pos = -1
+        for _ in range(occurrence + 1):
+            pos = text.find(needle, pos + 1)
+            if pos < 0:
+                return -1
+        return pos
+
     def replace_marker_by_regex(self, paragraph, marker_text: str, replacement: str,
-                                superscript: bool = False):
-        """Replace the first occurrence of *marker_text* in *paragraph*.
+                                superscript: bool = False, occurrence: int = 0):
+        """Replace one occurrence of *marker_text* in *paragraph*.
+
+        ``occurrence`` selects which occurrence (0 = first) when the same
+        marker text appears several times and earlier ones are being kept.
 
         Walks the existing runs to locate the one(s) that contain the marker,
         splits into up to three new runs (before-text | citation | after-text),
@@ -67,18 +86,19 @@ class DocxHandler:
         from lxml import etree
 
         full_text = paragraph.text
-        if marker_text not in full_text:
+        target_start = self._nth_index(full_text, marker_text, max(occurrence, 0))
+        if target_start < 0:
             return  # Marker not found in this paragraph
 
         w_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
-        target_start = full_text.find(marker_text)
         target_end = target_start + len(marker_text)
 
         runs = paragraph.runs
         if not runs:
             if superscript:
-                self._collapse_and_replace_superscript(paragraph, marker_text, replacement)
+                self._collapse_and_replace_superscript(paragraph, marker_text, replacement,
+                                                       occurrence=occurrence)
             else:
                 paragraph.text = full_text[:target_start] + replacement + full_text[target_end:]
             return
@@ -102,7 +122,8 @@ class DocxHandler:
 
         if first_run_idx is None:
             if superscript:
-                self._collapse_and_replace_superscript(paragraph, marker_text, replacement)
+                self._collapse_and_replace_superscript(paragraph, marker_text, replacement,
+                                                       occurrence=occurrence)
             else:
                 # Fallback: do a safe text-only replacement on the first run containing it
                 for run in runs:
@@ -176,13 +197,15 @@ class DocxHandler:
             p_elem.remove(runs[i]._element)
 
     def _collapse_and_replace_superscript(self, paragraph, marker_text: str,
-                                           replacement: str):
+                                           replacement: str, occurrence: int = 0):
         """Fallback when the marker straddles multiple runs.
 
         Collapses the paragraph into three fresh runs: before | cite^ | after.
         """
         full_text = paragraph.text
-        idx = full_text.find(marker_text)
+        idx = self._nth_index(full_text, marker_text, max(occurrence, 0))
+        if idx < 0:
+            return
         before = full_text[:idx]
         after = full_text[idx + len(marker_text):]
 

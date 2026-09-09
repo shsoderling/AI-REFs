@@ -23,6 +23,12 @@ from ..models.sentence import MarkerType
 from ..services.docx_io import DocxHandler
 from ..pipeline.existing_citation_parser import ExistingCitationParser
 from ..pipeline.renumbering import compute_renumbering, NewMarkerInfo
+from ..pipeline.export_slots import (
+    ExportStats, collect_marker_slots, slot_for_docx_marker, action_for_unmatched,
+    record_action, ACTION_CITE, ACTION_UNRESOLVED,
+)
+from ..models.markers import MarkerType as _MarkerKind
+from ..utils.markers import find_markers
 from ..storage.project_io import save_project, load_project
 from .inputs_tab import InputsTab
 from .library_tab import LibraryTab
@@ -182,6 +188,8 @@ class MainWindow(QMainWindow):
             return
 
         self._project.settings = self.library_tab.apply_to_settings(settings)
+        if not self._confirm_suggested_markers():
+            return
         self._project.created_at = datetime.now().isoformat()
 
         # Switch to Run tab
@@ -190,6 +198,76 @@ class MainWindow(QMainWindow):
         # Start pipeline
         self.run_tab.start_pipeline(self._project)
         self.statusBar().showMessage("Pipeline running...")
+
+    def _confirm_suggested_markers(self) -> bool:
+        """Tell the user how many author-suggested citations will be verified.
+
+        A document that already cites in author-year style can contain dozens
+        of parentheticals; each one costs an AI evaluation.  The user can go
+        ahead, restrict this run to (REF)/(REFS) markers, or cancel.
+        Returns False when the run should not start.
+        """
+        settings = self._project.settings
+        config = self._project.marker_config
+        if not (config.detect_ids or config.detect_author_year):
+            return True
+        try:
+            handler = DocxHandler(self._project.input_docx_path)
+            stop_at = -1
+            if self._project.is_insert_mode and self._project.existing_citations:
+                stop_at = self._project.existing_citations.references_heading_para_idx
+            n_search = n_ids = n_author_year = 0
+            for idx, para in enumerate(handler.get_paragraphs()):
+                if stop_at >= 0 and idx >= stop_at:
+                    break
+                text = para.text.strip()
+                # Same heading rule as DocumentParser: headings are not processed
+                if len(text) < 80 and not text.endswith('.') and para.style.name.startswith('Heading'):
+                    continue
+                for m in find_markers(text, config):
+                    if m.kind != _MarkerKind.SUGGESTED:
+                        n_search += 1
+                    elif any(s.kind.value == "author_year" for s in m.suggestions):
+                        n_author_year += 1
+                    else:
+                        n_ids += 1
+        except Exception as exc:
+            logger.warning(f"Marker pre-scan failed: {exc}")
+            return True
+
+        n_suggested = n_ids + n_author_year
+        if n_suggested == 0:
+            return True
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Author-suggested citations found")
+        box.setText(
+            f"This document contains {n_search} (REF)/(REFS) marker(s) to search and "
+            f"{n_suggested} author-suggested citation marker(s) to verify "
+            f"({n_ids} by PMID/PMCID/DOI, {n_author_year} by author and year)."
+        )
+        box.setInformativeText(
+            "Each suggested citation is looked up in your library and the literature "
+            "databases, then scored by the AI against its sentence so you can confirm "
+            "or replace it in the Review tab. Unconfirmed suggestions keep their "
+            "original text on export.\n\nVerify the suggested citations in this run? "
+            "(To switch detection off for good, use the checkboxes in the Input tab.)"
+        )
+        verify_btn = box.addButton("Verify all", QMessageBox.ButtonRole.AcceptRole)
+        refs_only_btn = box.addButton("Only (REF)/(REFS)", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(verify_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is None or clicked == cancel_btn:
+            return False
+        if clicked == refs_only_btn:
+            # This run only; the Input tab checkboxes keep the user's preference.
+            settings.detect_suggested_ids = False
+            settings.detect_author_year = False
+        return True
 
     @Slot(object)
     def _on_pipeline_complete(self, project: ProjectState):
@@ -236,10 +314,10 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._do_export(output_path)
+            stats = self._do_export(output_path)
             self.statusBar().showMessage(f"Exported: {output_path}")
             QMessageBox.information(self, "Export Complete",
-                                  f"Document exported to:\n{output_path}")
+                                  f"Document exported to:\n{output_path}\n\n{stats.summary()}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
             logger.error(f"Export error: {e}")
@@ -281,20 +359,20 @@ class MainWindow(QMainWindow):
             logger.warning(f"Could not parse CSL for {style}: {exc}")
             return defaults
 
-    def _do_export(self, output_path: str):
+    def _do_export(self, output_path: str) -> ExportStats:
         """Route to the appropriate export path based on mode."""
         if self._project.is_insert_mode and self._project.existing_citations:
-            self._do_insert_export(output_path)
-        else:
-            self._do_fresh_export(output_path)
+            return self._do_insert_export(output_path)
+        return self._do_fresh_export(output_path)
 
-    def _do_fresh_export(self, output_path: str):
+    def _do_fresh_export(self, output_path: str) -> ExportStats:
         """Export a fresh document (no pre-existing citations).
 
         Matches DOCX markers to sentence evidence using paragraph_index
         (structural matching) instead of text-content heuristics.  Within a
         paragraph that contains multiple markers, markers are matched to
-        sentences in document order.
+        sentences in document order.  Each marker owns its own block of the
+        sentence's selected citations (see ``export_slots``).
         """
         handler = DocxHandler(self._project.input_docx_path)
         style = self._project.settings.citation_style
@@ -317,64 +395,48 @@ class MainWindow(QMainWindow):
         bib_number = {}
         current_num = 1
 
-        # ── Build a lookup: paragraph_index → expanded list of (sentence, evidence, ref_index) ──
-        para_to_markers: dict[int, list[tuple]] = defaultdict(list)
-        for sent in self._project.sentences:
-            if sent.marker_type is not None:
-                ev = self._project.evidence_map.get(sent.id)
-                count = max(sent.marker_count, 1)
-                if sent.marker_type == MarkerType.REF and count > 1:
-                    for ref_idx in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
-                else:
-                    for _ in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, None))
-
-        # ── Collect all markers from the DOCX ──
-        markers = handler.find_markers()
+        slots_by_para = collect_marker_slots(self._project)
+        markers = handler.find_markers(self._project.export_marker_config)
         para_marker_counter: dict[int, int] = defaultdict(int)
+        same_text_counter: dict[tuple[int, str], int] = defaultdict(int)
+        stats = ExportStats()
 
-        total_expanded = sum(len(v) for v in para_to_markers.values())
+        total_expanded = sum(len(v) for v in slots_by_para.values())
         logger.info(f"Export: {len(markers)} DOCX markers, "
                      f"{total_expanded} expanded sentence-marker slots")
+
+        # Pass 1 (document order): decide every replacement and number the
+        # bibliography.  Pass 2 applies them right-to-left within each
+        # paragraph so an inserted citation can never be mistaken for a
+        # later marker's text (author-date styles can produce identical text).
+        plan: list[tuple] = []  # (para, para_idx, marker_text, occurrence, replacement, superscript)
 
         for marker_info in markers:
             para = marker_info['paragraph']
             para_idx = marker_info['para_index']
-            marker_type = marker_info['marker_type']
-            marker_text = f"({marker_type})"
+            marker_text = marker_info['text']
 
-            expanded_list = para_to_markers.get(para_idx, [])
             marker_order = para_marker_counter[para_idx]
             para_marker_counter[para_idx] += 1
+            occurrence = same_text_counter[(para_idx, marker_text)]
+            same_text_counter[(para_idx, marker_text)] += 1
 
-            matching_ev = None
-            matching_sent = None
-            ref_index = None
+            slot = slot_for_docx_marker(slots_by_para, para_idx, marker_order, marker_text)
+            action = slot.action if slot else action_for_unmatched(marker_info['marker_type'])
+            record_action(stats, slot, action)
 
-            if marker_order < len(expanded_list):
-                matching_sent, ev, ref_index = expanded_list[marker_order]
-                if ev and ev.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED):
-                    matching_ev = ev
-
-            sent_id = matching_sent.id if matching_sent else "???"
-            sent_preview = (matching_sent.clean_text[:50] + "...") if matching_sent else "NO MATCH"
-            if matching_ev and matching_ev.selected:
-                ref_titles = "; ".join(s.title[:40] for s in matching_ev.selected)
-                logger.info(f"  Marker para={para_idx}[{marker_order}] ref_index={ref_index} -> {sent_id} "
-                            f"({sent_preview}) -> refs=[{ref_titles}]")
+            sent_id = slot.sentence.id if slot else "???"
+            if slot and slot.citations:
+                ref_titles = "; ".join(s.title[:40] for s in slot.citations)
+                logger.info(f"  Marker para={para_idx}[{marker_order}] {marker_text!r} -> {sent_id} "
+                            f"action={action} refs=[{ref_titles}]")
             else:
-                logger.info(f"  Marker para={para_idx}[{marker_order}] -> {sent_id} "
-                            f"({sent_preview}) -> NO EVIDENCE")
+                logger.info(f"  Marker para={para_idx}[{marker_order}] {marker_text!r} -> {sent_id} "
+                            f"action={action} (no citations)")
 
-            if matching_ev and matching_ev.selected:
-                if ref_index is not None and ref_index < len(matching_ev.selected):
-                    refs_for_marker = [matching_ev.selected[ref_index]]
-                else:
-                    refs_for_marker = matching_ev.selected
-
+            if action == ACTION_CITE:
                 citation_parts = []
-                for sel in refs_for_marker:
+                for sel in slot.citations:
                     bib_key = sel.pmid or sel.doi or sel.title[:30]
                     if bib_key not in bib_number:
                         bib_number[bib_key] = current_num
@@ -389,10 +451,12 @@ class MainWindow(QMainWindow):
 
                 inner = cite_delim.join(citation_parts)
                 replacement = f"{cite_prefix}{inner}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=use_superscript)
-            else:
-                handler.replace_marker_by_regex(para, marker_text, "[?]")
+                plan.append((para, para_idx, marker_text, occurrence, replacement, use_superscript))
+            elif action == ACTION_UNRESOLVED:
+                plan.append((para, para_idx, marker_text, occurrence, "[?]", False))
+            # ACTION_LEAVE: nothing to apply
+
+        self._apply_replacement_plan(handler, plan)
 
         if bib_entries:
             handler.append_bibliography(bib_entries)
@@ -400,14 +464,33 @@ class MainWindow(QMainWindow):
         handler.save(output_path)
         self._project.output_docx_path = output_path
         logger.info(f"Exported document with {len(bib_entries)} bibliography entries: {output_path}")
+        return stats
+
+    @staticmethod
+    def _apply_replacement_plan(handler: DocxHandler, plan: list[tuple]):
+        """Apply (para, para_idx, text, occurrence, replacement, superscript) entries.
+
+        Entries are grouped by paragraph and applied from the last marker to
+        the first, so every ``occurrence`` index computed on the original text
+        stays valid while earlier text is still untouched.
+        """
+        by_para: dict[int, list[tuple]] = defaultdict(list)
+        for entry in plan:
+            by_para[entry[1]].append(entry)
+        for para_idx in sorted(by_para):
+            for para, _idx, marker_text, occurrence, replacement, superscript in reversed(by_para[para_idx]):
+                handler.replace_marker_by_regex(
+                    para, marker_text, replacement,
+                    superscript=superscript, occurrence=occurrence,
+                )
 
     # ── Insert-mode export ────────────────────────────────────────────
 
-    def _do_insert_export(self, output_path: str):
+    def _do_insert_export(self, output_path: str) -> ExportStats:
         """Export a document in insert mode: resolve new markers + renumber.
 
         Steps:
-        1. Match new (REF)/(REFS) markers to their resolved citations
+        1. Match new markers to their resolved citations
         2. Compute merged renumbering across existing + new citations
         3. Renumber all existing in-text citation numbers (before inserting new ones)
         4. Replace new markers with assigned citation numbers
@@ -428,51 +511,46 @@ class MainWindow(QMainWindow):
                      f"existing_refs={len(existing.bib_entries)}  "
                      f"superscript={use_superscript}")
 
+        refs_start = existing.references_heading_para_idx
+
         # ── Step 1: Build new marker info from DOCX markers + evidence ──
-        markers = handler.find_markers()
+        # Markers inside the existing References section are never processed;
+        # that section is rebuilt in step 5.
+        markers = [
+            m for m in handler.find_markers(self._project.export_marker_config)
+            if refs_start < 0 or m['para_index'] < refs_start
+        ]
 
-        # Build para_to_markers lookup (same logic as fresh export)
-        para_to_markers: dict[int, list[tuple]] = defaultdict(list)
-        for sent in self._project.sentences:
-            if sent.marker_type is not None:
-                ev = self._project.evidence_map.get(sent.id)
-                count = max(sent.marker_count, 1)
-                if sent.marker_type == MarkerType.REF and count > 1:
-                    for ref_idx in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, ref_idx))
-                else:
-                    for _ in range(count):
-                        para_to_markers[sent.paragraph_index].append((sent, ev, None))
-
+        slots_by_para = collect_marker_slots(self._project)
         para_marker_counter: dict[int, int] = defaultdict(int)
+        same_text_counter: dict[tuple[int, str], int] = defaultdict(int)
+        stats = ExportStats()
 
-        # Collect resolved citations for each marker position
+        # Per DOCX marker: (marker_info, action, resolved citations, occurrence)
         new_marker_infos = []
-        marker_resolved_map = []  # parallel list: marker_info -> resolved citations
+        marker_plan: list[tuple] = []
 
         for marker_info in markers:
             para_idx = marker_info['para_index']
             char_offset = marker_info['location'][0]
+            marker_text = marker_info['text']
 
-            expanded_list = para_to_markers.get(para_idx, [])
             marker_order = para_marker_counter[para_idx]
             para_marker_counter[para_idx] += 1
+            occurrence = same_text_counter[(para_idx, marker_text)]
+            same_text_counter[(para_idx, marker_text)] += 1
 
-            resolved_citations = []
-            if marker_order < len(expanded_list):
-                matching_sent, ev, ref_index = expanded_list[marker_order]
-                if ev and ev.review_decision in (ReviewDecision.ACCEPTED, ReviewDecision.MODIFIED):
-                    if ref_index is not None and ref_index < len(ev.selected):
-                        resolved_citations = [ev.selected[ref_index]]
-                    else:
-                        resolved_citations = list(ev.selected)
+            slot = slot_for_docx_marker(slots_by_para, para_idx, marker_order, marker_text)
+            action = slot.action if slot else action_for_unmatched(marker_info['marker_type'])
+            record_action(stats, slot, action)
+            resolved_citations = list(slot.citations) if (slot and action == ACTION_CITE) else []
 
             new_marker_infos.append(NewMarkerInfo(
                 para_index=para_idx,
                 char_offset=char_offset,
                 citations=resolved_citations,
             ))
-            marker_resolved_map.append(resolved_citations)
+            marker_plan.append((marker_info, action, resolved_citations, occurrence))
 
         # ── Step 2: Compute renumbering ──
         renumber_result = compute_renumbering(existing, new_marker_infos)
@@ -487,14 +565,14 @@ class MainWindow(QMainWindow):
         if not is_author_date and any(o != n for o, n in renumber_map.items()):
             self._renumber_existing_citations(handler, existing, renumber_map)
 
-        # ── Step 4: Replace new (REF)/(REFS) markers ──
-        for i, marker_info in enumerate(markers):
+        # ── Step 4: Replace new markers (right-to-left within each paragraph) ──
+        plan: list[tuple] = []
+        for marker_info, action, resolved, occurrence in marker_plan:
             para = marker_info['paragraph']
-            marker_type = marker_info['marker_type']
-            marker_text = f"({marker_type})"
-            resolved = marker_resolved_map[i]
+            para_idx = marker_info['para_index']
+            marker_text = marker_info['text']
 
-            if resolved and not is_author_date:
+            if action == ACTION_CITE and resolved and not is_author_date:
                 citation_numbers = []
                 for cand in resolved:
                     bib_key = cand.pmid or cand.doi or cand.title[:30]
@@ -505,15 +583,14 @@ class MainWindow(QMainWindow):
 
                 inner = cite_delim.join(str(n) for n in citation_numbers)
                 replacement = f"{cite_prefix}{inner}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=use_superscript)
-            elif resolved and is_author_date:
+                plan.append((para, para_idx, marker_text, occurrence, replacement, use_superscript))
+            elif action == ACTION_CITE and resolved and is_author_date:
                 parts = [cand.first_author_year for cand in resolved]
                 replacement = f"{cite_prefix}{cite_delim.join(parts)}{cite_suffix}"
-                handler.replace_marker_by_regex(para, marker_text, replacement,
-                                               superscript=False)
-            else:
-                handler.replace_marker_by_regex(para, marker_text, "[?]")
+                plan.append((para, para_idx, marker_text, occurrence, replacement, False))
+            elif action == ACTION_UNRESOLVED:
+                plan.append((para, para_idx, marker_text, occurrence, "[?]", False))
+        self._apply_replacement_plan(handler, plan)
 
         # ── Step 5: Remove old References section, build merged bibliography ──
         handler.remove_references_section(existing.references_heading_para_idx)
@@ -524,6 +601,7 @@ class MainWindow(QMainWindow):
         handler.save(output_path)
         self._project.output_docx_path = output_path
         logger.info(f"Insert-mode export complete: {len(merged_bib)} bibliography entries: {output_path}")
+        return stats
 
     def _renumber_existing_citations(self, handler: DocxHandler,
                                       existing, renumber_map: dict[int, int]):
@@ -705,10 +783,12 @@ class MainWindow(QMainWindow):
         if citation.doi:
             base += f" doi:{citation.doi}"
 
-        # Add PMCID / PMID for NIH grant style
+        # Add PMID / PMCID for NIH grant style (public access policy)
         if style == CitationStyle.NIH_GRANT:
             if citation.pmid:
                 base += f" PMID: {citation.pmid}"
+            if citation.pmcid:
+                base += f"{';' if citation.pmid else ''} PMCID: {citation.pmcid}"
 
         # Numeric styles get a number prefix
         if style not in AUTHOR_DATE_STYLES:

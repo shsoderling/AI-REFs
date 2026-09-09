@@ -174,6 +174,40 @@ class EuropePMCClient:
             return results[0]
         return None
 
+    # ── Fetch by PMCID ────────────────────────────────────────────
+
+    def fetch_by_pmcid(self, pmcid: str) -> Optional[CitationCandidate]:
+        """Fetch a single article by PubMed Central ID (e.g. 'PMC11413553')."""
+        pmcid = (pmcid or "").strip().upper()
+        if pmcid and not pmcid.startswith("PMC"):
+            pmcid = f"PMC{pmcid}"
+        if not pmcid:
+            return None
+        cache_key = f"europepmc:pmcid:{pmcid}"
+        cached = self.cache.get_article(cache_key)
+        if cached:
+            return CitationCandidate(**cached)
+
+        results = self.search(f"PMCID:{pmcid}", max_results=1)
+        if results:
+            self.cache.put_article(cache_key, results[0].model_dump())
+            return results[0]
+        return None
+
+    # ── Search by author + year ───────────────────────────────────
+
+    def search_author_year(
+        self, last_name: str, year: int, coauthor: str = "", max_results: int = 10,
+    ) -> list[CitationCandidate]:
+        """Find articles by (first) author last name and publication year."""
+        last_name = (last_name or "").strip()
+        if not last_name or not year:
+            return []
+        query = f'AUTH:"{last_name}" AND PUB_YEAR:{year}'
+        if coauthor:
+            query += f' AND AUTH:"{coauthor}"'
+        return self.search(query, max_results=max_results)
+
     # ── Convert Europe PMC result → CitationCandidate ─────────────
 
     def _result_to_candidate(self, result: dict) -> Optional[CitationCandidate]:
@@ -182,8 +216,9 @@ class EuropePMCClient:
         if not title:
             return None
 
-        # PMID
+        # PMID / PMCID
         pmid = str(result.get("pmid", "")) if result.get("pmid") else ""
+        pmcid = str(result.get("pmcid", "")) if result.get("pmcid") else ""
 
         # DOI
         doi = result.get("doi", "") or ""
@@ -243,6 +278,7 @@ class EuropePMCClient:
 
         return CitationCandidate(
             pmid=pmid,
+            pmcid=pmcid,
             doi=doi,
             title=title.rstrip("."),  # Europe PMC sometimes adds trailing period
             source="europepmc",

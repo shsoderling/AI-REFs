@@ -102,6 +102,29 @@ class ReferenceLibrary:
             CREATE INDEX IF NOT EXISTS idx_ref_library_year ON references_library(year);
             """
         )
+        self._migrate_columns()
+
+    def _migrate_columns(self):
+        """Add columns introduced after the first release to older library files."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(references_library)").fetchall()
+        }
+        if "pmcid" not in cols:
+            self._conn.execute(
+                "ALTER TABLE references_library ADD COLUMN pmcid TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ref_library_pmcid ON references_library(pmcid)"
+            )
+            self._conn.commit()
+
+    # Column list shared by every SELECT so row unpacking stays in one place.
+    _SELECT_COLUMNS = (
+        "key, pmid, doi, title, authors_json, year, journal, journal_abbrev, "
+        "volume, issue, pages, abstract, mesh_terms_json, publication_types_json, "
+        "is_retracted, is_review, source, updated_at, pmcid"
+    )
 
     # ------------------------------------------------------------------
     # CRUD + search
@@ -135,6 +158,7 @@ class ReferenceLibrary:
             (key,),
         ).fetchone()
 
+        pmcid = self._normalize_pmcid(citation.pmcid)
         values = (
             key,
             citation.pmid,
@@ -161,10 +185,10 @@ class ReferenceLibrary:
                 INSERT INTO references_library (
                     key, pmid, doi, title, authors_json, year, journal, journal_abbrev,
                     volume, issue, pages, abstract, mesh_terms_json, publication_types_json,
-                    is_retracted, is_review, source, added_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_retracted, is_review, source, added_at, updated_at, pmcid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (*values, now, now),
+                (*values, now, now, pmcid),
             )
             self._conn.commit()
             return True, False
@@ -175,7 +199,8 @@ class ReferenceLibrary:
             SET pmid = ?, doi = ?, title = ?, authors_json = ?, year = ?, journal = ?,
                 journal_abbrev = ?, volume = ?, issue = ?, pages = ?, abstract = ?,
                 mesh_terms_json = ?, publication_types_json = ?, is_retracted = ?,
-                is_review = ?, source = ?, updated_at = ?
+                is_review = ?, source = ?, updated_at = ?,
+                pmcid = CASE WHEN ? != '' THEN ? ELSE pmcid END
             WHERE key = ?
             """,
             (
@@ -196,6 +221,8 @@ class ReferenceLibrary:
                 1 if citation.is_review else 0,
                 source or "literature",
                 now,
+                pmcid,
+                pmcid,
                 key,
             ),
         )
@@ -223,10 +250,8 @@ class ReferenceLibrary:
         query = (query or "").strip()
 
         rows = self._conn.execute(
-            """
-            SELECT key, pmid, doi, title, authors_json, year, journal, journal_abbrev,
-                   volume, issue, pages, abstract, mesh_terms_json, publication_types_json,
-                   is_retracted, is_review, source, updated_at
+            f"""
+            SELECT {self._SELECT_COLUMNS}
             FROM references_library
             ORDER BY updated_at DESC
             LIMIT 3000
@@ -244,12 +269,13 @@ class ReferenceLibrary:
         tokens = self._tokenize(query)
         doi_query = self._normalize_doi(query)
         pmid_query = query if query.isdigit() else ""
+        pmcid_query = self._normalize_pmcid(query) if query.upper().startswith("PMC") else ""
 
         scored: list[tuple[float, CitationCandidate]] = []
         for row in rows:
             cand = self._row_to_candidate(row)
             cand.source = "user_library"
-            score = self._score_candidate(cand, tokens, pmid_query, doi_query)
+            score = self._score_candidate(cand, tokens, pmid_query, doi_query, pmcid_query)
             if score <= 0:
                 continue
             cand.composite_score = score
@@ -258,6 +284,78 @@ class ReferenceLibrary:
 
         scored.sort(key=lambda x: (x[0], x[1].year), reverse=True)
         return [cand for _, cand in scored[:max_results]]
+
+    # ── Identifier lookups (author-suggested citations) ────────────────
+
+    def _fetch_where(self, where: str, params: tuple) -> list[CitationCandidate]:
+        rows = self._conn.execute(
+            f"SELECT {self._SELECT_COLUMNS} FROM references_library WHERE {where} "
+            "ORDER BY updated_at DESC LIMIT 50",
+            params,
+        ).fetchall()
+        out = []
+        for row in rows:
+            cand = self._row_to_candidate(row)
+            cand.source = "user_library"
+            out.append(cand)
+        return out
+
+    def find_by_pmid(self, pmid: str) -> Optional[CitationCandidate]:
+        pmid = (pmid or "").strip()
+        if not pmid:
+            return None
+        found = self._fetch_where("pmid = ?", (pmid,))
+        return found[0] if found else None
+
+    def find_by_doi(self, doi: str) -> Optional[CitationCandidate]:
+        doi = self._normalize_doi(doi)
+        if not doi:
+            return None
+        found = self._fetch_where("lower(doi) = ?", (doi,))
+        return found[0] if found else None
+
+    def find_by_pmcid(self, pmcid: str) -> Optional[CitationCandidate]:
+        pmcid = self._normalize_pmcid(pmcid)
+        if not pmcid:
+            return None
+        found = self._fetch_where("upper(pmcid) = ?", (pmcid,))
+        return found[0] if found else None
+
+    def find_by_author_year(
+        self, last_name: str, year: int, coauthor: str = "", first_author_only: bool = True,
+    ) -> list[CitationCandidate]:
+        """Library entries whose (first) author matches *last_name* in *year*.
+
+        Falls back to any-author matching when nothing matches as first author.
+        """
+        last_name = (last_name or "").strip().lower()
+        if not last_name or not year:
+            return []
+        rows = self._fetch_where("year = ?", (int(year),))
+
+        def _last(a: Author) -> str:
+            return (a.last_name or "").strip().lower()
+
+        def _same(n: str, target: str) -> bool:
+            return bool(n) and (n == target or n.split()[-1] == target.split()[-1])
+
+        def _matches(cand: CitationCandidate, first_only: bool) -> bool:
+            names = [n for n in (_last(a) for a in cand.authors) if n]
+            if not names:
+                return False
+            if first_only:
+                ok = _same(names[0], last_name)
+            else:
+                ok = any(_same(n, last_name) for n in names)
+            if ok and coauthor:
+                co = coauthor.strip().lower()
+                ok = any(_same(n, co) for n in names)
+            return ok
+
+        found = [c for c in rows if _matches(c, True)]
+        if not found and first_author_only:
+            found = [c for c in rows if _matches(c, False)]
+        return found
 
     def close(self):
         self._conn.close()
@@ -365,6 +463,15 @@ class ReferenceLibrary:
         return doi.lower()
 
     @staticmethod
+    def _normalize_pmcid(pmcid: str) -> str:
+        pmcid = (pmcid or "").strip().upper()
+        if not pmcid:
+            return ""
+        if pmcid.isdigit():
+            pmcid = f"PMC{pmcid}"
+        return pmcid if pmcid.startswith("PMC") and pmcid[3:].isdigit() else ""
+
+    @staticmethod
     def _normalize_title(title: str) -> str:
         t = (title or "").lower()
         t = re.sub(r"[^a-z0-9]+", " ", t)
@@ -406,6 +513,7 @@ class ReferenceLibrary:
             is_review,
             source,
             _updated_at,
+            pmcid,
         ) = row
 
         try:
@@ -425,6 +533,7 @@ class ReferenceLibrary:
 
         return CitationCandidate(
             pmid=pmid or "",
+            pmcid=pmcid or "",
             doi=doi or "",
             title=title or "",
             authors=authors,
@@ -448,10 +557,13 @@ class ReferenceLibrary:
         tokens: list[str],
         pmid_query: str,
         doi_query: str,
+        pmcid_query: str = "",
     ) -> float:
         if pmid_query and candidate.pmid == pmid_query:
             return 500.0
         if doi_query and self._normalize_doi(candidate.doi) == doi_query:
+            return 500.0
+        if pmcid_query and self._normalize_pmcid(candidate.pmcid) == pmcid_query:
             return 500.0
 
         title = (candidate.title or "").lower()

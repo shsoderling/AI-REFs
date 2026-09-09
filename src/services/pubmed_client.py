@@ -20,6 +20,9 @@ from ..storage.cache_db import CacheDB
 logger = logging.getLogger(__name__)
 
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+# NCBI PMC ID Converter: maps PMCID / DOI / manuscript IDs to PMIDs.
+# https://www.ncbi.nlm.nih.gov/pmc/tools/id-converter-api/
+IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 
 
 class PubMedClient:
@@ -90,6 +93,126 @@ class PubMedClient:
         except Exception as e:
             logger.error(f"PubMed search error: {e}")
             return [], 0
+
+    # ── Identifier lookups (used for author-suggested citations) ────
+
+    def find_pmids_by_doi(self, doi: str, max_results: int = 3) -> list[str]:
+        """Return candidate PMIDs for a DOI via ESearch (``[doi]``, then ``[aid]``).
+
+        More than one PMID can come back (errata, comments); callers should
+        fetch the records and keep the one whose DOI matches exactly.
+        """
+        doi = (doi or "").strip()
+        if not doi:
+            return []
+        for field in ("doi", "aid"):
+            pmids, _ = self.search(f"{doi}[{field}]", max_results=max_results)
+            if pmids:
+                return pmids
+        return []
+
+    def find_pmid_by_doi(self, doi: str) -> str:
+        """Return the first PMID for a DOI, or '' when PubMed has no record."""
+        pmids = self.find_pmids_by_doi(doi, max_results=1)
+        return pmids[0] if pmids else ""
+
+    def pmcid_to_pmid(self, pmcid: str) -> str:
+        """Convert a PMCID (e.g. 'PMC11413553') to a PMID.
+
+        Tries the NCBI ID Converter first, then ELink (pmc -> pubmed).
+        Returns '' when no PubMed record is linked.
+        """
+        pmcid = (pmcid or "").strip().upper()
+        if not pmcid:
+            return ""
+        if not pmcid.startswith("PMC"):
+            pmcid = f"PMC{pmcid}"
+        digits = pmcid[3:]
+        if not digits.isdigit():
+            return ""
+
+        cache_key = f"pubmed:pmcid2pmid:{pmcid}"
+        cached = self.cache.get_search(cache_key)
+        if cached is not None:
+            return cached or ""
+
+        pmid = ""
+        # 1) ID converter
+        self._rate_limit()
+        try:
+            params = {
+                **self._base_params(),
+                "ids": pmcid,
+                "format": "json",
+                "tool": "airefs",
+            }
+            resp = self._session.get(IDCONV_URL, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            for rec in data.get("records", []):
+                if str(rec.get("pmcid", "")).upper() == pmcid and rec.get("pmid"):
+                    pmid = str(rec["pmid"])
+                    break
+        except Exception as e:
+            logger.warning(f"PMC ID converter failed for {pmcid}: {e}")
+
+        # 2) ELink fallback
+        if not pmid:
+            self._rate_limit()
+            try:
+                # Only the article's own PubMed record ("pmc_pubmed"), never the
+                # papers it cites ("pmc_refs_pubmed"), which ELink also returns.
+                params = {
+                    **self._base_params(),
+                    "dbfrom": "pmc",
+                    "db": "pubmed",
+                    "id": digits,
+                    "linkname": "pmc_pubmed",
+                    "retmode": "json",
+                }
+                resp = self._session.get(f"{EUTILS_BASE}/elink.fcgi", params=params, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                for linkset in data.get("linksets", []):
+                    for linksetdb in linkset.get("linksetdbs", []):
+                        if linksetdb.get("linkname", "pmc_pubmed") != "pmc_pubmed":
+                            continue
+                        links = linksetdb.get("links", [])
+                        if links:
+                            pmid = str(links[0])
+                            break
+                    if pmid:
+                        break
+            except Exception as e:
+                logger.warning(f"ELink pmc->pubmed failed for {pmcid}: {e}")
+
+        if pmid:
+            self.cache.put_search(cache_key, pmid)
+        return pmid
+
+    def search_author_year(
+        self, last_name: str, year: int, coauthor: str = "", max_results: int = 10,
+    ) -> tuple[list[str], int]:
+        """Find papers whose first author is *last_name* published in *year*.
+
+        Returns ``(pmids, total_count)``.  Uses the first-author field first and
+        falls back to any-author when that yields nothing.
+        """
+        last_name = (last_name or "").strip()
+        if not last_name or not year:
+            return [], 0
+        extra = f" AND {coauthor}[au]" if coauthor else ""
+        # [dp] is the print publication date; an e-pub in December and a print
+        # date the next year are common, so widen to +-1 year when the exact
+        # year finds nothing.
+        date_terms = (f"{year}[dp]", f"{year - 1}:{year + 1}[dp]")
+        for field in ("1au", "au"):
+            for date_term in date_terms:
+                query = f"{last_name}[{field}] AND {date_term}{extra}"
+                pmids, total = self.search(query, max_results=max_results)
+                if pmids:
+                    return pmids, total
+        return [], 0
 
     # ── EFetch: get full article metadata ───────────────────────────
 
@@ -259,14 +382,16 @@ class PubMedClient:
             if id_elem.get("EIdType") == "doi":
                 doi = id_elem.text or ""
                 break
-        # Also check PubmedData ArticleIdList
-        if not doi:
-            pubmed_data = elem.find("PubmedData")
-            if pubmed_data is not None:
-                for aid in pubmed_data.findall(".//ArticleId"):
-                    if aid.get("IdType") == "doi":
-                        doi = aid.text or ""
-                        break
+        # Also check PubmedData ArticleIdList (DOI fallback and PMCID)
+        pmcid = ""
+        pubmed_data = elem.find("PubmedData")
+        if pubmed_data is not None:
+            for aid in pubmed_data.findall(".//ArticleId"):
+                id_type = aid.get("IdType")
+                if id_type == "doi" and not doi:
+                    doi = aid.text or ""
+                elif id_type == "pmc" and not pmcid:
+                    pmcid = (aid.text or "").strip()
 
         # MeSH terms
         mesh_terms = []
@@ -291,6 +416,7 @@ class PubMedClient:
 
         return CitationCandidate(
             pmid=pmid,
+            pmcid=pmcid,
             doi=doi,
             title=title,
             source="pubmed",

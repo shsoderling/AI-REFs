@@ -1,32 +1,42 @@
-"""Stage 2: Locate (REF) and (REFS) markers in parsed sentences."""
+"""Stage 2: Locate citation markers in parsed sentences.
 
-import re
+Recognises ``(REF)`` / ``(REFS)`` plus author-suggested citations such as
+``(PMID: 32879322)``, ``(PMC11413553)``, ``(doi: 10.1101/...)`` and
+``(Battison et al. 2024)``; see :mod:`src.utils.markers` for the grammar.
+"""
+
 import logging
-from ..models.sentence import SentenceRecord, MarkerType
+from typing import Optional
+
+from ..models.markers import MarkerConfig, MarkerType
+from ..models.sentence import SentenceRecord
+from ..utils.markers import find_markers
 
 logger = logging.getLogger(__name__)
-
-MARKER_PATTERN = re.compile(r'\((REFS?)\)')
 
 
 class MarkerLocator:
     """Detect and classify reference markers in sentences."""
 
-    def locate(self, sentences: list[SentenceRecord]) -> list[SentenceRecord]:
-        """Scan sentences for (REF)/(REFS) markers and set marker_type."""
-        for sent in sentences:
-            matches = MARKER_PATTERN.findall(sent.raw_text)
-            if matches:
-                # Use the first marker found
-                marker_str = matches[0]
-                if marker_str == "REFS":
-                    sent.marker_type = MarkerType.REFS
-                else:
-                    sent.marker_type = MarkerType.REF
-                sent.marker_count = len(matches)
+    def __init__(self, config: Optional[MarkerConfig] = None):
+        self.config = config or MarkerConfig.all_on()
 
-        marked_count = sum(1 for s in sentences if s.marker_type is not None)
-        logger.info(f"Located {marked_count} sentences with markers")
+    def locate(self, sentences: list[SentenceRecord]) -> list[SentenceRecord]:
+        """Scan sentences for markers and populate marker fields."""
+        for sent in sentences:
+            markers = find_markers(sent.raw_text, self.config)
+            sent.markers = markers
+            sent.marker_count = len(markers)
+            sent.marker_type = markers[0].kind if markers else None
+
+        marked = [s for s in sentences if s.marker_type is not None]
+        suggested = sum(
+            1 for s in marked for m in s.markers if m.kind == MarkerType.SUGGESTED
+        )
+        logger.info(
+            f"Located {len(marked)} sentences with markers "
+            f"({suggested} author-suggested marker(s))"
+        )
         return sentences
 
     def get_marked_sentences(self, sentences: list[SentenceRecord]) -> list[SentenceRecord]:

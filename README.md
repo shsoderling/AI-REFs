@@ -64,6 +64,30 @@ REM Output: dist\AI REFs\AI REFs.exe
 - `(REF)` → replaced with 1 best reference
 - `(REFS)` → replaced with 2-5 references (configurable)
 
+### Author-suggested citations
+
+If you already know the paper, write it in parentheses. The app looks it up (your
+library first, then PubMed, Europe PMC, and bioRxiv/medRxiv), scores how well it
+supports the sentence with the same AI confidence scoring used for `(REF)`, and lets
+you confirm, replace, or leave it unchanged in the Review tab:
+
+| Written as | Resolved by |
+|---|---|
+| `(PMID: 32879322)` | PubMed ID |
+| `(PMC11413553)` | PubMed Central ID (converted to a PubMed record) |
+| `(doi: 10.1101/2024.01.03.574066)` | DOI, including bioRxiv/medRxiv preprints |
+| `(Battison et al. 2024)`, `(Smith and Jones, 2020)`, `(Smith 2019a)` | first author + year; the AI picks the matching paper when several exist |
+
+Several citations can share one pair of parentheses, separated by commas or
+semicolons, and the kinds can be mixed: `(PMC11413553, PMC3159129)`,
+`(PMID: 32879322; Battison et al. 2024)`. `(REF, PMID: 32879322)` verifies the
+suggestion and searches for one more reference.
+
+Only parentheticals made entirely of citations are detected, so `(n = 12)`,
+`(Fig. 2B)`, or `(December 2024)` are left alone. Detection can be switched off per
+kind in the Input tab. Suggested citations you do not confirm keep their original
+text on export (they are never replaced with `[?]`).
+
 ## Requirements
 
 - Python 3.11+
