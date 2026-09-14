@@ -18,7 +18,7 @@ import logging
 import sys
 
 from common import (  # noqa: E402
-    OFFLINE_HINT, die, dump_json, library_path, load_json, ncbi_credentials, network_reachable,
+    OFFLINE_HINT, dump_json, library_path, load_json, ncbi_credentials, network_reachable,
 )
 
 from airefs.models.markers import SuggestedCitation
@@ -48,6 +48,17 @@ def main() -> None:
     pubmed = PubMedClient(email=email, api_key=api_key, cache_db=cache)
     lib_path = library_path(args.library)
     library = ReferenceLibrary(lib_path) if lib_path else None
+
+    # Probe once up front: every lookup retries through four services, so on an
+    # offline shell a manuscript's worth of suggestions would take minutes to
+    # tell you what one request answers in a second.
+    online, detail = network_reachable()
+    if not online and library is None:
+        dump_json({"schema": 1, "plan": args.plan, "library": lib_path, "sentences": {}, "records": [],
+                   "summary": {"suggestions": 0, "resolved": 0},
+                   "network_error": detail, "hint": OFFLINE_HINT}, args.out)
+        print(f"warning: {OFFLINE_HINT}", file=sys.stderr)
+        return
     resolver = SuggestionResolver(
         pubmed=pubmed,
         europepmc=EuropePMCClient(cache_db=cache),
@@ -99,11 +110,9 @@ def main() -> None:
         library.close()
     out["summary"] = {"suggestions": n_suggestions, "resolved": n_resolved}
     # An unresolved suggestion means "no such paper" only if the network worked.
-    if n_resolved < n_suggestions:
-        ok, detail = network_reachable()
-        if not ok:
-            out["network_error"] = detail
-            out["hint"] = OFFLINE_HINT
+    if not online:
+        out["network_error"] = detail
+        out["hint"] = OFFLINE_HINT + " (the library was searched; everything else needs network)"
     dump_json(out, args.out)
     if args.out:
         print(f"{args.out}: {n_resolved}/{n_suggestions} suggestion(s) resolved, "

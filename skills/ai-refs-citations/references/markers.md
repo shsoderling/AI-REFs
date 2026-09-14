@@ -32,9 +32,13 @@ detected either; tell the user if they rely on those.
 
 `scan_markers.py --no-ids` ignores PMID/PMC/DOI items; `--no-author-year` ignores
 author-year items. With both, only `(REF)`/`(REFS)` count, which is what the app did
-before author-suggested markers existed. A document that already cites in author-year
-style will show every citation as a suggestion; that is usually not what the user wants
-unless they asked to verify their citations, so ask.
+before author-suggested markers existed. A whole parenthetical has to parse, so the
+switches also drop mixed markers: `(REF, PMID: 32879322)` stops being a marker at all
+and that sentence disappears from the plan. Say so when a document has any.
+
+A document that already cites in author-year style will show every citation as a
+suggestion; that is usually not what the user wants unless they asked to verify their
+citations, so ask.
 
 ## Where markers are read
 

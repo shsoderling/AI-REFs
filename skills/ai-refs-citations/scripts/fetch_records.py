@@ -13,6 +13,7 @@ often lack, so run this on the final identifiers before write_docx.py.
 
 import argparse
 import logging
+import re
 
 import sys
 
@@ -32,7 +33,11 @@ def _norm_doi(doi: str) -> str:
     for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:", "DOI:"):
         if doi.startswith(prefix):
             doi = doi[len(prefix):]
-    return doi.strip().rstrip(".").lower()
+    doi = doi.strip().rstrip(".").lower()
+    # A bioRxiv URL carries the version (…574066v2); the API knows the DOI without it.
+    if doi.startswith("10.1101/"):
+        doi = re.sub(r"v\d+$", "", doi)
+    return doi
 
 
 def fetch(pmids, dois, pmcids, email, api_key, library):
@@ -133,13 +138,20 @@ def main() -> None:
     if not (pmids or dois or pmcids):
         die("give at least one of --pmids, --dois, --pmcids")
     email, api_key = ncbi_credentials(args.email, args.api_key, save=args.save_config)
-    result = fetch(pmids, dois, pmcids, email, api_key, library_path(args.library))
+    library = library_path(args.library)
+    # One probe before any lookup: each identifier would otherwise retry through
+    # PubMed, Europe PMC and bioRxiv before failing, several seconds each.
+    online, detail = network_reachable()
+    if not online and not library:
+        dump_json({"records": [], "sources": {}, "missing": pmids + pmcids + dois,
+                   "network_error": detail, "hint": OFFLINE_HINT}, args.out)
+        print(f"warning: {OFFLINE_HINT}", file=sys.stderr)
+        return
+    result = fetch(pmids, dois, pmcids, email, api_key, library)
     # Distinguish "no such paper" from "this shell has no internet".
-    if result["missing"]:
-        ok, detail = network_reachable()
-        if not ok:
-            result["network_error"] = detail
-            result["hint"] = OFFLINE_HINT
+    if result["missing"] and not online:
+        result["network_error"] = detail
+        result["hint"] = OFFLINE_HINT
     dump_json(result, args.out)
     if args.out:
         print(f"{args.out}: {len(result['records'])} record(s)"

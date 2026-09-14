@@ -39,8 +39,6 @@ def document_mode(existing) -> str:
             return "foreign"
         if tracking.tier == DocumentTier.TRACKED:
             return "tracked"
-        if tracking.tier == DocumentTier.STRIPPED:
-            return "stripped"
     return "legacy" if existing.has_existing_citations else "fresh"
 
 
@@ -73,7 +71,7 @@ def scan(docx: str, detect_ids: bool, detect_author_year: bool, keep_uncited: bo
     handler = DocxHandler(docx)
     existing = ExistingCitationParser(handler, keep_uncited=keep_uncited).analyze()
     mode = document_mode(existing)
-    insert_mode = mode in ("legacy", "foreign", "tracked", "stripped") and existing.has_existing_citations
+    insert_mode = mode in ("legacy", "foreign", "tracked") and existing.has_existing_citations
     stop_at = existing.body_end_para_idx if insert_mode else -1
 
     config = MarkerConfig(detect_ids=detect_ids, detect_author_year=detect_author_year)

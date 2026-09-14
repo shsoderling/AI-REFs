@@ -17,8 +17,9 @@ several markers, each marker's `sub_claim` is the text that ends at that marker
 
 ## Search workflow for (REF) and (REFS)
 
-Budget: about three searches and two fetches per marker. Do not keep searching; pick the
-best available match even if it is not perfect, and say so in the rationale.
+Budget: two or three searches and one or two fetches per marker (the app stops its agent
+after six rounds). Do not keep searching; pick the best available match even if it is not
+perfect, and say so in the rationale.
 
 1. If the user has an AI REFs library (`check_env.py` reports it), search it first with
    the claim's key terms and prefer its papers when relevance is comparable; the user
@@ -36,8 +37,9 @@ best available match even if it is not perfect, and say so in the rationale.
    earlier marker of the same sentence; take the next-best unique paper instead.
 
 Preferences (the app's defaults; the user can change them):
-- Peer-reviewed primary research over reviews, unless the user asked to prefer reviews
-  or the claim is a broad statement of the field that a review covers directly.
+- Peer-reviewed primary research over reviews. (When the user asks to prefer reviews,
+  the app flips this: a review that covers a broad statement of the field directly then
+  wins.)
 - Recent publications when relevance is equal.
 - Never select a retracted article.
 - Self-citations: when the sentence says "we previously showed", "our lab", "our

@@ -8,8 +8,8 @@ description: "Find, verify and insert literature citations into a Word (.docx) m
 You are the citation agent the AI REFs app runs in software: read the document, find
 what each marker needs, search the literature, verify every paper against its claim,
 let the user review, then write the document. The deterministic parts (marker
-grammar, DOCX surgery, tracked Word fields, citation and bibliography formatting in
-19 CSL styles, renumbering of pre-cited documents) are the app's own code, bundled in
+grammar, DOCX surgery, tracked Word fields, in-text citation formatting in 19 CSL
+styles, renumbering of pre-cited documents) are the app's own code, bundled in
 `scripts/`. You supply the judgement the app asks its Claude agent and its independent
 verifier for: search, choose, quote, score.
 
@@ -193,9 +193,17 @@ python3 scripts/write_docx.py --plan plan.json --records resolved.json --records
 ```
 
 The default style is NIH grant: superscript numbers in the text, NLM-style entries
-carrying DOI and PMID. The other style ids are listed in `references/file-formats.md`.
+carrying DOI and PMID. The style decides the in-text form; the reference entries are
+NLM-style in every style, so tell a user who asked for "Nature format" that the numbering
+matches but the entry layout is NLM. The style ids are listed in
+`references/file-formats.md`.
 Report the summary lines the script prints (markers resolved, `[?]` placeholders,
-references added, entries left unchanged) and hand the user both files. Never write onto
+references added, markers left unchanged) and hand the user both files. The writer
+refuses rather than quietly doing the wrong thing when a slot holds a paper the author
+did not name, when a chosen paper is retracted, when an author-date style would strand a
+numeric document's existing numbers, or when a legacy reference list is too poorly
+matched to rebuild safely; each refusal names the flag that overrides it, and each
+override is a decision to put to the user, not to take yourself. Never write onto
 the input document; the script refuses.
 
 ## Things that matter
@@ -210,9 +218,10 @@ the input document; the script refuses.
   the writer lists which sentence it belongs to.
 - "Leave unchanged" (decision `skipped`) keeps a marker's text exactly as written, which
   is what the user wants for a parenthetical that was not really a citation.
-- A sentence with several markers has one citation slot per marker, in order, and each
-  slot may hold several papers. Getting the slots right is what puts each paper at the
-  marker it belongs to (`references/markers.md`).
+- Read `slot_count` from the plan rather than counting markers: a sentence usually has
+  one slot per marker, in order, but a sentence whose markers are all `(REFS)` has a
+  single shared slot, and the whole list is then cited at each marker. Getting the slots
+  right is what puts each paper at the marker it belongs to (`references/markers.md`).
 - Do not invent identifiers. A PMID or DOI goes into `decisions.json` only after a
   connector, a script or the user's library returned it. A hand-written record whose
   numbers you guessed will be formatted into the bibliography and read as fact.

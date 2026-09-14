@@ -80,7 +80,11 @@ def library_path(option: Optional[str]) -> Optional[str]:
     if option.lower() == "auto":
         return str(DEFAULT_LIBRARY_PATH) if Path(DEFAULT_LIBRARY_PATH).exists() else None
     path = Path(option).expanduser()
-    return str(path) if path.exists() else None
+    if not path.exists():
+        # A named path that is not there is a typo, not "no library": saying
+        # nothing would quietly search the wrong thing.
+        die(f"no reference library at {path} (pass --library auto or --library none)")
+    return str(path)
 
 
 def network_reachable(timeout: float = 10.0) -> tuple[bool, str]:

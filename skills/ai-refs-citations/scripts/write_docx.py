@@ -15,9 +15,11 @@ unchanged in decisions.json keep their text and take no number; a pending
 
 import argparse
 import json
+import re
 from pathlib import Path
+from typing import Optional
 
-from common import die, index_records, load_json, lookup_record  # noqa: E402
+from common import die, index_records, load_json, lookup_record, record_keys  # noqa: E402
 
 from airefs.models.embedded import DocumentTier
 from airefs.models.evidence import EvidenceRecord, ReviewDecision
@@ -27,9 +29,9 @@ from airefs.pipeline.docx_export import (
     ExportBlocked, ExportDecisions, check_export_guard, export_fresh, export_legacy, export_tracked,
     fresh_append_needs_confirmation,
 )
+from airefs.pipeline.citation_render import parse_csl_layout
 from airefs.pipeline.document_parser import DocumentParser
 from airefs.pipeline.existing_citation_parser import ExistingCitationParser
-from airefs.pipeline.export_slots import ACTION_CITE, ACTION_LEAVE
 from airefs.pipeline.marker_locator import MarkerLocator
 from airefs.pipeline.renumber_plan import build_renumber_plan
 from airefs.services.docx_io import DocxHandler
@@ -45,8 +47,59 @@ DECISIONS = {
 }
 
 
+def _norm_doi(doi: str) -> str:
+    """A DOI as it compares: lower case, no URL prefix, no bioRxiv version suffix."""
+    doi = (doi or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"):
+        if doi.startswith(prefix):
+            doi = doi[len(prefix):]
+    doi = doi.strip().rstrip(".")
+    if doi.startswith("10.1101/"):
+        doi = re.sub(r"v\d+$", "", doi)
+    return doi
+
+
+def suggestion_mismatches(plan: dict, project: ProjectState) -> list[str]:
+    """Author-suggested identifiers whose slot holds some other paper.
+
+    The one invariant of an author-suggested citation is that it stays the
+    author's citation: a PMID, PMC id or DOI the author wrote must end up
+    pointing at that record, or at nothing.  This checks it in code rather
+    than trusting the review to have gone right.
+    """
+    problems = []
+    for sent in plan["sentences"]:
+        ev = project.evidence_map.get(sent["id"])
+        if ev is None or not ev.selected:
+            continue
+        ranges = ev.slot_ranges(sent["slot_count"])
+        for marker in sent["markers"]:
+            if marker["kind"] != "SUGGESTED":
+                continue
+            slot = marker["slot"]
+            if slot >= len(ranges):
+                continue
+            start, end = ranges[slot]
+            block = ev.selected[start:end]
+            if not block:
+                continue                                     # unresolved: text kept, fine
+            have_pmids = {(c.pmid or "").strip() for c in block}
+            have_pmcids = {(c.pmcid or "").strip().upper() for c in block}
+            have_dois = {_norm_doi(c.doi) for c in block}
+            for sug in marker["suggestions"]:
+                kind, value = sug.get("kind", ""), str(sug.get("value", "")).strip()
+                if kind == "pmid" and value and value not in have_pmids:
+                    problems.append(f"{sent['id']} {marker['text']}: PMID {value} is not among the cited records")
+                elif kind == "pmcid" and value and value.upper() not in have_pmcids:
+                    problems.append(f"{sent['id']} {marker['text']}: {value} is not among the cited records")
+                elif kind == "doi" and value and _norm_doi(value) not in have_dois:
+                    problems.append(f"{sent['id']} {marker['text']}: doi {value} is not among the cited records")
+    return problems
+
+
 def build_project(plan: dict, decisions: dict, records, style: CitationStyle, embed: bool,
-                  keep_uncited: bool, allow_tracked_changes: bool) -> tuple[ProjectState, str, dict]:
+                  keep_uncited: bool, allow_tracked_changes: bool,
+                  min_match_ratio: Optional[float] = None) -> tuple[ProjectState, str, dict]:
     docx = plan["docx"]
     if not Path(docx).exists():
         die(f"the document in plan.json no longer exists: {docx}")
@@ -55,6 +108,8 @@ def build_project(plan: dict, decisions: dict, records, style: CitationStyle, em
     project.settings.embed_citation_fields = embed
     project.settings.keep_uncited_entries = keep_uncited
     project.settings.allow_export_with_tracked_changes = allow_tracked_changes
+    if min_match_ratio is not None:
+        project.settings.min_match_ratio = min_match_ratio
 
     handler = DocxHandler(docx)
     existing = ExistingCitationParser(handler, keep_uncited=keep_uncited).analyze()
@@ -67,7 +122,9 @@ def build_project(plan: dict, decisions: dict, records, style: CitationStyle, em
         mode = "legacy"
     else:
         mode = "fresh"
-    project.is_insert_mode = mode != "fresh"
+    # Same condition scan_markers.py used, so both stop parsing at the same
+    # paragraph and the sentence ids line up.
+    project.is_insert_mode = mode != "fresh" and existing.has_existing_citations
 
     # Re-parse with the configuration recorded in the plan so sentence ids and
     # markers are exactly the ones the plan (and the decisions) refer to.
@@ -174,7 +231,13 @@ def write_report(path: str, plan: dict, project: ProjectState, mode: str, stats,
             marker_text = s["markers"][slot]["text"] if slot < len(s["markers"]) else f"slot {slot + 1}"
             for cand in ev.selected[start:end]:
                 key = cand.pmid or cand.doi or cand.title
-                meta = (entry.get("citations") or {}).get(key) or (entry.get("citations") or {}).get(cand.doi.lower() if cand.doi else "", {}) or {}
+                # The decisions file may key a citation by any identifier of the
+                # paper, and with or without a PMID:/doi: prefix.
+                meta = {}
+                for candidate_key in (entry.get("citations") or {}):
+                    if lookup_record({k: cand for k in record_keys(cand)}, candidate_key) is not None:
+                        meta = (entry.get("citations") or {})[candidate_key] or {}
+                        break
                 n = numbers.get(key)
                 head = f"- **{marker_text}** → " + (f"[{n}] " if n else "") + f"{cand.first_author_year}. {cand.title}"
                 ident = " | ".join(x for x in (f"PMID {cand.pmid}" if cand.pmid else "",
@@ -213,8 +276,19 @@ def main() -> None:
     ap.add_argument("--keep-uncited", action="store_true", help="tracked documents: keep entries nothing cites")
     ap.add_argument("--allow-tracked-changes", action="store_true",
                     help="export even if citations carry pending Word tracked changes")
+    ap.add_argument("--allow-retracted", action="store_true",
+                    help="write a citation to a retracted paper (refused otherwise)")
+    ap.add_argument("--allow-suggestion-substitution", action="store_true",
+                    help="allow a slot to hold a paper other than the identifier the author wrote "
+                         "(for a deliberate preprint-to-journal swap)")
+    ap.add_argument("--min-match-ratio", type=float,
+                    help="legacy documents: fraction of reference entries that must match an in-text "
+                         "citation before the bibliography is rebuilt (default 0.5)")
     args = ap.parse_args()
 
+    for path in [args.plan, args.decisions] + list(args.records):
+        if not Path(path).exists():
+            die(f"no such file: {path}")
     plan = load_json(args.plan)
     decisions = load_json(args.decisions)
     style_id = args.style or decisions.get("style") or "nih_grant"
@@ -229,7 +303,37 @@ def main() -> None:
     records = index_records(args.records)
     project, mode, justification = build_project(
         plan, decisions, records, style, embed=not args.no_fields,
-        keep_uncited=args.keep_uncited, allow_tracked_changes=args.allow_tracked_changes)
+        keep_uncited=args.keep_uncited, allow_tracked_changes=args.allow_tracked_changes,
+        min_match_ratio=args.min_match_ratio)
+
+    # A tracked document is always rewritten with fields; saying otherwise would
+    # hand the user a tracked file while telling them it is plain text.
+    if args.no_fields and mode == "tracked":
+        die("this document already carries AI REFs fields, and a tracked rewrite always writes "
+            "fields. To get a field-free document, export the original (untracked) file instead.")
+
+    retracted = sorted({f"{c.first_author_year} ({c.pmid or c.doi})"
+                        for ev in project.evidence_map.values() for c in ev.selected if c.is_retracted})
+    if retracted and not args.allow_retracted:
+        die("refusing to cite retracted paper(s): " + "; ".join(retracted)
+            + ". Choose another paper, or pass --allow-retracted if the retraction is the point "
+              "of the sentence.")
+
+    # A numeric legacy document written in an author-date style leaves the old
+    # numbers pointing at a list that no longer has numbers.
+    if (mode == "legacy" and args.convert_author_date != "yes"
+            and parse_csl_layout(style).is_author_date
+            and project.existing_citations.in_text_citations):
+        die(f"this document cites by number but {style.value} is an author-date style, so the "
+            "existing numbers would point at an unnumbered list. Pass --convert-author-date yes "
+            "to rewrite the existing citations as author-date too (the result is plain text, not "
+            "tracked), or choose a numeric style.")
+
+    mismatched = suggestion_mismatches(plan, project)
+    if mismatched and not args.allow_suggestion_substitution:
+        die("a marker's slot holds a paper the author did not name: " + " | ".join(mismatched)
+            + ". Cite what the author wrote, leave the slot empty when it could not be resolved, "
+              "or pass --allow-suggestion-substitution for a deliberate preprint-to-journal swap.")
 
     reasons = check_export_guard(project.existing_citations, mode, project.settings,
                                  allow_fresh_append=args.allow_fresh_append)
@@ -257,7 +361,8 @@ def main() -> None:
         "output": str(out.resolve()),
         "mode": mode,
         "style": style.value,
-        "tracked_fields": not args.no_fields,
+        "tracked_fields": stats.fields_written > 0,
+        "retracted_cited": retracted if args.allow_retracted else [],
         "summary": stats.summary_lines(),
         "unresolved_sentences": stats.unresolved_sentence_ids,
         "sentences_without_decision": pending,

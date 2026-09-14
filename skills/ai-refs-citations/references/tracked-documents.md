@@ -36,14 +36,16 @@ plain Word content and survive PDF export).
   numbers, new citations get the next numbers in document order, and on write every
   existing citation site is wrapped into a field (adopted) so the next pass is tracked.
   The write is refused when fewer than half of the entries could be matched to in-text
-  citations (a misparsed list would otherwise be destroyed); tell the user which entries
-  were not matched (`plan.json` → `document.problems`).
-- `stripped`: a former export that lost its fields (Google Docs, Pages, RTF). Read as
-  legacy; tracking resumes on the next write.
+  citations, because rebuilding a misparsed list would destroy it; the refusal message
+  gives the ratio. A list that really is only partly cited can be written with
+  `--min-match-ratio 0.2`, after telling the user what the number means.
 - `foreign`: EndNote, Zotero or Mendeley fields are present. The writer refuses; suggest
   the user finalise or convert that document first.
 - `failed` / `newer-version`: unreadable citations, or a document from a newer app
   version. Refuse and report `document.problems`.
+
+A document that lost its fields (saved through Google Docs, Pages or RTF) comes back as
+`legacy` and is adopted again on the next write.
 
 ## Author-date conversions
 

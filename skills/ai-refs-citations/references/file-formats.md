@@ -10,7 +10,7 @@ All files are JSON. Keep them in a scratch folder next to the document.
   "docx": "/Users/me/paper.docx",
   "marker_config": {"detect_ids": true, "detect_author_year": true},
   "document": {
-    "mode": "fresh",                    // fresh | tracked | legacy | stripped | foreign | failed | newer-version
+    "mode": "fresh",                    // fresh | tracked | legacy | foreign | failed | newer-version
     "insert_mode": false,               // true when existing citations must be renumbered
     "existing_references": 0,
     "references_heading_paragraph": -1,
@@ -136,8 +136,9 @@ reconstructing a citation from memory.
   is taken as one slot. A slot may hold several keys (a `(REFS)` marker, or a `(REF)` the
   user extended). An empty list leaves that marker unresolved.
 - `citations`: optional per-record details for the report (score, rationale, verdict,
-  verbatim quote, warnings). The score and rationale are also stored in the document's
-  hidden field record, as the app does.
+  verbatim quote, warnings). They are written into the markdown report only; the
+  document's hidden record carries the bibliographic data, not your scoring. Key each
+  entry by the same identifier used in `slots`.
 
 ## Citation style ids
 
