@@ -36,6 +36,13 @@ before author-suggested markers existed. A document that already cites in author
 style will show every citation as a suggestion; that is usually not what the user wants
 unless they asked to verify their citations, so ask.
 
+## Where markers are read
+
+Body paragraphs only. Table cells, text boxes, headers and footers are not parsed, which
+is also true of the app, so a `(REF)` in a table is never searched and would be exported
+as literal text. `scan_markers.py` lists any it finds in tables under
+`document.markers_in_tables` so you can raise it with the user before writing.
+
 ## Sentences and slots
 
 Each marked sentence has `slot_count` citation slots:

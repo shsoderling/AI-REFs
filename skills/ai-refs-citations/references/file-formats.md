@@ -18,7 +18,9 @@ All files are JSON. Keep them in a scratch folder next to the document.
     "pending_tracked_changes": false,
     "problems": [], "reconcile": [],
     "field_count": 0, "foreign_field_count": 0, "paragraphs": 42,
-    "unresolved_placeholders": 0            // [?] left by an earlier export
+    "unresolved_placeholders": 0,           // [?] left by an earlier export
+    "markers_in_tables": []                 // markers the pipeline cannot reach:
+                                            // [{location, text, paragraph_text}]
   },
   "counts": {"marked_sentences": 3, "markers": 4, "ref": 2, "refs": 1, "suggested": 1, "suggestions": 2},
   "sentences": [

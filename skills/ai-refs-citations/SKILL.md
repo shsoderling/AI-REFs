@@ -92,11 +92,17 @@ whether the document already carries citations.
 - `foreign`, `failed`, `newer-version`: the document cannot be written (another reference
   manager's fields, unreadable citations, or a newer app version). Say so and stop.
 
-Two fields are worth a sentence to the user when they are not zero:
+Three fields are worth a sentence to the user when they are not empty.
 `document.unresolved_placeholders` counts `[?]` left by an earlier export, which are no
-longer markers: to fill one, the user replaces the `[?]` with `(REF)` in Word and you
-scan again. `document.problems` and `document.reconcile` explain anything the parser could
-not line up.
+longer markers: to fill one, the user replaces the `[?]` with `(REF)` in Word and you scan
+again. `document.markers_in_tables` lists markers inside table cells or text boxes: the
+pipeline reads body paragraphs only, exactly as the app does, so those markers are not
+searched and would survive into the exported file as literal `(REF)` text. Say which cells
+they are in and offer to move the sentence into the body, or to cite them by hand after
+the export as plain superscript numbers pointing at the same bibliography (a field in a
+table would not be renumbered later, so plain text is the honest choice there).
+`document.problems` and `document.reconcile` explain anything else the parser could not
+line up.
 
 If the scan finds no markers at all, the document has nothing to work on: say so, name a
 sentence or two that look like they need a citation, and offer either to insert `(REF)`

@@ -84,6 +84,17 @@ def build_project(plan: dict, decisions: dict, records, style: CitationStyle, em
             "Run scan_markers.py again and redo the decisions.")
 
     justification: dict[str, dict] = {}
+    # One object per paper, shared by every citation of it.  Two copies of the
+    # same paper would be minted as two records in the document's hidden field
+    # list, and a later pass would then read more references than are printed.
+    by_identity: dict[str, object] = {}
+
+    def identity_of(cand) -> str:
+        return ((cand.pmid or "").strip()
+                or (cand.doi or "").strip().lower()
+                or (cand.pmcid or "").strip().upper()
+                or (cand.title or "").strip().lower())
+
     for sid, entry in (decisions.get("sentences") or {}).items():
         sentence = by_id.get(sid)
         if sentence is None:
@@ -106,12 +117,15 @@ def build_project(plan: dict, decisions: dict, records, style: CitationStyle, em
                 cand = lookup_record(records, key)
                 if cand is None:
                     die(f"{sid}: no record for {key!r}; fetch it with fetch_records.py or add it to records.json")
-                cand = cand.model_copy()
+                ident = identity_of(cand)
+                shared = by_identity.get(ident)
+                cand = shared if shared is not None else cand.model_copy()
                 meta = (entry.get("citations") or {}).get(str(key)) or {}
-                if meta.get("score") is not None:
+                if meta.get("score") is not None and (shared is None or not cand.composite_score):
                     cand.composite_score = float(meta["score"])
-                if meta.get("rationale"):
+                if meta.get("rationale") and (shared is None or not cand.score_rationale):
                     cand.score_rationale = str(meta["rationale"])
+                by_identity[ident] = cand
                 block.append(cand)
             selected.extend(block)
             sizes.append(len(block))

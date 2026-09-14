@@ -19,6 +19,7 @@ from common import dump_json, die  # noqa: E402  (puts airefs on sys.path)
 
 from airefs.models.embedded import DocumentTier
 from airefs.models.markers import MarkerConfig, MarkerType
+from airefs.utils.markers import find_markers as find_marker_specs
 from airefs.pipeline.claim_context import build_claim_context, sub_claims_for
 from airefs.pipeline.document_parser import DocumentParser
 from airefs.pipeline.existing_citation_parser import ExistingCitationParser
@@ -41,6 +42,31 @@ def document_mode(existing) -> str:
         if tracking.tier == DocumentTier.STRIPPED:
             return "stripped"
     return "legacy" if existing.has_existing_citations else "fresh"
+
+
+def markers_out_of_flow(handler, config: MarkerConfig) -> list[dict]:
+    """Markers inside tables and text boxes.
+
+    The document parser reads ``document.paragraphs`` only, exactly as the app
+    does, so a marker in a table cell is never searched and would survive into
+    the exported file as literal text.  Reporting it lets you tell the user
+    instead of letting it slip through.
+    """
+    found = []
+
+    def walk(table, path: str):
+        for r, row in enumerate(table.rows):
+            for c, cell in enumerate(row.cells):
+                for para in cell.paragraphs:
+                    for spec in find_marker_specs(para.text, config):
+                        found.append({"location": f"{path} row {r + 1}, column {c + 1}",
+                                      "text": spec.text, "paragraph_text": para.text[:200]})
+                for nested in cell.tables:
+                    walk(nested, f"{path} (nested)")
+
+    for t, table in enumerate(getattr(handler.doc, "tables", []) or []):
+        walk(table, f"table {t + 1}")
+    return found
 
 
 def scan(docx: str, detect_ids: bool, detect_author_year: bool, keep_uncited: bool = False) -> dict:
@@ -117,6 +143,8 @@ def scan(docx: str, detect_ids: bool, detect_author_year: bool, keep_uncited: bo
         # [?] left by an earlier export: still missing citations.  They are not
         # markers any more, so tell the user to replace each with (REF).
         "unresolved_placeholders": sum(p.text.count("[?]") for p in handler.get_paragraphs()),
+        # Markers the pipeline cannot reach (table cells, text boxes).
+        "markers_in_tables": markers_out_of_flow(handler, config),
     }
     return {
         "schema": 1,
@@ -150,7 +178,9 @@ def main() -> None:
               f"document is {d['mode']}" + (f" with {d['existing_references']} existing references"
                                             if d['existing_references'] else "")
               + (f"; {d['unresolved_placeholders']} leftover [?] placeholder(s)"
-                 if d['unresolved_placeholders'] else ""))
+                 if d['unresolved_placeholders'] else "")
+              + (f"; {len(d['markers_in_tables'])} marker(s) inside tables, which are NOT processed"
+                 if d['markers_in_tables'] else ""))
 
 
 if __name__ == "__main__":
