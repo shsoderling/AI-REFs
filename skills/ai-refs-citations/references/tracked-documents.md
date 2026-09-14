@@ -79,3 +79,7 @@ replaced by the real citation.
   `--allow-tracked-changes`).
 - A citation copied and pasted elsewhere in the document becomes a second citation of
   the same paper (same number), which is usually what was intended.
+- Only the marker text is replaced, so a space typed before the marker survives: `claim
+  (REF).` becomes `claim 4.` with the space still there, where a hand-typed superscript
+  usually sits tight against the word. Mention it once; it is a find-and-replace away in
+  Word, and editing it here would mean touching the citation fields.
