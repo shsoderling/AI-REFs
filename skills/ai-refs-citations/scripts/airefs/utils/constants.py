@@ -1,0 +1,48 @@
+"""Constants used across the AI REFs application."""
+
+# High-impact journal names (abbreviated and full) for ranking heuristic
+HIGH_IMPACT_JOURNALS = {
+    "Nature", "Science", "Cell",
+    "Nat Neurosci", "Nature Neuroscience",
+    "Nat Cell Biol", "Nature Cell Biology",
+    "Nat Methods", "Nature Methods",
+    "Nat Rev Neurosci", "Nature Reviews Neuroscience",
+    "Nat Genet", "Nature Genetics",
+    "Nat Med", "Nature Medicine",
+    "Nat Biotechnol", "Nature Biotechnology",
+    "Nat Commun", "Nature Communications",
+    "N Engl J Med", "New England Journal of Medicine",
+    "Lancet", "The Lancet",
+    "JAMA",
+    "Neuron",
+    "Cell Rep", "Cell Reports",
+    "Dev Cell", "Developmental Cell",
+    "Mol Cell", "Molecular Cell",
+    "J Cell Biol", "Journal of Cell Biology",
+    "Proc Natl Acad Sci U S A", "PNAS",
+    "Science",
+    "eLife",
+    "Curr Biol", "Current Biology",
+}
+
+MEDIUM_IMPACT_JOURNALS = {
+    "J Neurosci", "Journal of Neuroscience",
+    "PLoS Biol", "PLoS Biology",
+    "PLoS Genet", "PLoS Genetics",
+    "EMBO J", "EMBO Journal",
+    "J Biol Chem", "Journal of Biological Chemistry",
+    "Mol Biol Cell", "Molecular Biology of the Cell",
+    "BMC Biol", "BMC Biology",
+    "Sci Rep", "Scientific Reports",
+    "PLoS One", "PLoS ONE",
+    "Nucleic Acids Res", "Nucleic Acids Research",
+    "Genome Res", "Genome Research",
+    "Bioinformatics",
+    "J Comp Neurol", "Journal of Comparative Neurology",
+    "J Physiol", "Journal of Physiology",
+    "Brain",
+    "Cereb Cortex", "Cerebral Cortex",
+    "Hippocampus",
+    "Front Neurosci", "Frontiers in Neuroscience",
+    "Front Cell Neurosci", "Frontiers in Cellular Neuroscience",
+}

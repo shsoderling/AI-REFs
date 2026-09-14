@@ -1,0 +1,60 @@
+{
+  "skill_name": "ai-refs-citations",
+  "evals": [
+    {
+      "id": 0,
+      "name": "fresh-grant-ref-markers",
+      "prompt": "Here's a draft of my R01 Specific Aims and Significance sections. I left (REF) and (REFS) markers where citations need to go. Can you find the references, show me what you picked before you change anything, and then give me back the document with NIH-style numbered citations and a reference list? The file is rac1_grant_draft.docx.",
+      "expected_output": "A review table of proposed papers per marker (with PMIDs, scores and supporting quotes) presented before writing, then a new .docx with superscript numbers, a References list, and a markdown report. Citations must be real PubMed records, not invented.",
+      "files": [
+        "rac1_grant_draft.docx"
+      ],
+      "assertions": [
+        "An output .docx was produced and can be opened with python-docx",
+        "No literal (REF) or (REFS) text remains in the body of the output document",
+        "The output document has a References heading followed by numbered reference entries",
+        "Every cited PMID corresponds to a real PubMed record whose title matches the one listed in the reference list",
+        "In-text citation numbers run in ascending order of first appearance",
+        "A per-sentence review of the proposed citations was shown to the user before the document was written",
+        "Each proposed citation is accompanied by a supporting quote or rationale tied to the sentence it cites",
+        "The output document reopens as a tracked AI REFs document (citations stored as hidden fields)"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "author-suggested-citations",
+      "prompt": "I already wrote in the papers I want cited in this intro, things like (PMID: 32879322), (PMC11413553, PMC3159129) and (Battison et al. 2024). Check that each one is a real paper and that it actually supports the sentence it is attached to, tell me which ones are weak, and then build the reference list. File is proteomics_intro_with_suggestions.docx.",
+      "expected_output": "Each suggestion looked up and scored against its own sentence, with mismatches flagged rather than silently replaced; suggestions that cannot be confirmed reported as unresolved and left as written; a review table before writing; then a cited .docx plus report.",
+      "files": [
+        "proteomics_intro_with_suggestions.docx"
+      ],
+      "assertions": [
+        "Every author-suggested identifier in the input is either cited in the output or explicitly reported as unresolved",
+        "No author suggestion was silently replaced by a different paper",
+        "At least one suggestion that does not support its sentence is flagged as a weak match or mismatch",
+        "PMC identifiers were converted to their PubMed records rather than cited as bare PMC numbers",
+        "Suggestions that could not be confirmed keep their original text in the output document",
+        "An output .docx and a reference list were produced",
+        "No bibliographic details were invented: every record's title, journal and year match the PubMed or bioRxiv record"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "legacy-insert-renumber",
+      "prompt": "This section already has three numbered references and a References list I wrote by hand. I added two new sentences with (REF) and (REFS). Please add citations for just those two and renumber everything properly, keeping my existing references. File is inhibitory_plasticity_numbered.docx.",
+      "expected_output": "Document recognised as legacy (3 existing references), only the two new sentences searched, existing entries preserved and renumbered in document order, new entries inserted at the right numbers, and a review table shown before writing.",
+      "files": [
+        "inhibitory_plasticity_numbered.docx"
+      ],
+      "assertions": [
+        "The document was recognised as an existing numbered (legacy) document with 3 references",
+        "All three original references are still present in the output reference list",
+        "Only the two new marker sentences received new citations",
+        "In-text numbers and reference-list numbers agree, in document order, after renumbering",
+        "The new citations are real records with verifiable PMIDs",
+        "A review of the proposed citations was shown before the document was written",
+        "The output document reopens as a tracked AI REFs document"
+      ]
+    }
+  ]
+}
