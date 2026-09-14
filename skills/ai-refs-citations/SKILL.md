@@ -97,10 +97,12 @@ Three fields are worth a sentence to the user when they are not empty.
 longer markers: to fill one, the user replaces the `[?]` with `(REF)` in Word and you scan
 again. `document.markers_in_tables` lists markers inside table cells or text boxes: the
 pipeline reads body paragraphs only, exactly as the app does, so those markers are not
-searched and would survive into the exported file as literal `(REF)` text. Say which cells
-they are in and offer to move the sentence into the body, or to cite them by hand after
-the export as plain superscript numbers pointing at the same bibliography (a field in a
-table would not be renumbered later, so plain text is the honest choice there).
+searched and would survive into the exported file as literal `(REF)` text. Search those
+claims like any other, then after the main write fill them with
+`scripts/fill_table_markers.py` (step 6), and tell the user that those numbers are plain
+text: a later renumbering pass will not update them, so the script has to be re-run after
+any later write. A paper cited only in a table cannot be added to the bibliography this
+way, so for one of those, suggest moving the sentence into the body instead.
 `document.problems` and `document.reconcile` explain anything else the parser could not
 line up.
 
@@ -197,6 +199,17 @@ carrying DOI and PMID. The style decides the in-text form; the reference entries
 NLM-style in every style, so tell a user who asked for "Nature format" that the numbering
 matches but the entry layout is NLM. The style ids are listed in
 `references/file-formats.md`.
+If the scan found markers in tables, fill them once the main write is done:
+
+```bash
+python3 scripts/fill_table_markers.py --docx "paper_with_refs.docx" --out "paper_final.docx" \
+    --assign table_citations.json
+```
+
+`table_citations.json` is `{"markers": [{"location": ..., "text": ..., "keys": [...]}]}`,
+with `location` and `text` copied from `document.markers_in_tables` and `keys` naming
+papers already cited in the body.
+
 Report the summary lines the script prints (markers resolved, `[?]` placeholders,
 references added, markers left unchanged) and hand the user both files. The writer
 refuses rather than quietly doing the wrong thing when a slot holds a paper the author

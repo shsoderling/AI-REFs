@@ -152,6 +152,16 @@ bibliography entry is formatted NLM-style (authors, title, journal, year, volume
 with the DOI and PMID appended when known, which is also what lets a re-opened document
 match its entries back to real records.
 
+## table_citations.json (for fill_table_markers.py)
+
+```json
+{"markers": [{"location": "table 1 row 2, column 1", "text": "(REF)", "keys": ["27680697"]}]}
+```
+
+`location` and `text` come straight from `document.markers_in_tables`; `keys` name papers
+already cited in the body of the written document. The script prints what it filled, what
+it could not place, and the reminder that these numbers are plain text.
+
 ## check_env.py and search_library.py output
 
 `check_env.py` prints `lookups` (`scripts` when this shell can reach PubMed,

@@ -45,7 +45,9 @@ citations, so ask.
 Body paragraphs only. Table cells, text boxes, headers and footers are not parsed, which
 is also true of the app, so a `(REF)` in a table is never searched and would be exported
 as literal text. `scan_markers.py` lists any it finds in tables under
-`document.markers_in_tables` so you can raise it with the user before writing.
+`document.markers_in_tables` so you can raise it with the user before writing, and
+`fill_table_markers.py` writes plain numbers into those cells after the main write (they
+do not follow later renumbering, so re-run it after any later write).
 
 ## Sentences and slots
 
