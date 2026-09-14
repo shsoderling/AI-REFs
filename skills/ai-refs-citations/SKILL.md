@@ -8,9 +8,9 @@ description: "Find, verify and insert literature citations into a Word (.docx) m
 You are the citation agent the AI REFs app runs in software: read the document, find
 what each marker needs, search the literature, verify every paper against its claim,
 let the user review, then write the document. The deterministic parts (marker
-grammar, DOCX surgery, tracked Word fields, in-text citation formatting in 19 CSL
-styles, renumbering of pre-cited documents) are the app's own code, bundled in
-`scripts/`. You supply the judgement the app asks its Claude agent and its independent
+grammar, DOCX surgery, tracked Word fields, renumbering of pre-cited documents) are the
+app's own code, bundled in `scripts/`, with the skill's own renderer for the 19 citation
+styles on top. You supply the judgement the app asks its Claude agent and its independent
 verifier for: search, choose, quote, score.
 
 Read `references/search-and-verify.md` before the first search of a session. It carries
@@ -112,11 +112,23 @@ markers into a copy of the document for the user to check, or to take a list of 
 from them. Do not start citing unmarked prose on your own; which claims need support is
 the author's call.
 
-If there are author-suggested markers, ask whether to verify them or to handle only
-`(REF)`/`(REFS)` this time; the app asks the same question, because each suggestion costs
-a lookup and an evaluation. For the latter, scan again with `--no-ids --no-author-year`.
+Ask your two setup questions now, in one message, because both change the work that
+follows and neither is worth discovering at the end:
+
+1. **Which citation style?** The default is NIH grant (superscript numbers, NLM-style
+   entries). The nineteen style ids are in `references/file-formats.md`; name a few that
+   fit what the user is writing (a grant, a Nature paper, an APA manuscript) rather than
+   listing all of them. The style decides both the in-text form and the reference entry
+   layout, so changing it later means rewriting the document.
+2. **Verify the author-suggested markers, or only `(REF)`/`(REFS)` this time?** Ask only
+   when the scan found suggestions; the app asks the same question, because each
+   suggestion costs a lookup and an evaluation. For the latter, scan again with
+   `--no-ids --no-author-year`.
+
 If the counts look wrong (a whole author-date manuscript detected as suggestions), that is
-the moment to switch detection off rather than after the searching.
+the moment to switch detection off rather than after the searching. If the user does not
+answer, use NIH grant and verify the suggestions, and say in the handover which defaults
+you took.
 
 ### 2. Resolve the author's suggestions
 
@@ -194,11 +206,20 @@ python3 scripts/write_docx.py --plan plan.json --records resolved.json --records
     --decisions decisions.json --style nih_grant --out "paper_with_refs.docx" --report report.md
 ```
 
-The default style is NIH grant: superscript numbers in the text, NLM-style entries
-carrying DOI and PMID. The style decides the in-text form; the reference entries are
-NLM-style in every style, so tell a user who asked for "Nature format" that the numbering
-matches but the entry layout is NLM. The style ids are listed in
-`references/file-formats.md`.
+The style now decides both halves of the citation: the in-text form (superscript,
+bracketed or author-date) and the reference entry itself, rendered from the style's own
+CSL rules, so Nature entries read `Udakis, M. et al. Title. Nat Commun 11, 4395 (2020).`
+and APA entries read `Udakis, M., Pedrosa, V., ... (2020). Title. Nature Communications,
+11(1), 4395.` The style ids are listed in `references/file-formats.md`.
+
+Two writer options belong to the bibliography:
+
+- `--bibliography nlm` goes back to the app's single NLM-like entry format for every
+  style, which is what the desktop app produces. Use it when the user wants the document
+  to match what the app would have written.
+- `--append-ids` adds the DOI and PMID to entries whose style omits them. Worth offering
+  when the document may later be saved through Google Docs or Pages, which strips the
+  hidden fields: the identifiers are then the only way back to the records.
 If the scan found markers in tables, fill them once the main write is done:
 
 ```bash

@@ -71,6 +71,14 @@ not a marker any more: it is an unresolved field, counted in
 again. A `(REF)` typed over a `[?]` is picked up normally and the placeholder field is
 replaced by the real citation.
 
+## Entries and the desktop app
+
+The skill renders reference entries from the style's own CSL rules; the desktop app has a
+single NLM-like format for every style. Both write the same hidden fields, so documents
+pass between them freely, but a document exported here and then re-exported by the app
+comes back with NLM entries (the app regenerates them). For someone who works in both,
+either pass `--bibliography nlm` so the two agree, or do the last pass here.
+
 ## Caveats to tell the user once
 
 - Do not retype citation numbers by hand; they are regenerated. Author-date text edits

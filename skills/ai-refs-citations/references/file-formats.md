@@ -147,10 +147,24 @@ reconstructing a citation from memory.
 `plos_one`, `cell`, `elife`, `pnas`, `acs`, `ieee`, `aps`, `elsevier_harvard`,
 `chicago_author_date`. Author-date styles (APA, CSE author-date, Elsevier Harvard,
 Chicago, eLife) write `(Smith et al., 2020)` and an alphabetical list; the others write
-numbers in order of first appearance. The style file decides the in-text form; every
-bibliography entry is formatted NLM-style (authors, title, journal, year, volume, pages)
-with the DOI and PMID appended when known, which is also what lets a re-opened document
-match its entries back to real records.
+numbers in order of first appearance.
+
+Both the in-text citation and the reference entry follow the style's CSL file
+(`scripts/csl_bibliography.py` renders the bibliography; `--bibliography nlm` restores the
+app's single NLM-like format). What that means per style, for one paper:
+
+| Style | Entry |
+|---|---|
+| `nih_grant` | `1. Udakis M, Pedrosa V, ... Title. Nat Commun. 2020;11(1):4395. PMCID: PMC7467931` |
+| `vancouver` | `1. Udakis M, Pedrosa V, Chamberlain SEL, Clopath C, Mellor JR. Title. Nat Commun. 2020;11(1):4395.` |
+| `nature` | `1. Udakis, M., Pedrosa, V. & Mellor, J. R. Title. Nat Commun 11, 4395 (2020).` |
+| `apa` | `Udakis, M., Pedrosa, V., & Mellor, J. R. (2020). Title. Nature Communications, 11(1), 4395. https://doi.org/...` |
+| `ieee` | `[1] M. Udakis, V. Pedrosa, and J. R. Mellor, "Title", Nat Commun, vol. 11, no. 1, p. 4395, 2020, doi: ...` |
+
+Each style's own author cap applies (Nature shows one author then et al., Vancouver six,
+AMA three). Font styling is not part of an entry: Word runs are written as plain text, so
+a style that italicises journal names renders them upright. A style file that cannot be
+parsed falls back to the NLM format rather than producing a half-built entry.
 
 ## table_citations.json (for fill_table_markers.py)
 

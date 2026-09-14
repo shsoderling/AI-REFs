@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import csl_bibliography  # noqa: E402
 from common import die, index_records, load_json, lookup_record, record_keys  # noqa: E402
 
 from airefs.models.embedded import DocumentTier
@@ -281,6 +282,12 @@ def main() -> None:
     ap.add_argument("--allow-suggestion-substitution", action="store_true",
                     help="allow a slot to hold a paper other than the identifier the author wrote "
                          "(for a deliberate preprint-to-journal swap)")
+    ap.add_argument("--bibliography", choices=["style", "nlm"], default="style",
+                    help="'style' (default): reference entries follow the citation style's own "
+                         "CSL rules. 'nlm': the app's single NLM-like format for every style.")
+    ap.add_argument("--append-ids", action="store_true",
+                    help="append the DOI and PMID to entries whose style omits them (helps a "
+                         "document that later loses its hidden fields be re-matched)")
     ap.add_argument("--min-match-ratio", type=float,
                     help="legacy documents: fraction of reference entries that must match an in-text "
                          "citation before the bibliography is rebuilt (default 0.5)")
@@ -299,6 +306,9 @@ def main() -> None:
     out = Path(args.out)
     if out.resolve() == Path(plan["docx"]).resolve():
         die("refusing to overwrite the input document; choose another --out")
+
+    if args.bibliography == "style":
+        csl_bibliography.install(append_identifiers=args.append_ids)
 
     records = index_records(args.records)
     project, mode, justification = build_project(
@@ -362,6 +372,7 @@ def main() -> None:
         "mode": mode,
         "style": style.value,
         "tracked_fields": stats.fields_written > 0,
+        "bibliography": args.bibliography,
         "retracted_cited": retracted if args.allow_retracted else [],
         "summary": stats.summary_lines(),
         "unresolved_sentences": stats.unresolved_sentence_ids,
