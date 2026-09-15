@@ -120,7 +120,65 @@ def test_vancouver_lists_six_authors_then_et_al():
 def test_ieee_quotes_the_title_and_labels_pages():
     text = render(MANY_AUTHORS, CitationStyle.IEEE)
     assert "“Tiam1-mediated" in text
-    assert "vol. 147" in text and "pp. 2507-2521" in text
+    assert "C. Yao et al., “" in text          # the author list keeps its comma
+    assert "vol. 147" in text and "pp. 2507–2521" in text
+
+
+def test_page_ranges_use_an_en_dash_and_the_style_s_abbreviation():
+    """CSL normalises the separator, and page-range-format decides the digits."""
+    assert "2507–2521" in render(MANY_AUTHORS, CitationStyle.APA)        # expanded
+    assert "2507–21" in render(MANY_AUTHORS, CitationStyle.CHICAGO_AUTHOR_DATE)
+
+
+def test_a_title_ending_in_a_question_mark_gets_no_extra_period():
+    asking = CitationCandidate(
+        pmid="2", doi="10.1/x", title="Why do spines shrink?",
+        authors=[_author("Diaz", "Luis", "L")], year=2020, journal="Nature communications",
+        journal_abbrev="Nat Commun", volume="11", issue="2", pages="1-9")
+    for style in (CitationStyle.VANCOUVER, CitationStyle.NATURE, CitationStyle.APA,
+                  CitationStyle.AMA, CitationStyle.CELL):
+        text = render(asking, style)
+        assert "shrink?." not in text, (style.value, text)
+        assert "shrink?" in text
+
+
+def test_a_record_with_no_year_says_so_in_author_date_styles():
+    undated = CitationCandidate(
+        title="Undated work", authors=[_author("Ray", "Sam", "S")],
+        doi="10.1101/x", journal="bioRxiv", journal_abbrev="bioRxiv", source="biorxiv")
+    assert "n.d." in cb.format_bib_entry(undated, 1, CitationStyle.APA)
+    assert "n.d." in cb.format_bib_entry(undated, 1, CitationStyle.CHICAGO_AUTHOR_DATE)
+
+
+def test_the_number_is_not_doubled_when_the_style_renders_it_itself():
+    for style in (CitationStyle.ACS, CitationStyle.IEEE, CitationStyle.VANCOUVER):
+        text = cb.format_bib_entry(ARTICLE, 3, style)
+        assert text.count("3") >= 1
+        assert not text.startswith("3. (3)") and not text.startswith("3. [3]")
+
+
+def test_an_apa_paper_with_21_authors_keeps_the_ellipsis():
+    crowd = CitationCandidate(
+        pmid="3", doi="10.1/y", title="A consortium paper",
+        authors=[_author(f"Author{i:02d}", f"First{i:02d}", "F") for i in range(1, 26)],
+        year=2020, journal="Nature communications", journal_abbrev="Nat Commun",
+        volume="11", issue="2", pages="1-9")
+    text = render(crowd, CitationStyle.APA)
+    assert "\u2026 Author25, F." in text.encode().decode("unicode_escape") or "… Author25, F." in text
+    assert "F.. Author25" not in text
+
+
+def test_a_doi_containing_repeated_punctuation_survives_the_tidy_up():
+    odd = CitationCandidate(
+        pmid="4", doi="10.1002/(SICI)1097-0142::AID-X", title="An odd identifier",
+        authors=[_author("Ng", "Wei", "W")], year=2019, journal="Cell",
+        journal_abbrev="Cell", volume="1", pages="2-3")
+    assert "::" in render(odd, CitationStyle.AMA).lower()
+
+
+def test_a_preprint_is_typed_so_styles_can_label_it():
+    text = cb.format_bib_entry(PREPRINT, 1, CitationStyle.APA)
+    assert "Preprint" in text
 
 
 def test_author_date_styles_carry_the_year_without_a_number():

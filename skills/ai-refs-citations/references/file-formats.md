@@ -162,9 +162,18 @@ app's single NLM-like format). What that means per style, for one paper:
 | `ieee` | `[1] M. Udakis, V. Pedrosa, and J. R. Mellor, "Title", Nat Commun, vol. 11, no. 1, p. 4395, 2020, doi: ...` |
 
 Each style's own author cap applies (Nature shows one author then et al., Vancouver six,
-AMA three). Font styling is not part of an entry: Word runs are written as plain text, so
-a style that italicises journal names renders them upright. A style file that cannot be
-parsed falls back to the NLM format rather than producing a half-built entry.
+AMA three, APA the first nineteen then an ellipsis and the last). Page ranges take the
+style's abbreviation and CSL's en dash (`2507–2521` in APA, `2507–21` in Chicago), a
+record with no year renders the style's own "n.d.", and a bioRxiv or medRxiv record is
+typed as a preprint so styles that label unpublished work do ("[Preprint]" in APA,
+"Preprint at" in Nature, "Preprint posted online" in AMA).
+
+Two limits worth stating to a user who asks. Font styling is not part of an entry: Word
+runs are written as plain text, so a style that italicises journal names renders them
+upright. And an existing entry in a legacy document is kept verbatim when it is adopted,
+so a rebuilt list can mix the user's own punctuation with the style's until those entries
+are regenerated. A style file that cannot be parsed falls back to the NLM format rather
+than producing a half-built entry.
 
 ## table_citations.json (for fill_table_markers.py)
 

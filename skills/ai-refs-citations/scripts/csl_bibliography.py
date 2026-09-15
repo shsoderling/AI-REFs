@@ -76,6 +76,12 @@ MONTHS_SHORT = ["Jan.", "Feb.", "Mar.", "Apr.", "May", "Jun.",
 
 NUMERIC_RE = re.compile(r"^[a-zA-Z]*\d+([-,&\s]+[a-zA-Z]*\d+)*[a-zA-Z]*$")
 
+# Disambiguation variables exist only when a processor needs them.  Counting
+# them would suppress the group that carries "(n.d.)", because that group calls
+# year-suffix and nothing else.
+NON_COUNTING_VARIABLES = {"year-suffix", "citation-label", "locator",
+                          "first-reference-note-number"}
+
 
 class CslError(Exception):
     """The style could not be rendered; the caller falls back."""
@@ -146,6 +152,50 @@ class Options:
         return o
 
 
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }".replace(" ", "")
+
+
+def _roman(n: int) -> str:
+    pairs = ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+             (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"))
+    out = []
+    for value, letters in pairs:
+        while n >= value:
+            out.append(letters)
+            n -= value
+    return "".join(out)
+
+
+def _format_page_range(pages: str, style_format: str) -> str:
+    """A page range as the style wants it, with CSL's en dash.
+
+    Vancouver and Chicago abbreviate the second number ("2507-21"); APA and
+    the NLM family spell it out. CSL normalises the separator to an en dash
+    whatever the source used.
+    """
+    pages = pages.strip()
+    m = re.match(r"^(\w*?)(\d+)\s*[-\u2013]\s*(\w*?)(\d+)$", pages)
+    if not m:
+        return pages
+    prefix_a, first, prefix_b, last = m.groups()
+    if style_format in ("minimal", "minimal-two", "chicago", "chicago-15", "chicago-16") \
+            and not prefix_b and len(first) == len(last):
+        keep = 2 if style_format in ("minimal-two", "chicago", "chicago-15", "chicago-16") else 1
+        common = 0
+        for a, b in zip(first, last):
+            if a != b:
+                break
+            common += 1
+        cut = min(common, len(last) - keep)
+        if style_format.startswith("chicago") and len(first) == 4 and first[1] != "0":
+            cut = min(cut, 2)                     # Chicago keeps at least two digits
+        last = last[cut:] if cut > 0 else last
+    return f"{prefix_a}{first}\u2013{prefix_b}{last}"
+
+
 def _tag(el) -> str:
     return el.tag.replace(NS, "") if isinstance(el.tag, str) else ""
 
@@ -174,14 +224,64 @@ def _apply_format(text: str, el) -> str:
         def _title_word(w: str, i: int, n: int) -> str:
             if any(c.isupper() for c in w[1:]) or w.isupper():
                 return w                                   # bioRxiv, CA1, DNA
-            if w.lower() in small and 0 < i < n - 1:
+            if w.lower() in small and 0 < i < n - 1 and not words[i - 1].endswith((":", "?", "!", ".")):
                 return w.lower()
             return w[:1].upper() + w[1:]
         words = text.split(" ")
         text = " ".join(_title_word(w, i, len(words)) for i, w in enumerate(words))
     if a.get("quotes") == "true":
         text = f"“{text}”"
-    return a.get("prefix", "") + text + a.get("suffix", "")
+    suffix = a.get("suffix", "")
+    # "Why do spines shrink?" followed by a "." suffix must not read "shrink?.";
+    # CSL drops punctuation the text already ends with.
+    # Only a period is swallowed, and only by sentence-ending punctuation:
+    # a style that appends ", " after an author list still needs its comma.
+    if suffix[:1] == "." and text.rstrip().rstrip("”\"')").endswith((".", "?", "!")):
+        suffix = suffix[1:]
+    return a.get("prefix", "") + text + suffix
+
+
+# Identifiers must survive the tidy-up: a DOI may legitimately contain "::"
+# or "..", and a URL ends in whatever it ends in.
+_PROTECTED = re.compile(
+    r"(https?://\S*[^\s.,;:]|doi:\s*\S*[^\s.,;:]|10\.\d{4,9}/\S*[^\s.,;:])")
+
+
+def _join(parts: list, delimiter: str) -> str:
+    """Join with *delimiter*, without doubling sentence punctuation.
+
+    A title that ends in "?" followed by a ". " delimiter must read
+    "shrink? Nat Commun", not "shrink?. Nat Commun".
+    """
+    if not parts:
+        return ""
+    out = parts[0]
+    for part in parts[1:]:
+        sep = delimiter
+        if sep[:1] in ".,;:" and out.rstrip("\u201d\"')").endswith((".", "?", "!")):
+            sep = sep[1:] or " "
+        out += sep + part
+    return out
+
+
+def _clean_punctuation(text: str) -> str:
+    """Tidy punctuation a style left adjacent, without touching identifiers.
+
+    Styles assume every article has a volume and a page range; when one does
+    not, their delimiters collide ("2024;.", "2020;:1-9").  Only the gaps
+    between fields are cleaned, and never inside a DOI or URL.
+    """
+    parts = _PROTECTED.split(text)
+    last = len(parts) - 1
+    for i in range(0, len(parts), 2):                # even indexes are prose
+        chunk = parts[i]
+        chunk = re.sub(r"([.,;:])\1+", r"\1", chunk)
+        chunk = chunk.replace(" ,", ",").replace(" .", ".").replace("..", ".")
+        chunk = re.sub(r"[;,:]\s*([.;:])", r"\1", chunk)
+        if i == last:                                # only the entry's own tail
+            chunk = re.sub(r"[;,:]\s*$", "", chunk)
+        parts[i] = chunk
+    return "".join(parts).strip()
 
 
 class CslBibliography:
@@ -205,6 +305,17 @@ class CslBibliography:
         self.base = Options()
         for el in (root, self.bibliography):
             self.base = self.base.merged(el)
+        if root.attrib.get("name-form"):
+            self.base.form = root.attrib["name-form"]
+        self.names_delimiter = root.attrib.get("names-delimiter", "; ")
+        self.page_range_format = root.attrib.get("page-range-format", "")
+        # A style's locale block may ask for punctuation inside closing quotes
+        # (IEEE and Chicago do); CSL calls this punctuation-in-quote.
+        self.punctuation_in_quote = False
+        for locale in root.findall(NS + "locale"):
+            for opt in locale.findall(NS + "style-options"):
+                if opt.attrib.get("punctuation-in-quote") == "true":
+                    self.punctuation_in_quote = True
 
     # ── locale ──────────────────────────────────────────────────────
     def _load_locale_terms(self, root) -> None:
@@ -237,12 +348,7 @@ class CslBibliography:
         frag = self._children(self.layout, ctx, self.base, self.layout.attrib.get("delimiter", ""))
         text = _apply_format(frag.text, self.layout)
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"([.,;:])\1+", r"\1", text)
-        text = text.replace(" ,", ",").replace(" .", ".").replace("..", ".")
-        # A style that assumes every article has a volume leaves "2024;." behind
-        # when one does not; collapse punctuation that ended up adjacent.
-        text = re.sub(r"[;,:]\s*([.;])", r"\1", text)
-        text = re.sub(r"[;,:]\s*$", "", text).strip()
+        text = _clean_punctuation(text)
         if self.bibliography.attrib.get("second-field-align"):
             text = re.sub(r"^(\(?\[?\d+\]?[.)]?)(?=[^\s.,;:)\]])", r"\1 ", text)
         return text
@@ -255,7 +361,7 @@ class CslBibliography:
             filled += frag.filled
             if frag.text:
                 parts.append(frag.text)
-        return Frag(delimiter.join(parts), called, filled)
+        return Frag(_join(parts, delimiter), called, filled)
 
     def _flatten(self, el, ctx, opts: Options):
         """Fragments for *el*'s children, with choose branches spliced in.
@@ -304,7 +410,10 @@ class CslBibliography:
         if "value" in a:
             return Frag(_apply_format(a["value"], el))
         if "variable" in a:
-            value = self._variable(ctx, a["variable"], a.get("form", ""))
+            name = a["variable"]
+            value = self._variable(ctx, name, a.get("form", ""))
+            if name in NON_COUNTING_VARIABLES:
+                return Frag(_apply_format(value, el))
             return Frag(_apply_format(value, el), called=1, filled=1 if value else 0)
         return Frag()
 
@@ -325,13 +434,20 @@ class CslBibliography:
         return self._children(branch, ctx, opts, branch.attrib.get("delimiter", ""))
 
     def _do_names(self, el, ctx, opts) -> Frag:
-        opts = opts.merged(el)
+        names_delimiter = el.attrib.get("delimiter", self.names_delimiter)
+        inherited = Options(**opts.__dict__)
+        for key in ("et-al-min", "et-al-use-first", "et-al-use-last"):
+            if key in el.attrib:
+                inherited = inherited.merged(el)
+                break
         variables = el.attrib.get("variable", "").split()
         name_el = el.find(NS + "name")
         label_el = el.find(NS + "label")
         substitute = el.find(NS + "substitute")
+        opts = inherited
         name_opts = opts.merged(name_el) if name_el is not None else opts
 
+        label_first = self._label_comes_first(el)
         rendered, called, filled = [], 0, 0
         for var in variables:
             called += 1
@@ -341,9 +457,10 @@ class CslBibliography:
             filled += 1
             text = self._names_text(people, name_opts, name_el)
             if label_el is not None:
-                label = self.term(var, label_el.attrib.get("form", "long"), plural=len(people) > 1)
-                if label:
-                    text += _apply_format(label, label_el)
+                label = self._names_label(label_el, var, len(people))
+                # A style may put the label before the names ("edited by X"),
+                # and several do; its position in the XML decides.
+                text = f"{label}{text}" if label_first else f"{text}{label}"
             rendered.append(text)
         if not rendered and substitute is not None:
             ctx.setdefault("suppress", set())
@@ -359,8 +476,7 @@ class CslBibliography:
             ctx.pop("record_vars", None)
         if not rendered:
             return Frag("", called, 0)
-        joined = el.attrib.get("delimiter", "; ").join(rendered)
-        return Frag(_apply_format(joined, el), called, filled)
+        return Frag(_apply_format(names_delimiter.join(rendered), el), called, filled)
 
     def _do_names_with(self, el, ctx, inherited: Options, parent_name_el, parent_label_el) -> Frag:
         """Render a <names> that inherits another's name options (substitute)."""
@@ -380,13 +496,28 @@ class CslBibliography:
             filled += 1
             text = self._names_text(people, opts, name_el or parent_name_el)
             if label_el is not None:
-                label = self.term(var, label_el.attrib.get("form", "long"), plural=len(people) > 1)
-                if label:
-                    text += _apply_format(label, label_el)
+                label = self._names_label(label_el, var, len(people))
+                text = f"{label}{text}" if self._label_comes_first(el) else f"{text}{label}"
             rendered.append(text)
         if not rendered:
             return Frag("", called, 0)
         return Frag(_apply_format(el.attrib.get("delimiter", "; ").join(rendered), el), called, filled)
+
+    @staticmethod
+    def _label_comes_first(names_el) -> bool:
+        for child in names_el:
+            tag = _tag(child)
+            if tag == "label":
+                return True
+            if tag in ("name", "et-al"):
+                return False
+        return False
+
+    def _names_label(self, label_el, variable: str, count: int) -> str:
+        plural_attr = label_el.attrib.get("plural", "contextual")
+        plural = count > 1 if plural_attr == "contextual" else plural_attr == "always"
+        term = self.term(variable, label_el.attrib.get("form", "long"), plural=plural)
+        return _apply_format(term, label_el) if term else ""
 
     def _names_text(self, people: list, opts: Options, name_el) -> str:
         names = [self._one_name(p, opts, i) for i, p in enumerate(people)]
@@ -403,7 +534,7 @@ class CslBibliography:
         if truncated:
             text = delim.join(names)
             if last:
-                text += f"{delim}... {last[0]}"
+                text += f"{delim}\u2026 {last[0]}"
             else:
                 et_al = self.term("et-al", "long")
                 sep = delim if (opts.delimiter_precedes_et_al == "always"
@@ -412,10 +543,12 @@ class CslBibliography:
             return text
         if len(names) > 1 and opts.and_:
             and_word = self.term("and", "symbol" if opts.and_ == "symbol" else "long")
+            inverted_before_last = (opts.name_as_sort_order == "all"
+                                    or (opts.name_as_sort_order == "first" and len(names) == 2))
             precedes = (opts.delimiter_precedes_last == "always"
                         or (opts.delimiter_precedes_last == "contextual" and len(names) > 2)
                         or (opts.delimiter_precedes_last == "after-inverted-name"
-                            and opts.name_as_sort_order in ("first", "all")))
+                            and inverted_before_last))
             head = delim.join(names[:-1])
             return f"{head}{delim if precedes else ' '}{and_word} {names[-1]}"
         return delim.join(names)
@@ -428,9 +561,15 @@ class CslBibliography:
             return literal
         if opts.form == "short" or not given:
             return family
-        if opts.initialize_with is not None:
+        if opts.initialize_with is not None and not opts.initialize:
+            # Chicago: keep the given name, but punctuate bare initials
+            # ("Sophie E L" -> "Sophie E. L.").
+            mark = opts.initialize_with.strip() or "."
+            given_out = " ".join(
+                (w + mark if len(w) == 1 and w.isalpha() else w) for w in given.split())
+        elif opts.initialize_with is not None:
             parts = []
-            for token in re.split(r"[\s.]+", given):
+            for token in re.split(r"[\s.]+", given.replace("-", " -")):
                 if not token:
                     continue
                 # PubMed records carry initials as one blob ("JA"): each letter
@@ -498,6 +637,9 @@ class CslBibliography:
 
     def _do_number(self, el, ctx, opts) -> Frag:
         value = self._variable(ctx, el.attrib.get("variable", ""), "")
+        form = el.attrib.get("form", "numeric")
+        if value.isdigit() and form in ("ordinal", "long-ordinal", "roman"):
+            value = _ordinal(int(value)) if form != "roman" else _roman(int(value))
         return Frag(_apply_format(value, el), called=1, filled=1 if value else 0)
 
     def _do_label(self, el, ctx, opts) -> Frag:
@@ -521,6 +663,8 @@ class CslBibliography:
         if name == "page-first":
             pages = str(item.get("page") or "")
             return re.split(r"[-\u2013,]", pages)[0].strip() if pages else ""
+        if name == "page":
+            return _format_page_range(str(item.get("page") or ""), self.page_range_format)
         if name == "container-title" and form == "short":
             return str(item.get("container-title-short") or item.get("container-title") or "")
         if name in ("author", "editor", "translator"):
@@ -597,29 +741,54 @@ def _style_bibliography(style) -> Optional[CslBibliography]:
     if key not in _CACHE:
         try:
             _CACHE[key] = CslBibliography(str(get_csl_path(style)))
-        except CslError:
+        except Exception:                                # noqa: BLE001 - never abort a write
             return None
     return _CACHE[key]
+
+
+def _item_for(citation) -> dict:
+    """The CSL item for *citation*, with preprints typed as such.
+
+    The app types every record ``article-journal``; several styles keep a
+    branch for unpublished work ("Preprint", "ahead of print") that only fires
+    on another type, and a bioRxiv record is not a journal article.
+    """
+    from airefs.pipeline.csl_mapping import to_csl_item
+    item = to_csl_item(citation)
+    types = [t.lower() for t in (getattr(citation, "publication_types", None) or [])]
+    doi = (getattr(citation, "doi", "") or "").lower()
+    source = (getattr(citation, "source", "") or "").lower()
+    looks_preprint = ("preprint" in types or doi.startswith("10.1101/")
+                      or source in ("biorxiv", "medrxiv"))
+    if looks_preprint and not citation.pmid:
+        item["type"] = "article"                      # CSL 1.0.2's unpublished type
+        item.setdefault("genre", "Preprint")
+    return item
 
 
 def format_bib_entry(citation, number: int, style) -> str:
     """Drop-in replacement for ``airefs.pipeline.bib_format.format_bib_entry``."""
     from airefs.models.project import AUTHOR_DATE_STYLES
-    from airefs.pipeline.csl_mapping import to_csl_item
     nlm_entry = _ORIGINAL or _load_original()
 
-    bib = _style_bibliography(style)
+    try:
+        bib = _style_bibliography(style)
+    except Exception:                                    # noqa: BLE001
+        bib = None
     if bib is None:
         return nlm_entry(citation, number, style)
     try:
-        text = bib.render(to_csl_item(citation), number)
+        text = bib.render(_item_for(citation), number)
     except Exception:                                            # noqa: BLE001
         return nlm_entry(citation, number, style)
     if not text or sum(c.isalnum() for c in text) < 6:           # nothing usable came out
         return nlm_entry(citation, number, style)
 
     numeric = style not in AUTHOR_DATE_STYLES
-    if numeric and not re.match(rf"^\[?{number}\b", text):
+    # Styles render citation-number themselves, in their own shape: "3.", "[3]",
+    # "(3)". Only prepend when the style produced no number at all, or ACS
+    # entries come out as "3. (3) Smith, J.".
+    if numeric and not re.match(rf"^[\[(]?{number}[\])]?[.,:)\s]", text):
         text = f"{number}. {text}"
     if _APPEND_IDS:
         if citation.doi and citation.doi.lower() not in text.lower():
@@ -637,10 +806,10 @@ def install(append_identifiers: bool = False) -> None:
     """
     global _APPEND_IDS, _ORIGINAL
     _APPEND_IDS = append_identifiers
-    from airefs.pipeline import bib_format, docx_export, tracked_renumber
+    from airefs.pipeline import author_date_convert, bib_format, docx_export, tracked_renumber
     if _ORIGINAL is None:
         _ORIGINAL = bib_format.format_bib_entry
-    for module in (bib_format, docx_export, tracked_renumber):
+    for module in (bib_format, docx_export, tracked_renumber, author_date_convert):
         if hasattr(module, "format_bib_entry"):
             module.format_bib_entry = format_bib_entry
 
@@ -649,7 +818,7 @@ def uninstall() -> None:
     """Restore the app's NLM formatter (used by the tests)."""
     if _ORIGINAL is None:
         return
-    from airefs.pipeline import bib_format, docx_export, tracked_renumber
-    for module in (bib_format, docx_export, tracked_renumber):
+    from airefs.pipeline import author_date_convert, bib_format, docx_export, tracked_renumber
+    for module in (bib_format, docx_export, tracked_renumber, author_date_convert):
         if hasattr(module, "format_bib_entry"):
             module.format_bib_entry = _ORIGINAL
