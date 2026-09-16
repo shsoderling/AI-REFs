@@ -93,11 +93,21 @@ def _adjacent(prev: ComplexField, nxt: ComplexField) -> bool:
     return prev.end.getnext() is nxt.begin
 
 
-def candidates_for(items: list[CiteItem], existing: ExistingCitationMap) -> list[CitationCandidate]:
+def candidates_for(items: list[CiteItem], existing: ExistingCitationMap,
+                   canon: Optional[RecordCanonicaliser] = None,
+                   by_uuid: Optional[dict] = None) -> list[CitationCandidate]:
     """The candidates behind a cluster's items: the map's record when the
-    reader has it, else the item data embedded in the field."""
-    by_uuid = {e.record_uuid: e for e in existing.bib_entries.values() if e.record_uuid}
-    canon = RecordCanonicaliser(existing)
+    reader has it, else the item data embedded in the field.
+
+    Pass the document's own *canon* (and its uuid index): one canonicaliser
+    across the whole document is what lets a paper recorded twice by an
+    earlier version fold back into one record, and it is built once rather
+    than per cluster.
+    """
+    if by_uuid is None:
+        by_uuid = {e.record_uuid: e for e in existing.bib_entries.values() if e.record_uuid}
+    if canon is None:
+        canon = RecordCanonicaliser(existing)
     out = []
     for item in items:
         entry = by_uuid.get(item.record_uuid)
@@ -114,7 +124,7 @@ def candidates_for(items: list[CiteItem], existing: ExistingCitationMap) -> list
 
 def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
                      result: RenumberingResult, layout: CitationLayout, style: CitationStyle,
-                     stats: ExportStats) -> int:
+                     stats: ExportStats, canon: Optional[RecordCanonicaliser] = None) -> int:
     """Give every cluster its new numbers, text and payload; rewrite only what
     changed. An unresolved [?] field into which the user typed a marker
     ((REF), (REFS) or an author-suggested citation) is unwrapped so the
@@ -123,13 +133,15 @@ def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
     from ..models.markers import MarkerConfig
     from ..utils.markers import find_markers
     unwrapped = 0
+    canon = canon or RecordCanonicaliser(existing)
+    by_uuid = {e.record_uuid: e for e in existing.bib_entries.values() if e.record_uuid}
     for cluster in clusters:
         if (cluster.payload.unresolved and not cluster.items
                 and find_markers(cluster.field.result_text, MarkerConfig.all_on())):
             unwrap_field(cluster.field)
             unwrapped += 1
             continue
-        cands = candidates_for(cluster.items, existing)
+        cands = candidates_for(cluster.items, existing, canon, by_uuid)
         numbers = [n for n in (result.number_for_candidate(c) for c in cands) if n is not None]
         visible = cluster.field.result_text
         user_edited = bool(cluster.payload.plain) and visible != cluster.payload.plain
@@ -155,11 +167,14 @@ def rewrite_clusters(clusters: list[Cluster], existing: ExistingCitationMap,
 
 
 def blocked_table_fields(table_fields, existing: ExistingCitationMap, result: RenumberingResult,
-                         layout: CitationLayout) -> list[str]:
+                         layout: CitationLayout,
+                         canon: Optional[RecordCanonicaliser] = None) -> list[str]:
     """Reasons a table / text-box citation could not be left as it is."""
     reasons = []
+    canon = canon or RecordCanonicaliser(existing)
+    by_uuid = {e.record_uuid: e for e in existing.bib_entries.values() if e.record_uuid}
     for f, payload in table_fields:
-        cands = candidates_for(payload.items, existing)
+        cands = candidates_for(payload.items, existing, canon, by_uuid)
         numbers = [n for n in (result.number_for_candidate(c) for c in cands) if n is not None]
         stored = [] if layout.is_author_date else numbers
         if stored != payload.numbers or payload.render != layout.render_kind:

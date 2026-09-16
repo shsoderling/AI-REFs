@@ -274,7 +274,10 @@ def export_fresh(project: ProjectState, output_path: str) -> ExportStats:
 
     write_new_markers(handler, plan, result, layout, style, embed, stats)
 
-    entries, order = render_new_bibliography(result, style, layout, settings.bibliography_format)
+    # Without hidden fields the printed identifiers are the only way back to
+    # the records, so they are kept whatever the format asks for.
+    bibliography_format = settings.bibliography_format if embed else "style_with_ids"
+    entries, order = render_new_bibliography(result, style, layout, bibliography_format)
     if entries:
         project.doc_id = project.doc_id or str(uuid.uuid4())
         if embed:
@@ -331,15 +334,19 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
     logger.info(f"Tracked export: style={style.value} clusters={len(clusters)} "
                 f"markers={len(plan.markers)} records={len(result.assignments)}")
 
-    blocked = blocked_table_fields(table_fields, existing, result, layout)
+    blocked = blocked_table_fields(table_fields, existing, result, layout, plan.canonicaliser)
     if blocked:
         raise ExportBlocked(blocked)
 
     # 1. existing citations: new numbers, text and payload
-    unwrapped = rewrite_clusters(clusters, existing, result, layout, style, stats)
+    unwrapped = rewrite_clusters(clusters, existing, result, layout, style, stats,
+                                 plan.canonicaliser)
     handler.invalidate_fields()          # runs were replaced: rebuild the identity index
 
     # 2. new markers
+    # The return value (numbers a new citation shares with an existing entry)
+    # is not reported here: in a tracked document duplicates_merged already
+    # counts adjacent citation fields that were merged into one cluster.
     write_new_markers(handler, plan, result, layout, style, True, stats)
 
     # 3. bibliography, replaced in place (or regenerated when its field is gone)
@@ -501,6 +508,16 @@ def adopt_existing_sites(handler: DocxHandler, existing: ExistingCitationMap,
     cand_by_old = _identify_existing_entries(existing)
     new_to_old = {a.final_number: a.original_number
                   for a in result.assignments.values() if not a.is_new}
+    # A new citation of a paper the list already has takes that entry's record
+    # (the canonicaliser gave them one object). When such a citation comes
+    # first in the document the assignment is marked new, so map it back here
+    # or the adoption pass cannot tell which entry the site cites.
+    old_by_candidate = {id(candidate): old for old, candidate in cand_by_old.items()}
+    for assignment in result.assignments.values():
+        if assignment.is_new and assignment.candidate is not None:
+            old = old_by_candidate.get(id(assignment.candidate))
+            if old is not None:
+                new_to_old.setdefault(assignment.final_number, old)
 
     def cands_for(numbers):
         cands = []
@@ -644,11 +661,13 @@ def export_legacy(project: ProjectState, output_path: str,
         project.uncited = list(uncited)
         project.entry_hashes = list(hashes)
     else:
+        # This branch writes plain text: nothing hidden carries the identity.
+        plain_format = ("style_with_ids" if settings.bibliography_format != "nlm"
+                        else "nlm")
         if is_author_date:
-            entries = build_author_date_bibliography(existing, result, style)
+            entries = build_author_date_bibliography(existing, result, style, plain_format)
         else:
-            entries = merged_numeric_bibliography(existing, result, style,
-                                                  settings.bibliography_format)
+            entries = merged_numeric_bibliography(existing, result, style, plain_format)
         if entries:
             handler.append_bibliography(entries)
 

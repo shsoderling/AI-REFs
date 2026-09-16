@@ -979,9 +979,12 @@ class InputsTab(QWidget):
         style_idx = s.value("citation_style_index", None)
         if style_idx is not None:
             self.style_combo.setCurrentIndex(int(style_idx))
-        bib_idx = s.value("bibliography_format_index", None)
-        if bib_idx is not None:
-            self.bibliography_combo.setCurrentIndex(int(bib_idx))
+        saved_format = s.value("bibliography_format", None)
+        if saved_format is not None:
+            for i, (_, value) in enumerate(self._bibliography_options):
+                if value == saved_format:
+                    self.bibliography_combo.setCurrentIndex(i)
+                    break
         parallel = s.value("parallel_searches", None)
         if parallel is not None:
             try:
@@ -1002,7 +1005,9 @@ class InputsTab(QWidget):
         s.setValue("claude_model_id", self.current_model_id())
         s.remove("claude_model_index")
         s.setValue("citation_style_index", self.style_combo.currentIndex())
-        s.setValue("bibliography_format_index", self.bibliography_combo.currentIndex())
+        idx = self.bibliography_combo.currentIndex()
+        if 0 <= idx < len(self._bibliography_options):
+            s.setValue("bibliography_format", self._bibliography_options[idx][1])
         s.setValue("parallel_searches", self.parallel_spin.value())
         s.setValue("detect_suggested_ids", self.suggested_ids_check.isChecked())
         s.setValue("detect_author_year", self.author_year_check.isChecked())

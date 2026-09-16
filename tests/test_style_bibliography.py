@@ -131,3 +131,107 @@ def test_the_nlm_setting_writes_what_earlier_versions_wrote(tmp_path):
     export_fresh(project, str(out))
     assert DocxHandler(str(out)).get_paragraphs()[-1].text == format_nlm_entry(
         ARTICLE, 1, CitationStyle.NATURE)
+
+
+def test_a_document_with_no_hidden_fields_keeps_its_identifiers(tmp_path):
+    """Plain-text exports have nowhere else to carry identity."""
+    builder = DocBuilder()
+    builder.paragraph("A claim (REF).")
+    source = builder.save(tmp_path / "in.docx")
+    project = ProjectState(settings={"citation_style": CitationStyle.NATURE,
+                                     "embed_citation_fields": False})
+    project.input_docx_path = str(source)
+    project.sentences = [SentenceRecord(
+        id="S001", paragraph_index=0, raw_text="A claim (REF).", clean_text="A claim.",
+        marker_type=MarkerType.REF, marker_count=1, marker_types=[MarkerType.REF])]
+    project.evidence_map = {"S001": EvidenceRecord(
+        sentence_id="S001", selected=[ARTICLE], review_decision=ReviewDecision.ACCEPTED)}
+    out = tmp_path / "out.docx"
+    export_fresh(project, str(out))
+
+    entry = DocxHandler(str(out)).get_paragraphs()[-1].text
+    assert "Udakis, M." in entry                      # still Nature's shape
+    assert "PMID: 32879322" in entry
+    assert "10.1038/s41467-020-18074-8" in entry
+
+
+def test_a_style_that_prints_the_doi_as_a_url_round_trips(tmp_path):
+    """APA gives the DOI as a link; the entry reader has to accept that form."""
+    from src.models.existing_refs import ExistingBibEntry
+    from src.pipeline.existing_citation_parser import ExistingCitationParser
+
+    entry = ExistingBibEntry(original_number=1)
+    ExistingCitationParser._extract_bib_fields(
+        entry, format_bib_entry(ARTICLE, 1, CitationStyle.APA))
+    assert entry.doi == ARTICLE.doi
+
+
+def test_style_with_ids_does_not_print_an_identifier_twice():
+    apa = format_bib_entry(ARTICLE, 1, CitationStyle.APA, "style_with_ids")
+    assert apa.count(ARTICLE.doi) == 1               # APA prints it as a URL already
+    vancouver = format_bib_entry(ARTICLE, 1, CitationStyle.VANCOUVER, "style_with_ids")
+    assert vancouver.count(ARTICLE.doi) == 1         # Vancouver prints none, so one is added
+    assert vancouver.count(ARTICLE.pmid) == 1
+
+
+def test_a_cold_spring_harbor_journal_is_not_called_a_preprint():
+    """10.1101 is the publisher's prefix, not bioRxiv's."""
+    genome_research = CitationCandidate(
+        doi="10.1101/gr.123456.119", title="A genome research paper", year=2019,
+        journal="Genome Research", journal_abbrev="Genome Res", volume="29", pages="1-10",
+        authors=[Author(last_name="Ng", first_name="Wei", initials="W")])
+    assert "Preprint" not in format_bib_entry(genome_research, 1, CitationStyle.APA)
+
+
+def test_a_preprint_pubmed_has_indexed_is_still_a_preprint():
+    indexed = CitationCandidate(
+        pmid="39000001", doi="10.1101/2024.02.02.500000", title="An indexed preprint",
+        year=2024, journal="bioRxiv", journal_abbrev="bioRxiv",
+        publication_types=["Preprint"],
+        authors=[Author(last_name="Kim", first_name="Soo", initials="S")])
+    assert "Preprint" in format_bib_entry(indexed, 1, CitationStyle.APA)
+
+
+def test_a_failure_to_read_a_style_is_not_remembered_for_the_process(monkeypatch, tmp_path):
+    """A transient failure must not silently disable styling for everything after."""
+    broken = tmp_path / "broken.csl"
+    broken.write_text("<style><not-csl></style>", encoding="utf-8")
+    monkeypatch.setattr("src.pipeline.csl_bibliography._CACHE", {})
+    monkeypatch.setattr("src.models.project.get_csl_path", lambda style: broken)
+    assert render_entry(ARTICLE, 1, CitationStyle.NATURE) is None
+    monkeypatch.undo()
+    monkeypatch.setattr("src.pipeline.csl_bibliography._CACHE", {})
+    assert render_entry(ARTICLE, 1, CitationStyle.NATURE) is not None
+
+
+def test_the_tracked_and_legacy_paths_honour_the_format(tmp_path):
+    """Not just the fresh export: every path reads the setting."""
+    from src.pipeline.docx_export import ExportDecisions, export_legacy, export_tracked
+    from src.pipeline.existing_citation_parser import ExistingCitationParser
+
+    builder = DocBuilder()
+    builder.paragraph("A claim (REF).")
+    source = builder.save(tmp_path / "in.docx")
+    project = ProjectState(settings={"citation_style": CitationStyle.NATURE})
+    project.input_docx_path = str(source)
+    project.sentences = [SentenceRecord(
+        id="S001", paragraph_index=0, raw_text="A claim (REF).", clean_text="A claim.",
+        marker_type=MarkerType.REF, marker_count=1, marker_types=[MarkerType.REF])]
+    project.evidence_map = {"S001": EvidenceRecord(
+        sentence_id="S001", selected=[ARTICLE], review_decision=ReviewDecision.ACCEPTED)}
+    first = tmp_path / "first.docx"
+    export_fresh(project, str(first))
+    assert DocxHandler(str(first)).get_paragraphs()[-1].text.startswith("1. Udakis, M.")
+
+    # the tracked pass re-renders the same entry, and the setting still decides
+    reopened = ExistingCitationParser(DocxHandler(str(first))).analyze()
+    second = ProjectState(settings={"citation_style": CitationStyle.NATURE,
+                                    "bibliography_format": "nlm"})
+    second.input_docx_path = str(first)
+    second.existing_citations = reopened
+    second.doc_tracking = reopened.tracking
+    second.is_insert_mode = True
+    out = tmp_path / "tracked.docx"
+    export_tracked(second, str(out))
+    assert DocxHandler(str(out)).get_paragraphs()[-1].text == format_nlm_entry(
+        ARTICLE, 1, CitationStyle.NATURE)

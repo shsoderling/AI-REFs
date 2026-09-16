@@ -40,12 +40,11 @@ def _came_from_a_document(citation) -> bool:
 
     Such a record is thinner than a fresh search result (no abstract, no MeSH
     terms), so the library merges it rather than overwriting the row.  The
-    record uuid used to be the only signal; since candidates for one paper are
-    now shared across its citations, a copy can reach here without one, so the
-    record's own origin is checked too.
+    record uuid is the signal: only a document ever carries one.  Records
+    that share an object across several citations of one paper keep the uuid
+    of whichever citation was written first, which is the same record.
     """
-    return bool(getattr(citation, "record_uuid", "")) or \
-        (getattr(citation, "source", "") or "").lower() in ("embedded", "document")
+    return bool(getattr(citation, "record_uuid", ""))
 
 
 def _follow_wrapped_height(widget: QWidget):

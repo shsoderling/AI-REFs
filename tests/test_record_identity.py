@@ -212,3 +212,101 @@ def test_any_shared_identifier_resolves_to_the_same_record(other_kwargs):
     canon = RecordCanonicaliser()
     canon.canonical(owner)
     assert canon.canonical(CitationCandidate(**other_kwargs)) is owner
+
+
+def test_two_papers_that_share_a_title_prefix_keep_their_own_records(tmp_path):
+    """A 60-character title prefix is enough to share a number, never a record.
+
+    Long biomedical titles collide on their opening words; merging their
+    metadata would print a reference that belongs to neither paper.
+    """
+    prefix = "Efficacy and safety of semaglutide in adults with overweight or obesity"
+    preprint = CitationCandidate(
+        doi="10.1101/2024.05.05.000123", title=f"{prefix}", year=2024,
+        journal="bioRxiv", journal_abbrev="bioRxiv",
+        authors=[Author(last_name="Alpha", initials="A")])
+    other_paper = CitationCandidate(
+        pmid="99999999", doi="10.1038/s41586-025-00001-x",
+        title=f"{prefix} and type 2 diabetes", year=2025,
+        journal="Nature", journal_abbrev="Nature", volume="640", pages="55-62",
+        authors=[Author(last_name="Zeta", initials="Z"), Author(last_name="Omega", initials="O")])
+
+    canon = RecordCanonicaliser()
+    assert canon.canonical(preprint) is preprint
+    assert canon.canonical(other_paper) is other_paper      # different papers
+    assert preprint.journal == "bioRxiv" and preprint.year == 2024
+    assert preprint.pmid == "" and len(preprint.authors) == 1
+
+
+def test_a_retraction_does_not_travel_between_papers():
+    prefix = "Single-cell transcriptomic atlas of the human prefrontal cortex in health"
+    clean = CitationCandidate(pmid="1", doi="10.1/clean", title=prefix, year=2024,
+                              journal="Cell", authors=[Author(last_name="Alpha", initials="A")])
+    retracted = CitationCandidate(pmid="2", doi="10.1/retracted", title=f"{prefix} and disease",
+                                  year=2024, journal="Cell", is_retracted=True,
+                                  retraction_notice="Retracted 2025",
+                                  authors=[Author(last_name="Zeta", initials="Z")])
+    canon = RecordCanonicaliser()
+    canon.canonical(clean)
+    canon.canonical(retracted)
+    assert clean.is_retracted is False and not clean.retraction_notice
+
+
+def test_a_reviewed_record_is_not_demoted_to_a_documents_stub():
+    """A legacy entry is a title and a year; the reviewed paper has the rest."""
+    stub = CitationCandidate(pmid="30000007", title="Important Study Number 7", year=2025)
+    stub.raw_entry = "Author7 A. Important Study Number 7. J Test 7. 2025;17:700-710."
+    reviewed = make_citation(7)
+    canon = RecordCanonicaliser()
+    canon.canonical(stub)
+    assert canon.canonical(reviewed) is stub
+    assert stub.journal == reviewed.journal and stub.volume == reviewed.volume
+    assert stub.authors and stub.authors[0].last_name == reviewed.authors[0].last_name
+
+
+def test_a_new_citation_before_the_existing_one_still_adopts(tmp_path):
+    """The new marker comes first in the document, the old citation second."""
+    builder = DocBuilder()
+    paragraph = builder.paragraph("New claim about the same paper (REF). Old claim")
+    builder.add_text(paragraph, "1", superscript=True)
+    builder.add_text(paragraph, ".")
+    builder.paragraph("References")
+    builder.paragraph("1. Author7 A. Important Study Number 7. J Test 7. 2025;17:700-710. "
+                      "doi:10.1234/test.7 PMID: 30000007")
+    source = builder.save(tmp_path / "legacy.docx")
+
+    existing = ExistingCitationParser(DocxHandler(str(source))).analyze()
+    project = _project(source,
+                       [_sentence(0, "New claim about the same paper (REF).", "S001")],
+                       {"S001": EvidenceRecord(sentence_id="S001", selected=[make_citation(7)],
+                                               review_decision=ReviewDecision.ACCEPTED)})
+    project.existing_citations = existing
+    project.doc_tracking = existing.tracking
+    project.is_insert_mode = True
+    out = tmp_path / "out.docx"
+    export_legacy(project, str(out), ExportDecisions())          # must not raise
+
+    assert len([e for e in _entries(out) if e.strip()]) == 1
+    assert len(set(_record_ids(out))) == 1                        # both sites, one record
+
+
+def test_previewing_the_numbering_leaves_the_reviewed_records_alone(tmp_path):
+    """The plan runs on the GUI's preview path too: it must not rewrite state."""
+    from src.pipeline.renumber_plan import build_renumber_plan
+
+    builder = DocBuilder()
+    builder.paragraph("First claim (REF).")
+    builder.paragraph("Second claim (REF).")
+    source = builder.save(tmp_path / "in.docx")
+    first, second = make_citation(7), make_citation(9)
+    project = _project(source,
+                       [_sentence(0, "First claim (REF).", "S001"),
+                        _sentence(1, "Second claim (REF).", "S002")],
+                       {"S001": EvidenceRecord(sentence_id="S001", selected=[first],
+                                               review_decision=ReviewDecision.ACCEPTED),
+                        "S002": EvidenceRecord(sentence_id="S002", selected=[second],
+                                               review_decision=ReviewDecision.ACCEPTED)})
+    before = [(c.pmid, c.doi, c.title, c.journal, c.year) for c in (first, second)]
+    build_renumber_plan(DocxHandler(str(source)), project)
+    after = [(c.pmid, c.doi, c.title, c.journal, c.year) for c in (first, second)]
+    assert before == after

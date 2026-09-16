@@ -36,7 +36,11 @@ def upgrade_project_data(data: dict) -> dict:
 
     v1 files (no ``schema_version``) lose the two bibliography maps that
     were never read; the document's own citation fields replaced them. A
-    file written by a newer AI REFs is refused rather than misread.
+    v2 file was written before reference entries followed the citation
+    style, so its document carries the old NLM entries and it keeps them
+    until the user asks for otherwise: re-exporting should not silently
+    restyle a reference list the author has already read. A file written by
+    a newer AI REFs is refused rather than misread.
     """
     version = int(data.get("schema_version") or 1)
     if version > PROJECT_SCHEMA_VERSION:
@@ -47,6 +51,11 @@ def upgrade_project_data(data: dict) -> dict:
         for key in _DROPPED_V1_KEYS:
             data.pop(key, None)
         data["schema_version"] = 2
+    if version < 3:
+        settings = data.setdefault("settings", {})
+        if settings.get("bibliography_format") is None:
+            settings["bibliography_format"] = "nlm"
+        data["schema_version"] = 3
     return data
 
 

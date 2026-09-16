@@ -257,8 +257,10 @@ class ExistingCitationParser:
     @staticmethod
     def _extract_bib_fields(entry: ExistingBibEntry, body: str):
         """Best-effort extraction of DOI, PMID, year from raw bib text."""
-        # DOI
-        doi_match = re.search(r'doi:\s*(10\.\S+)', body, re.IGNORECASE)
+        # DOI, in either form entries carry it: "doi:10.1/x" or the URL that
+        # APA, Cell, eLife and the PLOS styles print.
+        doi_match = re.search(
+            r'(?:doi:\s*|https?://(?:dx\.)?doi\.org/)(10\.\S+)', body, re.IGNORECASE)
         if doi_match:
             entry.doi = doi_match.group(1).rstrip('.')
         # PMID

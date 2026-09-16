@@ -94,33 +94,85 @@ class RecordCanonicaliser:
     Every export path runs its candidates through here first, seeded from the
     records already in the document so a repeat citation reuses that record
     rather than minting a rival.
+
+    Only a shared strong identifier -- record uuid, PMID, PMC id or DOI --
+    makes two objects one record. The numbering engine also merges on a
+    normalised title, which is right for choosing one number but far too weak
+    to decide whose metadata a printed entry carries: two different papers can
+    share a 60-character title prefix, and merging their records would invent
+    a reference that exists nowhere.
     """
 
     def __init__(self, existing: Optional[ExistingCitationMap] = None):
-        self._index = CitationKeyIndex()
         self._owner: dict[str, CitationCandidate] = {}
+        self._order: list[CitationCandidate] = []          # first registered wins
         if existing is not None:
             for number in sorted(existing.bib_entries):
                 candidate = existing.bib_entries[number].matched_candidate
-                if candidate is None:
-                    continue
-                key = self._index.key_for_candidate(candidate)
-                if key:
-                    self._owner.setdefault(key, candidate)
+                if candidate is not None:
+                    self._register(candidate)
+
+    @staticmethod
+    def _identifiers(candidate: CitationCandidate) -> list[str]:
+        """Every strong identifier this record can be recognised by."""
+        keys = []
+        if candidate.record_uuid and candidate.record_uuid.strip():
+            keys.append(f"uuid:{candidate.record_uuid.strip()}")
+        if candidate.pmid and candidate.pmid.strip():
+            keys.append(f"pmid:{candidate.pmid.strip()}")
+        pmcid = getattr(candidate, "pmcid", "") or ""
+        if pmcid.strip():
+            keys.append(f"pmcid:{pmcid.strip().upper()}")
+        if candidate.doi and candidate.doi.strip():
+            keys.append(f"doi:{candidate.doi.strip().lower()}")
+        return keys
+
+    def _register(self, candidate: CitationCandidate) -> None:
+        if not any(c is candidate for c in self._order):
+            self._order.append(candidate)
+        for key in self._identifiers(candidate):
+            self._owner.setdefault(key, candidate)
+
+    def _rank(self, candidate: CitationCandidate) -> int:
+        for index, seen in enumerate(self._order):
+            if seen is candidate:
+                return index
+        return len(self._order)
 
     def canonical(self, candidate: CitationCandidate) -> CitationCandidate:
         """The object that owns this paper's record, adopting *candidate* if
         the paper is new to the document."""
-        key = self._index.key_for_candidate(candidate)
-        if not key:
-            return candidate                      # nothing to identify it by
-        owner = self._owner.get(key)
-        if owner is None:
-            self._owner[key] = candidate
+        keys = self._identifiers(candidate)
+        if not keys:
+            return candidate                      # nothing strong to match on
+        owners = []
+        for key in keys:
+            found = self._owner.get(key)
+            if found is not None and not any(found is o for o in owners):
+                owners.append(found)
+        if not owners or (len(owners) == 1 and owners[0] is candidate):
+            self._register(candidate)
             return candidate
-        if owner is not candidate:
+        # Several records can claim this paper: a document written before
+        # records were shared holds one id per citation. The first one
+        # registered keeps the paper; the rest fold into it, so a second pass
+        # heals such a document instead of carrying the split forward.
+        owner = min(owners, key=self._rank)
+        for other in owners:
+            if other is not owner:
+                _absorb_metadata(owner, other)
+                self._repoint(other, owner)
+        if candidate is not owner:
             _absorb_metadata(owner, candidate)
+        self._register(owner)                     # the merge can add identifiers
+        for key in self._identifiers(owner):
+            self._owner[key] = owner
         return owner
+
+    def _repoint(self, old: CitationCandidate, owner: CitationCandidate) -> None:
+        for key, value in list(self._owner.items()):
+            if value is old:
+                self._owner[key] = owner
 
     def canonical_all(self, candidates) -> list[CitationCandidate]:
         return [self.canonical(c) for c in candidates]
@@ -129,27 +181,38 @@ class RecordCanonicaliser:
 def _absorb_metadata(owner: CitationCandidate, other: CitationCandidate) -> None:
     """Let the owning record learn from another object for the same paper.
 
-    Gaps are filled, never overwritten, with one deliberate exception: when
-    the owner has no PMID and the newcomer does, the paper has been published
-    since the owner was recorded (a preprint that reached a journal), so the
-    bibliographic fields are taken from the newcomer. The record id never
-    changes, so the document keeps pointing at the same record.
+    The two share a strong identifier, so this can never mix two papers.
+    Gaps are filled, and a record reviewed this session wins over a stub the
+    document carried: an entry parsed out of a hand-written reference list has
+    a title, a year and little else, and a citation the user just accepted
+    should not be demoted to it. The record id never changes, so the document
+    keeps pointing at the same record.
     """
-    published_now = bool(other.pmid) and not owner.pmid
     fields = ("pmid", "pmcid", "doi", "journal", "journal_abbrev", "volume",
               "issue", "pages", "year", "title", "abstract", "raw_entry")
+    # The newcomer wins outright in two cases, both safe because the two share
+    # an identifier: the owner is a stub parsed out of a document, or the paper
+    # has been indexed since (a preprint that reached a journal carries the
+    # same DOI and now has a PMID).
+    prefer_other = (_is_thin(owner) and not _is_thin(other)) or (bool(other.pmid) and not owner.pmid)
     for field_name in fields:
         new_value = getattr(other, field_name, None)
         if not new_value:
             continue
-        current = getattr(owner, field_name, None)
-        if not current or (published_now and field_name != "title"):
+        if not getattr(owner, field_name, None) or prefer_other:
             setattr(owner, field_name, new_value)
     if len(other.authors or []) > len(owner.authors or []):
         owner.authors = list(other.authors)
     if other.is_retracted and not owner.is_retracted:
         owner.is_retracted = True
         owner.retraction_notice = other.retraction_notice or owner.retraction_notice
+
+
+def _is_thin(candidate: CitationCandidate) -> bool:
+    """A record reconstructed from a document rather than from a search."""
+    if candidate.raw_entry:
+        return True                               # adopted verbatim from text
+    return not candidate.authors or not (candidate.journal or candidate.journal_abbrev)
 
 
 @dataclass

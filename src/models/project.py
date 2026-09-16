@@ -218,7 +218,7 @@ class ProjectSettings(BaseModel):
     )
 
 
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 
 
 class ProjectState(BaseModel):

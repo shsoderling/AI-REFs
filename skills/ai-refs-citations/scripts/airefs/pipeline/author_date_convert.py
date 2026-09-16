@@ -138,12 +138,12 @@ def convert_in_text_to_author_date(handler, existing: ExistingCitationMap,
 
 def build_author_date_bibliography(existing: ExistingCitationMap,
                                    renumber_result: RenumberingResult,
-                                   style) -> list[str]:
+                                   style, bibliography_format: str = "style") -> list[str]:
     """Build an unnumbered, alphabetically sorted merged bibliography."""
     entries: list[tuple[str, str]] = []
     for assignment in renumber_result.assignments.values():
         if assignment.is_new and assignment.candidate:
-            text = format_bib_entry(assignment.candidate, 0, style)
+            text = format_bib_entry(assignment.candidate, 0, style, bibliography_format)
         else:
             old_entry = existing.bib_entries.get(assignment.original_number)
             if not old_entry:

@@ -13,14 +13,27 @@ def test_v1_project_upgrades_and_drops_dead_fields(tmp_path):
     path = tmp_path / "old.airefsproj"
     path.write_text(json.dumps(v1))
     p = load_project(str(path))
-    assert p.schema_version == 2 and p.project_name == "old"
+    assert p.schema_version == 3 and p.project_name == "old"
     assert not hasattr(p, "bibliography_pmids") and not hasattr(p, "pmid_to_bib_number")
     assert p.doc_id == "" and p.record_order == [] and p.doc_tracking is None
 
 
 def test_upgrade_is_idempotent():
-    data = {"schema_version": 2, "project_name": "x"}
+    data = {"schema_version": 3, "project_name": "x"}
     assert upgrade_project_data(dict(data)) == data
+
+
+def test_a_v2_project_keeps_the_entry_format_its_document_was_written_with():
+    """Re-exporting must not restyle a reference list the author has read."""
+    upgraded = upgrade_project_data({"schema_version": 2, "project_name": "x"})
+    assert upgraded["schema_version"] == 3
+    assert upgraded["settings"]["bibliography_format"] == "nlm"
+
+
+def test_a_v2_project_that_already_chose_a_format_keeps_its_choice():
+    upgraded = upgrade_project_data(
+        {"schema_version": 2, "settings": {"bibliography_format": "style"}})
+    assert upgraded["settings"]["bibliography_format"] == "style"
 
 
 def test_v2_round_trip_keeps_tracking(tmp_path):
@@ -30,7 +43,7 @@ def test_v2_round_trip_keeps_tracking(tmp_path):
     path = tmp_path / "p.airefsproj"
     save_project(p, str(path))
     data = json.loads(path.read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert "secret" not in path.read_text()
     q = load_project(str(path))
     assert q.doc_id == "d1" and q.record_order == ["u1", "u2"] and q.uncited == ["u3"]

@@ -158,3 +158,29 @@ def test_new_pipeline_settings_round_trip_through_the_tab(tab):
     assert back.parallel_searches == 6
     assert back.verify_citations is False and back.use_full_text is False
     assert back.prefer_reviews is True and back.recency_bias is False
+
+
+# ── the reference-entry format the user picks ────────────────────────
+
+def test_reference_entries_default_to_the_citation_style(tab):
+    assert tab.get_settings().bibliography_format == "style"
+
+
+@pytest.mark.parametrize("value,label", [
+    ("style", "Follow the citation style"),
+    ("style_with_ids", "Follow the style, keep DOI/PMID"),
+    ("nlm", "Classic NLM format (all styles)"),
+])
+def test_the_reference_entry_choice_round_trips(tab, value, label):
+    tab.set_settings(ProjectSettings(bibliography_format=value))
+    assert tab.bibliography_combo.currentText() == label
+    assert tab.get_settings().bibliography_format == value
+
+
+def test_the_reference_entry_choice_survives_a_restart(tab, isolated_settings, qapp):
+    """QSettings stores the choice, not a row number that a later release moves."""
+    tab.set_settings(ProjectSettings(bibliography_format="nlm"))
+    tab.get_settings()                                   # persists on read
+    from src.gui.inputs_tab import InputsTab
+    reopened = InputsTab()
+    assert reopened.get_settings().bibliography_format == "nlm"

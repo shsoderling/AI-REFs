@@ -730,14 +730,19 @@ _CACHE: dict[str, Optional["CslBibliography"]] = {}
 def _style_bibliography(style) -> Optional["CslBibliography"]:
     """The parsed style, or None when it cannot be used (cached either way)."""
     key = getattr(style, "value", str(style))
-    if key not in _CACHE:
-        try:
-            from ..models.project import get_csl_path
-            _CACHE[key] = CslBibliography(str(get_csl_path(style)))
-        except Exception as exc:                             # noqa: BLE001 - never abort a write
-            logger.warning(f"{key}: bibliography rules unavailable ({exc}); using the NLM format")
-            _CACHE[key] = None
-    return _CACHE[key]
+    if key in _CACHE:
+        return _CACHE[key]
+    try:
+        from ..models.project import get_csl_path
+        parsed = CslBibliography(str(get_csl_path(style)))
+    except Exception as exc:                                 # noqa: BLE001 - never abort a write
+        # Not cached: a failure that was transient (a file being replaced, a
+        # locked read) would otherwise turn off style rendering for the rest
+        # of the process, silently changing every later entry.
+        logger.warning(f"{key}: bibliography rules unavailable ({exc}); using the NLM format")
+        return None
+    _CACHE[key] = parsed
+    return parsed
 
 
 def item_for(citation) -> dict:
@@ -752,9 +757,15 @@ def item_for(citation) -> dict:
     types = [t.lower() for t in (getattr(citation, "publication_types", None) or [])]
     doi = (getattr(citation, "doi", "") or "").lower()
     source = (getattr(citation, "source", "") or "").lower()
-    looks_preprint = ("preprint" in types or doi.startswith("10.1101/")
-                      or source in ("biorxiv", "medrxiv"))
-    if looks_preprint and not getattr(citation, "pmid", ""):
+    # 10.1101 is Cold Spring Harbor's prefix, shared by Genome Research, Genes
+    # & Development and the Perspectives: only the dated bioRxiv/medRxiv shape
+    # (10.1101/2024.01.03.574066) marks a preprint. PubMed indexes preprints
+    # too, so its publication type is authoritative even with a PMID.
+    biorxiv_doi = bool(re.match(r"10\.1101/\d{4}\.\d{2}\.\d{2}\.", doi))
+    looks_preprint = ("preprint" in types
+                      or ((biorxiv_doi or source in ("biorxiv", "medrxiv"))
+                          and not getattr(citation, "pmid", "")))
+    if looks_preprint:
         item["type"] = "article"                             # CSL 1.0.2's unpublished type
         item.setdefault("genre", "Preprint")
     return item

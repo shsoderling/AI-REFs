@@ -1,5 +1,7 @@
 """Bibliography entry formatting (pure, GUI-free)."""
 
+import re
+
 from ..models.citation import CitationCandidate
 from ..models.project import CitationStyle, AUTHOR_DATE_STYLES
 from .csl_bibliography import render_entry
@@ -28,10 +30,16 @@ def format_bib_entry(citation: CitationCandidate, number: int, style: CitationSt
 
 
 def _with_identifiers(entry: str, citation: CitationCandidate) -> str:
-    """The entry plus whichever identifiers the style did not print."""
-    if citation.doi and citation.doi.lower() not in entry.lower():
+    """The entry plus whichever identifiers the style did not print.
+
+    "Printed" means in a form the entry reader recognises: several styles give
+    the DOI as a URL, which reads well but is not what a stripped document is
+    parsed back with, so the plain ``doi:`` form is added alongside it.
+    """
+    readable_doi = rf"(?:doi:\s*|https?://(?:dx\.)?doi\.org/){re.escape(citation.doi)}"
+    if citation.doi and not re.search(readable_doi, entry, re.IGNORECASE):
         entry = entry.rstrip() + f" doi:{citation.doi}"
-    if citation.pmid and citation.pmid not in entry:
+    if citation.pmid and not re.search(rf"PMID:\s*{re.escape(citation.pmid)}", entry, re.IGNORECASE):
         entry = entry.rstrip() + f" PMID: {citation.pmid}"
     return entry
 

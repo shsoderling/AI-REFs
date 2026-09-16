@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RenumberPlan:
     """Everything needed to apply (or preview) an insert-mode renumbering."""
+    # One record per paper for the whole document; the tracked path reuses it
+    # so every citation of a paper resolves to the same object.
+    canonicaliser: Optional["RecordCanonicaliser"] = None
     # DOCX marker dicts from DocxHandler.find_markers(), in document order
     markers: list[dict] = field(default_factory=list)
     # Parallel to markers: the reviewed citations resolved for each marker
@@ -68,6 +71,7 @@ def build_renumber_plan(handler, project: ProjectState,
     # One object per paper across the whole document, seeded from the records
     # it already carries, so a paper cited twice keeps one hidden record.
     canon = RecordCanonicaliser(existing)
+    plan.canonicaliser = canon
 
     para_marker_counter: dict[int, int] = defaultdict(int)
     new_marker_infos: list[NewMarkerInfo] = []
