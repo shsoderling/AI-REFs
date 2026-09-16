@@ -19,7 +19,9 @@ from .export_slots import (
     ACTION_CITE, ACTION_LEAVE, MarkerSlot, action_for_unmatched, collect_marker_slots,
     slot_for_docx_marker,
 )
-from .renumbering import NewMarkerInfo, RenumberingResult, compute_renumbering
+from .renumbering import (
+    NewMarkerInfo, RecordCanonicaliser, RenumberingResult, compute_renumbering,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,9 @@ def build_renumber_plan(handler, project: ProjectState,
 
     plan.markers = handler.find_markers(project.export_marker_config)
     slots_by_para = collect_marker_slots(project)
+    # One object per paper across the whole document, seeded from the records
+    # it already carries, so a paper cited twice keeps one hidden record.
+    canon = RecordCanonicaliser(existing)
 
     para_marker_counter: dict[int, int] = defaultdict(int)
     new_marker_infos: list[NewMarkerInfo] = []
@@ -83,7 +88,7 @@ def build_renumber_plan(handler, project: ProjectState,
         else:
             action = slot.action
             sentence = slot.sentence
-            resolved = list(slot.citations) if action == ACTION_CITE else []
+            resolved = canon.canonical_all(slot.citations) if action == ACTION_CITE else []
 
         plan.marker_sentences.append(sentence)
         plan.marker_resolved_map.append(resolved)

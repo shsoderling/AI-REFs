@@ -2,15 +2,43 @@
 
 from ..models.citation import CitationCandidate
 from ..models.project import CitationStyle, AUTHOR_DATE_STYLES
+from .csl_bibliography import render_entry
 
 
-def format_bib_entry(citation: CitationCandidate, number: int,
-                     style: CitationStyle) -> str:
+def format_bib_entry(citation: CitationCandidate, number: int, style: CitationStyle,
+                     bibliography_format: str = "style") -> str:
     """Format a single bibliography entry.
 
-    Uses a generic NLM-like format that works well for most styles.
-    The CSL file determines in-text citation formatting; this function
-    handles the bibliography list.
+    ``style`` (the default) uses the citation style's own CSL
+    ``<bibliography>`` rules, so the reference list matches the journal or
+    funder the user picked; ``style_with_ids`` appends the DOI and PMID when
+    the style leaves them out, so a document that later loses its hidden
+    fields can still be matched back to real records; ``nlm`` keeps the
+    generic entry every style shared before, which is what documents from
+    earlier versions carry.  A style that cannot be rendered falls back to
+    ``nlm`` on its own.
+    """
+    if bibliography_format in ("style", "style_with_ids"):
+        rendered = render_entry(citation, number, style)
+        if rendered:
+            if bibliography_format == "style_with_ids":
+                rendered = _with_identifiers(rendered, citation)
+            return rendered
+    return format_nlm_entry(citation, number, style)
+
+
+def _with_identifiers(entry: str, citation: CitationCandidate) -> str:
+    """The entry plus whichever identifiers the style did not print."""
+    if citation.doi and citation.doi.lower() not in entry.lower():
+        entry = entry.rstrip() + f" doi:{citation.doi}"
+    if citation.pmid and citation.pmid not in entry:
+        entry = entry.rstrip() + f" PMID: {citation.pmid}"
+    return entry
+
+
+def format_nlm_entry(citation: CitationCandidate, number: int,
+                     style: CitationStyle) -> str:
+    """A generic NLM-like entry, whatever the style.
 
     DOI and PMID are always emitted when known: they are what allows a
     re-uploaded document to be parsed back into reliable identities

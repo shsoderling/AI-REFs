@@ -9,8 +9,9 @@ table, and writes the cited document.
 
 The deterministic half is the app's own code, vendored into
 `ai-refs-citations/scripts/airefs/` so the skill has no dependency on this repository:
-marker grammar, document parsing, tracked Word fields, renumbering, CSL styles and the
-DOCX writer. Only `python-docx`, `pydantic` and `requests` are needed at runtime.
+marker grammar, document parsing, tracked Word fields, renumbering, the CSL styles (both
+the in-text form and the reference entries) and the DOCX writer. Only `python-docx`,
+`pydantic` and `requests` are needed at runtime.
 
 ### Regenerating the vendored code
 
@@ -33,7 +34,9 @@ ai-refs-citations/
   references/              marker grammar, search and verification rules,
                            file formats, tracked documents, review table
   scripts/                 check_env, scan_markers, search_library,
-                           resolve_suggestions, fetch_records, write_docx
+                           resolve_suggestions, fetch_records, write_docx,
+                           fill_table_markers
+  tests/                   the style-by-style bibliography expectations
   scripts/airefs/          vendored app code (generated)
   assets/csl/              citation style files (generated)
   evals/evals.json         test prompts and assertions

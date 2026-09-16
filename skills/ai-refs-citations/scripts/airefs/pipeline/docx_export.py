@@ -146,7 +146,8 @@ def _bibliography_sort_key(text: str) -> str:
 
 
 def render_new_bibliography(result: RenumberingResult, style: CitationStyle,
-                            layout: CitationLayout) -> tuple[list[str], list[str]]:
+                            layout: CitationLayout,
+                            bibliography_format: str = "style") -> tuple[list[str], list[str]]:
     """Entries and record uuids (rendered order) for a numbering made of new
     candidates only. Numeric styles list by number; author-date styles list
     alphabetically without numbers."""
@@ -156,7 +157,7 @@ def render_new_bibliography(result: RenumberingResult, style: CitationStyle,
         cand = assignment.candidate
         if cand is None:
             continue
-        rows.append((format_bib_entry(cand, num, style), cand.record_uuid))
+        rows.append((format_bib_entry(cand, num, style, bibliography_format), cand.record_uuid))
     if layout.is_author_date:
         rows.sort(key=lambda row: _bibliography_sort_key(row[0]))
     return [text for text, _ in rows], [rid for _, rid in rows]
@@ -273,7 +274,7 @@ def export_fresh(project: ProjectState, output_path: str) -> ExportStats:
 
     write_new_markers(handler, plan, result, layout, style, embed, stats)
 
-    entries, order = render_new_bibliography(result, style, layout)
+    entries, order = render_new_bibliography(result, style, layout, settings.bibliography_format)
     if entries:
         project.doc_id = project.doc_id or str(uuid.uuid4())
         if embed:
@@ -342,7 +343,8 @@ def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
     write_new_markers(handler, plan, result, layout, style, True, stats)
 
     # 3. bibliography, replaced in place (or regenerated when its field is gone)
-    entries, order, uncited, hashes = render_tracked_bibliography(existing, result, style, layout)
+    entries, order, uncited, hashes = render_tracked_bibliography(
+        existing, result, style, layout, bibliography_format=settings.bibliography_format)
     project.doc_id = project.doc_id or existing.tracking.doc_id or str(uuid.uuid4())
     bibl_field = next((f for f in handler.fields.fields
                        if f.kind == 'airefs_bibl' and f.depth == 0 and not f.deleted), None)
@@ -411,14 +413,15 @@ def looks_stripped(existing: Optional[ExistingCitationMap], path: str,
 # ── legacy (plain-text) export ────────────────────────────────────────
 
 def merged_numeric_bibliography(existing: ExistingCitationMap, result: RenumberingResult,
-                                style: CitationStyle) -> list[str]:
+                                style: CitationStyle,
+                                bibliography_format: str = "style") -> list[str]:
     """Plain-text merged bibliography: new entries formatted, existing ones
     re-used verbatim with their new number."""
     entries = []
     for num in sorted(result.assignments):
         assignment = result.assignments[num]
         if assignment.is_new and assignment.candidate:
-            entries.append(format_bib_entry(assignment.candidate, num, style))
+            entries.append(format_bib_entry(assignment.candidate, num, style, bibliography_format))
             continue
         old_entry = existing.bib_entries.get(assignment.original_number)
         if old_entry:
@@ -583,6 +586,11 @@ def export_legacy(project: ProjectState, output_path: str,
     # All or nothing: a document is tracked only if every citation site can be
     adopt = settings.embed_citation_fields and not is_author_date and stats_unadoptable == 0
 
+    if adopt:
+        # Give the existing entries their record ids first: the plan groups
+        # candidates by paper, and a new citation of a paper already in the
+        # list must join that record rather than mint a second one.
+        _identify_existing_entries(existing)
     plan = build_renumber_plan(handler, project)
     result = plan.renumber_result
     renumber_map = result.renumber_map
@@ -620,7 +628,8 @@ def export_legacy(project: ProjectState, output_path: str,
             if entry is not None:
                 entry.is_uncited = True
         entries, order, uncited, hashes = render_tracked_bibliography(
-            existing, result, style, layout, verbatim_existing=True)
+            existing, result, style, layout, verbatim_existing=True,
+            bibliography_format=settings.bibliography_format)
         project.doc_id = project.doc_id or str(uuid.uuid4())
         if entries:
             code = build_bibl_code(doc_id=project.doc_id, style=style.value, render=layout.render_kind,
@@ -638,7 +647,8 @@ def export_legacy(project: ProjectState, output_path: str,
         if is_author_date:
             entries = build_author_date_bibliography(existing, result, style)
         else:
-            entries = merged_numeric_bibliography(existing, result, style)
+            entries = merged_numeric_bibliography(existing, result, style,
+                                                  settings.bibliography_format)
         if entries:
             handler.append_bibliography(entries)
 

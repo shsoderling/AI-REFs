@@ -35,6 +35,19 @@ from .widgets.chat_panel import ChatPanel
 logger = logging.getLogger(__name__)
 
 
+def _came_from_a_document(citation) -> bool:
+    """True when this record was read back out of a document.
+
+    Such a record is thinner than a fresh search result (no abstract, no MeSH
+    terms), so the library merges it rather than overwriting the row.  The
+    record uuid used to be the only signal; since candidates for one paper are
+    now shared across its citations, a copy can reach here without one, so the
+    record's own origin is checked too.
+    """
+    return bool(getattr(citation, "record_uuid", "")) or \
+        (getattr(citation, "source", "") or "").lower() in ("embedded", "document")
+
+
 def _follow_wrapped_height(widget: QWidget):
     """Keep a widget's minimum height equal to what its word-wrapped content
     needs at the current width.
@@ -703,7 +716,7 @@ class ReviewTab(QWidget):
                 continue
             ins, upd = self._ref_library.upsert_candidate(
                 citation, source=f"accepted_{source}",
-                merge=bool(citation.record_uuid),   # read back from a document: never degrade a row
+                merge=_came_from_a_document(citation),   # never degrade a library row
             )
             if ins:
                 imported += 1
@@ -982,7 +995,7 @@ class ReviewTab(QWidget):
             ins, upd = self._ref_library.upsert_candidate(
                 enriched,
                 source=f"manual_add_{source}",
-                merge=bool(citation.record_uuid),
+                merge=_came_from_a_document(citation),
             )
             if ins:
                 imported += 1

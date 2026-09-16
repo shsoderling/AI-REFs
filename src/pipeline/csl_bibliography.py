@@ -1,11 +1,11 @@
-"""Render bibliography entries with the citation style's own CSL rules.
+"""Bibliography entries rendered with the citation style's own CSL rules.
 
-The AI REFs app formats every reference entry the same NLM-like way whatever
-style is selected; only the in-text citation follows the CSL file.  This
-module renders the CSL file's ``<bibliography>`` element instead, so an APA
-document gets APA entries and a Nature document gets Nature entries, and
-installs itself over the vendored formatter (``install``) so the app's own
-writer picks it up.
+The selected style decides both halves of a citation: ``citation_render``
+reads the CSL ``<citation>`` element for the in-text form, and this module
+reads ``<bibliography>`` for the reference entry, so an APA document gets APA
+entries and a Nature document gets Nature entries.  ``bib_format`` calls
+:func:`render_entry` and falls back to its own NLM-like template when a style
+cannot be rendered.
 
 It implements the part of CSL 1.0.2 that journal-article styles use: macros,
 ``choose``/``if``/``else-if``/``else``, ``group`` (with the implicit
@@ -18,10 +18,13 @@ rather than producing a half-built entry.
 
 from __future__ import annotations
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 NS = "{http://purl.org/net/xbiblio/csl}"
 
@@ -719,106 +722,62 @@ class CslBibliography:
         return bool(value)
 
 
-# ── drop-in for the app's formatter ──────────────────────────────────
+# ── entry point used by bib_format ───────────────────────────────────
 
-_CACHE: dict[str, CslBibliography] = {}
-_APPEND_IDS = False
-_ORIGINAL = None                      # the app's NLM formatter, kept for uninstall()
+_CACHE: dict[str, Optional["CslBibliography"]] = {}
 
 
-def _load_original():
-    """The app's NLM formatter, imported lazily so patching cannot recurse."""
-    global _ORIGINAL
-    if _ORIGINAL is None:
-        from airefs.pipeline import bib_format
-        _ORIGINAL = bib_format.format_bib_entry
-    return _ORIGINAL
-
-
-def _style_bibliography(style) -> Optional[CslBibliography]:
-    from airefs.models.project import get_csl_path
+def _style_bibliography(style) -> Optional["CslBibliography"]:
+    """The parsed style, or None when it cannot be used (cached either way)."""
     key = getattr(style, "value", str(style))
     if key not in _CACHE:
         try:
+            from ..models.project import get_csl_path
             _CACHE[key] = CslBibliography(str(get_csl_path(style)))
-        except Exception:                                # noqa: BLE001 - never abort a write
-            return None
+        except Exception as exc:                             # noqa: BLE001 - never abort a write
+            logger.warning(f"{key}: bibliography rules unavailable ({exc}); using the NLM format")
+            _CACHE[key] = None
     return _CACHE[key]
 
 
-def _item_for(citation) -> dict:
+def item_for(citation) -> dict:
     """The CSL item for *citation*, with preprints typed as such.
 
-    The app types every record ``article-journal``; several styles keep a
-    branch for unpublished work ("Preprint", "ahead of print") that only fires
-    on another type, and a bioRxiv record is not a journal article.
+    Records are otherwise all ``article-journal``; several styles keep a
+    branch for unpublished work ("Preprint", "ahead of print") that only
+    fires on another type, and a bioRxiv record is not a journal article.
     """
-    from airefs.pipeline.csl_mapping import to_csl_item
+    from .csl_mapping import to_csl_item
     item = to_csl_item(citation)
     types = [t.lower() for t in (getattr(citation, "publication_types", None) or [])]
     doi = (getattr(citation, "doi", "") or "").lower()
     source = (getattr(citation, "source", "") or "").lower()
     looks_preprint = ("preprint" in types or doi.startswith("10.1101/")
                       or source in ("biorxiv", "medrxiv"))
-    if looks_preprint and not citation.pmid:
-        item["type"] = "article"                      # CSL 1.0.2's unpublished type
+    if looks_preprint and not getattr(citation, "pmid", ""):
+        item["type"] = "article"                             # CSL 1.0.2's unpublished type
         item.setdefault("genre", "Preprint")
     return item
 
 
-def format_bib_entry(citation, number: int, style) -> str:
-    """Drop-in replacement for ``airefs.pipeline.bib_format.format_bib_entry``."""
-    from airefs.models.project import AUTHOR_DATE_STYLES
-    nlm_entry = _ORIGINAL or _load_original()
+def render_entry(citation, number: int, style) -> Optional[str]:
+    """One bibliography entry in *style*, or None to fall back to the NLM format.
 
-    try:
-        bib = _style_bibliography(style)
-    except Exception:                                    # noqa: BLE001
-        bib = None
-    if bib is None:
-        return nlm_entry(citation, number, style)
-    try:
-        text = bib.render(_item_for(citation), number)
-    except Exception:                                            # noqa: BLE001
-        return nlm_entry(citation, number, style)
-    if not text or sum(c.isalnum() for c in text) < 6:           # nothing usable came out
-        return nlm_entry(citation, number, style)
-
-    numeric = style not in AUTHOR_DATE_STYLES
-    # Styles render citation-number themselves, in their own shape: "3.", "[3]",
-    # "(3)". Only prepend when the style produced no number at all, or ACS
-    # entries come out as "3. (3) Smith, J.".
-    if numeric and not re.match(rf"^[\[(]?{number}[\])]?[.,:)\s]", text):
-        text = f"{number}. {text}"
-    if _APPEND_IDS:
-        if citation.doi and citation.doi.lower() not in text.lower():
-            text += f" doi:{citation.doi}"
-        if citation.pmid and citation.pmid not in text:
-            text += f" PMID: {citation.pmid}"
-    return text
-
-
-def install(append_identifiers: bool = False) -> None:
-    """Make the app's writer use the style's own bibliography rules.
-
-    ``docx_export`` and ``tracked_renumber`` bind ``format_bib_entry`` at
-    import time, so the name is replaced in each module that holds it.
+    *number* is the entry's number; numeric styles render it themselves (in
+    their own shape: "3.", "[3]", "(3)"), and it is prepended only when the
+    style produced none.
     """
-    global _APPEND_IDS, _ORIGINAL
-    _APPEND_IDS = append_identifiers
-    from airefs.pipeline import author_date_convert, bib_format, docx_export, tracked_renumber
-    if _ORIGINAL is None:
-        _ORIGINAL = bib_format.format_bib_entry
-    for module in (bib_format, docx_export, tracked_renumber, author_date_convert):
-        if hasattr(module, "format_bib_entry"):
-            module.format_bib_entry = format_bib_entry
-
-
-def uninstall() -> None:
-    """Restore the app's NLM formatter (used by the tests)."""
-    if _ORIGINAL is None:
-        return
-    from airefs.pipeline import author_date_convert, bib_format, docx_export, tracked_renumber
-    for module in (bib_format, docx_export, tracked_renumber, author_date_convert):
-        if hasattr(module, "format_bib_entry"):
-            module.format_bib_entry = _ORIGINAL
+    from ..models.project import AUTHOR_DATE_STYLES
+    bib = _style_bibliography(style)
+    if bib is None:
+        return None
+    try:
+        text = bib.render(item_for(citation), number)
+    except Exception:                                        # noqa: BLE001 - never abort a write
+        logger.exception("bibliography rendering failed; using the NLM format")
+        return None
+    if not text or sum(c.isalnum() for c in text) < 6:       # nothing usable came out
+        return None
+    if style not in AUTHOR_DATE_STYLES and not re.match(rf"^[\[(]?{number}[\])]?[.,:)\s]", text):
+        text = f"{number}. {text}"
+    return text

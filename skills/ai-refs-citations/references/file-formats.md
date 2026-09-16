@@ -150,8 +150,9 @@ Chicago, eLife) write `(Smith et al., 2020)` and an alphabetical list; the other
 numbers in order of first appearance.
 
 Both the in-text citation and the reference entry follow the style's CSL file
-(`scripts/csl_bibliography.py` renders the bibliography; `--bibliography nlm` restores the
-app's single NLM-like format). What that means per style, for one paper:
+(`--bibliography nlm` restores the single NLM-like format older exports carry, and
+`--append-ids` keeps the DOI and PMID on entries whose style drops them). What that means
+per style, for one paper:
 
 | Style | Entry |
 |---|---|

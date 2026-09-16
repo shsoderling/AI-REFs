@@ -443,6 +443,25 @@ class InputsTab(QWidget):
         self.style_combo.setCurrentIndex(0)  # NIH Grant is default
         form.addRow("Citation Style:", self.style_combo)
 
+        # How the reference entries themselves are formatted.  The style's own
+        # rules are the point of choosing a style; the other two exist for
+        # documents that have to stay identifiable or match an older export.
+        self._bibliography_options = [
+            ("Follow the citation style", "style"),
+            ("Follow the style, keep DOI/PMID", "style_with_ids"),
+            ("Classic NLM format (all styles)", "nlm"),
+        ]
+        self.bibliography_combo = QComboBox()
+        for label, _ in self._bibliography_options:
+            self.bibliography_combo.addItem(label)
+        self.bibliography_combo.setCurrentIndex(0)
+        self.bibliography_combo.setToolTip(
+            "Reference entries follow the chosen style's own rules. Keep DOI/PMID if the "
+            "document may later be saved through Google Docs or Pages, which strips the "
+            "hidden citation data. Classic NLM matches documents exported by earlier "
+            "versions of AI REFs.")
+        form.addRow("Reference entries:", self.bibliography_combo)
+
         # Max refs for (REFS)
         self.max_refs_spin = QSpinBox()
         self.max_refs_spin.setRange(2, 10)
@@ -681,8 +700,12 @@ class InputsTab(QWidget):
         self._save_settings()
         idx = self.style_combo.currentIndex()
         selected_style = self._style_options[idx][1] if 0 <= idx < len(self._style_options) else CitationStyle.NIH_GRANT
+        bib_idx = self.bibliography_combo.currentIndex()
+        bibliography_format = (self._bibliography_options[bib_idx][1]
+                               if 0 <= bib_idx < len(self._bibliography_options) else "style")
         return ProjectSettings(
             citation_style=selected_style,
+            bibliography_format=bibliography_format,
             max_refs_for_refs=self.max_refs_spin.value(),
             detect_suggested_ids=self.suggested_ids_check.isChecked(),
             detect_author_year=self.author_year_check.isChecked(),
@@ -711,6 +734,10 @@ class InputsTab(QWidget):
                 style_index = i
                 break
         self.style_combo.setCurrentIndex(style_index)
+        for i, (_, value) in enumerate(self._bibliography_options):
+            if value == settings.bibliography_format:
+                self.bibliography_combo.setCurrentIndex(i)
+                break
 
         self.max_refs_spin.setValue(settings.max_refs_for_refs)
         self.set_detection_flags(settings.detect_suggested_ids, settings.detect_author_year)
@@ -952,6 +979,9 @@ class InputsTab(QWidget):
         style_idx = s.value("citation_style_index", None)
         if style_idx is not None:
             self.style_combo.setCurrentIndex(int(style_idx))
+        bib_idx = s.value("bibliography_format_index", None)
+        if bib_idx is not None:
+            self.bibliography_combo.setCurrentIndex(int(bib_idx))
         parallel = s.value("parallel_searches", None)
         if parallel is not None:
             try:
@@ -972,6 +1002,7 @@ class InputsTab(QWidget):
         s.setValue("claude_model_id", self.current_model_id())
         s.remove("claude_model_index")
         s.setValue("citation_style_index", self.style_combo.currentIndex())
+        s.setValue("bibliography_format_index", self.bibliography_combo.currentIndex())
         s.setValue("parallel_searches", self.parallel_spin.value())
         s.setValue("detect_suggested_ids", self.suggested_ids_check.isChecked())
         s.setValue("detect_author_year", self.author_year_check.isChecked())

@@ -1,7 +1,10 @@
-"""The skill's CSL bibliography renderer.
+"""The bibliography renderer as the skill uses it.
+
+The renderer itself lives in the app (``airefs.pipeline.csl_bibliography``,
+vendored from ``src/``); these tests pin the behaviour the skill depends on,
+style by style, and run against the vendored copy.
 
 Run from the repository root: ``python3 -m pytest skills/ai-refs-citations/tests -q``
-(the app's own suite is unaffected; nothing here imports ``src``).
 """
 
 import sys
@@ -14,7 +17,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402,F401  (puts the vendored airefs package on the path)
-import csl_bibliography as cb  # noqa: E402
+
+from airefs.pipeline import csl_bibliography as cb  # noqa: E402
+from airefs.pipeline.bib_format import format_bib_entry, format_nlm_entry  # noqa: E402
 
 from airefs.models.citation import Author, CitationCandidate  # noqa: E402
 from airefs.models.project import AUTHOR_DATE_STYLES, CitationStyle, get_csl_path  # noqa: E402
@@ -58,7 +63,11 @@ INITIALS_ONLY = CitationCandidate(
 
 def render(candidate, style, number=3):
     bib = cb.CslBibliography(str(get_csl_path(style)))
-    return bib.render(to_csl_item(candidate), number)
+    return bib.render(cb.item_for(candidate), number)
+
+
+def entry(candidate, number, style, bibliography_format="style"):
+    return format_bib_entry(candidate, number, style, bibliography_format)
 
 
 # ── every bundled style ──────────────────────────────────────────────
@@ -146,13 +155,13 @@ def test_a_record_with_no_year_says_so_in_author_date_styles():
     undated = CitationCandidate(
         title="Undated work", authors=[_author("Ray", "Sam", "S")],
         doi="10.1101/x", journal="bioRxiv", journal_abbrev="bioRxiv", source="biorxiv")
-    assert "n.d." in cb.format_bib_entry(undated, 1, CitationStyle.APA)
-    assert "n.d." in cb.format_bib_entry(undated, 1, CitationStyle.CHICAGO_AUTHOR_DATE)
+    assert "n.d." in entry(undated, 1, CitationStyle.APA)
+    assert "n.d." in entry(undated, 1, CitationStyle.CHICAGO_AUTHOR_DATE)
 
 
 def test_the_number_is_not_doubled_when_the_style_renders_it_itself():
     for style in (CitationStyle.ACS, CitationStyle.IEEE, CitationStyle.VANCOUVER):
-        text = cb.format_bib_entry(ARTICLE, 3, style)
+        text = entry(ARTICLE, 3, style)
         assert text.count("3") >= 1
         assert not text.startswith("3. (3)") and not text.startswith("3. [3]")
 
@@ -177,7 +186,7 @@ def test_a_doi_containing_repeated_punctuation_survives_the_tidy_up():
 
 
 def test_a_preprint_is_typed_so_styles_can_label_it():
-    text = cb.format_bib_entry(PREPRINT, 1, CitationStyle.APA)
+    text = entry(PREPRINT, 1, CitationStyle.APA)
     assert "Preprint" in text
 
 
@@ -201,29 +210,21 @@ def test_a_style_that_uses_page_first_gets_it():
 
 # ── installation over the app's formatter ────────────────────────────
 
-def test_install_replaces_the_formatter_everywhere_it_is_bound():
-    from airefs.pipeline import bib_format, docx_export, tracked_renumber
-    original = bib_format.format_bib_entry
-    try:
-        cb.install()
-        assert docx_export.format_bib_entry is cb.format_bib_entry
-        assert tracked_renumber.format_bib_entry is cb.format_bib_entry
-        entry = docx_export.format_bib_entry(ARTICLE, 2, CitationStyle.APA)
-        assert entry.startswith("Udakis, M.")
-    finally:
-        cb.uninstall()
-    assert bib_format.format_bib_entry is original
-    assert docx_export.format_bib_entry is original
+def test_the_style_entry_is_what_the_writer_uses_by_default():
+    assert entry(ARTICLE, 2, CitationStyle.APA).startswith("Udakis, M.")
+    assert entry(ARTICLE, 2, CitationStyle.NIH_GRANT).startswith("2. Udakis M")
 
 
-def test_append_ids_adds_identifiers_a_style_omits():
-    try:
-        cb.install(append_identifiers=True)
-        entry = cb.format_bib_entry(ARTICLE, 1, CitationStyle.VANCOUVER)
-        assert "PMID: 32879322" in entry
-        assert "doi:10.1038/s41467-020-18074-8" in entry
-    finally:
-        cb.uninstall()
+def test_the_nlm_mode_restores_one_format_for_every_style():
+    plain = entry(ARTICLE, 1, CitationStyle.APA, "nlm")
+    assert plain == format_nlm_entry(ARTICLE, 1, CitationStyle.APA)
+    assert "doi:10.1038/s41467-020-18074-8" in plain and "PMID: 32879322" in plain
+
+
+def test_style_with_ids_adds_identifiers_a_style_omits():
+    text = entry(ARTICLE, 1, CitationStyle.VANCOUVER, "style_with_ids")
+    assert "PMID: 32879322" in text
+    assert "doi:10.1038/s41467-020-18074-8" in text
 
 
 def test_a_broken_style_file_falls_back_to_the_app_format(monkeypatch, tmp_path):
@@ -232,14 +233,13 @@ def test_a_broken_style_file_falls_back_to_the_app_format(monkeypatch, tmp_path)
     broken.write_text("<style><not-csl></style>", encoding="utf-8")
     monkeypatch.setattr(cb, "_CACHE", {})
     monkeypatch.setattr("airefs.models.project.get_csl_path", lambda style: broken)
-    entry = cb.format_bib_entry(ARTICLE, 5, CitationStyle.VANCOUVER)
-    assert entry.startswith("5. Udakis")
-    assert "Nat Commun" in entry
+    assert cb.render_entry(ARTICLE, 5, CitationStyle.VANCOUVER) is None
+    text = entry(ARTICLE, 5, CitationStyle.VANCOUVER)
+    assert text.startswith("5. Udakis") and "Nat Commun" in text
     monkeypatch.setattr(cb, "_CACHE", {})
 
 
 def test_rendering_never_raises_for_a_record_stripped_to_its_title():
     bare = CitationCandidate(title="A title and nothing else")
     for style in CitationStyle:
-        text = cb.format_bib_entry(bare, 1, style)   # falls back when too thin
-        assert text
+        assert entry(bare, 1, style)                # falls back when too thin

@@ -167,8 +167,10 @@ class TestAuthorDateBibliography:
         ])
         bib = build_author_date_bibliography(existing, result, CitationStyle.APA)
         assert len(bib) == 3
+        # New entries follow the chosen style (APA inverts and parenthesises
+        # the year); existing entries keep their own wording.
         assert bib[0].startswith("Alpha A.")
-        assert bib[1].startswith("Mmm M.")
+        assert bib[1].startswith("Mmm, M. (2021).")
         assert bib[2].startswith("Zeta Z.")
         # Unnumbered
         assert not any(b[0].isdigit() for b in bib)

@@ -93,8 +93,20 @@ def test_fresh_export_reparses_with_legacy_parser(tmp_path):
     h = DocxHandler(str(out))
     m = ExistingCitationParser(h)._legacy_map()
     assert sorted(m.bib_entries) == [1, 2, 3]
-    assert m.bib_entries[1].pmid == "30000001" and m.bib_entries[3].doi == "10.1234/test.3"
+    assert m.bib_entries[1].pmid == "30000001"              # NIH grant prints the PMID
     assert m.references_heading_para_idx == 3 and m.bibliography_span == (4, 6)
+
+
+def test_style_with_ids_keeps_a_stripped_document_identifiable(tmp_path):
+    """Identity lives in the hidden fields; this is the belt for documents
+    that lose them (a Google Docs or Pages round trip)."""
+    project = make_project(tmp_path, BODY)
+    project.settings.bibliography_format = "style_with_ids"
+    out = tmp_path / "out.docx"
+    export_fresh(project, str(out))
+    m = ExistingCitationParser(DocxHandler(str(out)))._legacy_map()
+    assert m.bib_entries[1].pmid == "30000001"
+    assert m.bib_entries[3].doi == "10.1234/test.3"
 
 
 def test_record_uuids_are_minted_once_and_shared(tmp_path):
@@ -144,8 +156,28 @@ def test_per_marker_sentences_get_one_field_each(tmp_path):
     assert [p.numbers for p in payloads] == [[1], [2]]     # per-marker search keeps one item each
 
 
-def test_format_bib_entry_always_includes_identifiers():
+def test_entries_follow_the_style_that_was_chosen():
+    """The reference list matches the style, not one house format."""
+    c = make_citation(1)
+    nature = format_bib_entry(c, 1, CitationStyle.NATURE)
+    apa = format_bib_entry(c, 1, CitationStyle.APA)
+    assert nature.startswith("1. Author1, A.") and nature.rstrip().endswith("(2019).")
+    assert apa.startswith("Author1, A. (2019).")           # author-date: no number
+    assert format_bib_entry(c, 1, CitationStyle.IEEE).startswith("[1] A. Author1,")
+
+
+def test_the_nlm_format_still_carries_both_identifiers():
+    """Documents from earlier versions, and anyone who asks for that format."""
     c = make_citation(1)
     for style in (CitationStyle.NIH_GRANT, CitationStyle.NATURE, CitationStyle.SCIENCE):
-        entry = format_bib_entry(c, 1, style)
+        entry = format_bib_entry(c, 1, style, bibliography_format="nlm")
         assert f"doi:{c.doi}" in entry and f"PMID: {c.pmid}" in entry
+
+
+def test_style_with_ids_appends_only_what_the_style_omits():
+    c = make_citation(1)
+    entry = format_bib_entry(c, 1, CitationStyle.NATURE, bibliography_format="style_with_ids")
+    assert f"doi:{c.doi}" in entry and f"PMID: {c.pmid}" in entry
+    assert entry.count(c.pmid) == 1
+    apa = format_bib_entry(c, 1, CitationStyle.APA, bibliography_format="style_with_ids")
+    assert apa.count(c.doi) == 1                            # APA prints the DOI itself

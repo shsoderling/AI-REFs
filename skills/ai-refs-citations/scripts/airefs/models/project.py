@@ -2,7 +2,7 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, Field
 
 from .sentence import SentenceRecord
@@ -177,6 +177,15 @@ class ProjectSettings(BaseModel):
     keep_uncited_entries: bool = Field(
         default=False,
         description="Keep bibliography entries whose citations were all deleted",
+    )
+    bibliography_format: Literal["style", "style_with_ids", "nlm"] = Field(
+        default="style",
+        description="How reference entries are formatted. 'style': the citation style's "
+                    "own CSL rules, so APA entries look like APA and Nature like Nature. "
+                    "'style_with_ids': the same, with the DOI and PMID appended when the "
+                    "style omits them, which keeps a document identifiable if it later "
+                    "loses its hidden fields. 'nlm': the single NLM-like entry every "
+                    "style used before, which documents from earlier versions carry",
     )
 
     # Export safety

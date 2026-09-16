@@ -147,10 +147,34 @@ with `[?]`), and a confirmed one becomes a tracked citation field like any other
 
 ## Citation Styles
 
-- **Numbered** (Vancouver): [1], [2], ...
-- **Author-Year** (APA-like): (Smith et al., 2023)
-- **Nature**: superscript numbers
-- **PMID only**: (PMID: 12345678)
+Nineteen styles ship with the app, each as its own CSL file: NIH grant (the default),
+NSF grant, Vancouver, AMA, NLM, APA, CSE (author-date and citation-sequence), Nature,
+Science, PLOS One, Cell, eLife, PNAS, ACS, IEEE, APS, Elsevier Harvard and Chicago
+author-date.
+
+The style decides both halves of a citation. In the text it gives superscript numbers
+(NIH grant, Nature, Cell), bracketed numbers (Vancouver, IEEE, PLOS) or author-date
+`(Smith et al., 2023)` with an alphabetical list (APA, CSE author-date, Elsevier Harvard,
+Chicago, eLife). In the reference list it gives that style's own entry layout:
+
+```
+NIH grant   1. Udakis M, Pedrosa V, Mellor JR. Title. Nat Commun. 2020;11(1):4395. PMCID: PMC7467931
+Nature      1. Udakis, M., Pedrosa, V. & Mellor, J. R. Title. Nat Commun 11, 4395 (2020).
+APA         Udakis, M., Pedrosa, V., & Mellor, J. R. (2020). Title. Nature Communications, 11(1), 4395.
+IEEE        [1] M. Udakis, V. Pedrosa, and J. R. Mellor, "Title", Nat Commun, vol. 11, no. 1, p. 4395, 2020.
+```
+
+Each style's own author cap applies (Nature shows one author then et al., Vancouver six,
+AMA three, APA the first nineteen then an ellipsis and the last), page ranges take the
+style's abbreviation, and a preprint is labelled by the styles that say so. Entries are
+plain Word runs, so a style that italicises journal names renders them upright.
+
+**Reference entries** (Input tab) offers two alternatives to that default: *keep DOI/PMID*
+appends the identifiers a style omits, which is worth choosing when the document may later
+be saved through Google Docs or Pages (that strips the hidden citation data, and the
+identifiers are then the only way back to the records); *Classic NLM format* writes the
+single entry shape every style shared before this existed, which is what documents from
+earlier versions carry.
 
 ## Project Structure
 

@@ -23,7 +23,7 @@ from .citation_payload import (
 from .citation_render import CitationLayout, render_cluster
 from .csl_mapping import from_csl_item
 from .export_stats import ExportStats
-from .renumbering import RenumberingResult
+from .renumbering import RecordCanonicaliser, RenumberingResult
 
 logger = logging.getLogger(__name__)
 
@@ -97,15 +97,18 @@ def candidates_for(items: list[CiteItem], existing: ExistingCitationMap) -> list
     """The candidates behind a cluster's items: the map's record when the
     reader has it, else the item data embedded in the field."""
     by_uuid = {e.record_uuid: e for e in existing.bib_entries.values() if e.record_uuid}
+    canon = RecordCanonicaliser(existing)
     out = []
     for item in items:
         entry = by_uuid.get(item.record_uuid)
         if entry is not None and entry.matched_candidate is not None:
-            out.append(entry.matched_candidate)
+            cand = entry.matched_candidate
         else:
             cand = from_csl_item(item.item)
             cand.record_uuid = item.record_uuid
-            out.append(cand)
+        # A document written before records were shared can hold two ids for
+        # one paper; both resolve to the same object from here on.
+        out.append(canon.canonical(cand))
     return out
 
 
@@ -169,7 +172,8 @@ def blocked_table_fields(table_fields, existing: ExistingCitationMap, result: Re
 
 def render_tracked_bibliography(existing: ExistingCitationMap, result: RenumberingResult,
                                 style: CitationStyle, layout: CitationLayout,
-                                verbatim_existing: bool = False):
+                                verbatim_existing: bool = False,
+                                bibliography_format: str = "style"):
     """Entries, record uuids (rendered order), kept-uncited uuids and hashes.
 
     Existing entries are re-rendered from their record unless they were
@@ -183,7 +187,8 @@ def render_tracked_bibliography(existing: ExistingCitationMap, result: Renumberi
             cand = a.candidate
             if cand is None:
                 continue
-            rows.append((format_bib_entry(cand, num, style), cand.record_uuid, False))
+            rows.append((format_bib_entry(cand, num, style, bibliography_format),
+                         cand.record_uuid, False))
             continue
         entry: Optional[ExistingBibEntry] = existing.bib_entries.get(a.original_number)
         if entry is None:
@@ -198,7 +203,7 @@ def render_tracked_bibliography(existing: ExistingCitationMap, result: Renumberi
             body = entry.body or entry.raw_text or adopted_text
             text = body if layout.is_author_date else f"{num}. {body}"
         else:
-            text = format_bib_entry(cand, num, style)
+            text = format_bib_entry(cand, num, style, bibliography_format)
         rows.append((text, entry.record_uuid, entry.is_uncited))
     if layout.is_author_date:
         rows.sort(key=lambda row: re.sub(r"[^a-z0-9 ]+", "", row[0].lower())[:80])

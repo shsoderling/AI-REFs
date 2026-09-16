@@ -8,9 +8,9 @@ description: "Find, verify and insert literature citations into a Word (.docx) m
 You are the citation agent the AI REFs app runs in software: read the document, find
 what each marker needs, search the literature, verify every paper against its claim,
 let the user review, then write the document. The deterministic parts (marker
-grammar, DOCX surgery, tracked Word fields, renumbering of pre-cited documents) are the
-app's own code, bundled in `scripts/`, with the skill's own renderer for the 19 citation
-styles on top. You supply the judgement the app asks its Claude agent and its independent
+grammar, DOCX surgery, tracked Word fields, renumbering of pre-cited documents, and the
+reference entries themselves in 19 citation styles) are the app's own code, bundled in
+`scripts/`. You supply the judgement the app asks its Claude agent and its independent
 verifier for: search, choose, quote, score.
 
 Read `references/search-and-verify.md` before the first search of a session. It carries
@@ -115,8 +115,8 @@ the author's call.
 Ask your two setup questions now, in one message, because both change the work that
 follows and neither is worth discovering at the end:
 
-1. **Which citation style?** The default is NIH grant (superscript numbers, NLM-style
-   entries). The nineteen style ids are in `references/file-formats.md`; name a few that
+1. **Which citation style?** The default is NIH grant (superscript numbers, NLM entries
+   with the PMCID). The nineteen style ids are in `references/file-formats.md`; name a few that
    fit what the user is writing (a grant, a Nature paper, an APA manuscript) rather than
    listing all of them. The style decides both the in-text form and the reference entry
    layout, so changing it later means rewriting the document.

@@ -19,7 +19,6 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import csl_bibliography  # noqa: E402
 from common import die, index_records, load_json, lookup_record, record_keys  # noqa: E402
 
 from airefs.models.embedded import DocumentTier
@@ -100,7 +99,8 @@ def suggestion_mismatches(plan: dict, project: ProjectState) -> list[str]:
 
 def build_project(plan: dict, decisions: dict, records, style: CitationStyle, embed: bool,
                   keep_uncited: bool, allow_tracked_changes: bool,
-                  min_match_ratio: Optional[float] = None) -> tuple[ProjectState, str, dict]:
+                  min_match_ratio: Optional[float] = None,
+                  bibliography_format: str = "style") -> tuple[ProjectState, str, dict]:
     docx = plan["docx"]
     if not Path(docx).exists():
         die(f"the document in plan.json no longer exists: {docx}")
@@ -109,6 +109,7 @@ def build_project(plan: dict, decisions: dict, records, style: CitationStyle, em
     project.settings.embed_citation_fields = embed
     project.settings.keep_uncited_entries = keep_uncited
     project.settings.allow_export_with_tracked_changes = allow_tracked_changes
+    project.settings.bibliography_format = bibliography_format
     if min_match_ratio is not None:
         project.settings.min_match_ratio = min_match_ratio
 
@@ -284,7 +285,8 @@ def main() -> None:
                          "(for a deliberate preprint-to-journal swap)")
     ap.add_argument("--bibliography", choices=["style", "nlm"], default="style",
                     help="'style' (default): reference entries follow the citation style's own "
-                         "CSL rules. 'nlm': the app's single NLM-like format for every style.")
+                         "CSL rules. 'nlm': the single NLM-like format every style shared "
+                         "before, which documents from earlier app versions carry.")
     ap.add_argument("--append-ids", action="store_true",
                     help="append the DOI and PMID to entries whose style omits them (helps a "
                          "document that later loses its hidden fields be re-matched)")
@@ -307,14 +309,13 @@ def main() -> None:
     if out.resolve() == Path(plan["docx"]).resolve():
         die("refusing to overwrite the input document; choose another --out")
 
-    if args.bibliography == "style":
-        csl_bibliography.install(append_identifiers=args.append_ids)
-
+    bibliography_format = ("nlm" if args.bibliography == "nlm"
+                           else "style_with_ids" if args.append_ids else "style")
     records = index_records(args.records)
     project, mode, justification = build_project(
         plan, decisions, records, style, embed=not args.no_fields,
         keep_uncited=args.keep_uncited, allow_tracked_changes=args.allow_tracked_changes,
-        min_match_ratio=args.min_match_ratio)
+        min_match_ratio=args.min_match_ratio, bibliography_format=bibliography_format)
 
     # A tracked document is always rewritten with fields; saying otherwise would
     # hand the user a tracked file while telling them it is plain text.
@@ -372,7 +373,7 @@ def main() -> None:
         "mode": mode,
         "style": style.value,
         "tracked_fields": stats.fields_written > 0,
-        "bibliography": args.bibliography,
+        "bibliography": bibliography_format,
         "retracted_cited": retracted if args.allow_retracted else [],
         "summary": stats.summary_lines(),
         "unresolved_sentences": stats.unresolved_sentence_ids,

@@ -81,6 +81,77 @@ class CitationKeyIndex:
         return key or f"existing_{entry.original_number}"
 
 
+class RecordCanonicaliser:
+    """One candidate object per paper, shared by every citation of it.
+
+    A record id is minted per :class:`CitationCandidate` *object*
+    (``ensure_record_uuid``), while numbering merges papers by identity, so
+    two objects for the same paper -- two searches that found it, or a new
+    search for a paper the document already cites -- used to leave two
+    records in the document's hidden field list against one printed entry.
+    A later pass then read more references than the document shows.
+
+    Every export path runs its candidates through here first, seeded from the
+    records already in the document so a repeat citation reuses that record
+    rather than minting a rival.
+    """
+
+    def __init__(self, existing: Optional[ExistingCitationMap] = None):
+        self._index = CitationKeyIndex()
+        self._owner: dict[str, CitationCandidate] = {}
+        if existing is not None:
+            for number in sorted(existing.bib_entries):
+                candidate = existing.bib_entries[number].matched_candidate
+                if candidate is None:
+                    continue
+                key = self._index.key_for_candidate(candidate)
+                if key:
+                    self._owner.setdefault(key, candidate)
+
+    def canonical(self, candidate: CitationCandidate) -> CitationCandidate:
+        """The object that owns this paper's record, adopting *candidate* if
+        the paper is new to the document."""
+        key = self._index.key_for_candidate(candidate)
+        if not key:
+            return candidate                      # nothing to identify it by
+        owner = self._owner.get(key)
+        if owner is None:
+            self._owner[key] = candidate
+            return candidate
+        if owner is not candidate:
+            _absorb_metadata(owner, candidate)
+        return owner
+
+    def canonical_all(self, candidates) -> list[CitationCandidate]:
+        return [self.canonical(c) for c in candidates]
+
+
+def _absorb_metadata(owner: CitationCandidate, other: CitationCandidate) -> None:
+    """Let the owning record learn from another object for the same paper.
+
+    Gaps are filled, never overwritten, with one deliberate exception: when
+    the owner has no PMID and the newcomer does, the paper has been published
+    since the owner was recorded (a preprint that reached a journal), so the
+    bibliographic fields are taken from the newcomer. The record id never
+    changes, so the document keeps pointing at the same record.
+    """
+    published_now = bool(other.pmid) and not owner.pmid
+    fields = ("pmid", "pmcid", "doi", "journal", "journal_abbrev", "volume",
+              "issue", "pages", "year", "title", "abstract", "raw_entry")
+    for field_name in fields:
+        new_value = getattr(other, field_name, None)
+        if not new_value:
+            continue
+        current = getattr(owner, field_name, None)
+        if not current or (published_now and field_name != "title"):
+            setattr(owner, field_name, new_value)
+    if len(other.authors or []) > len(owner.authors or []):
+        owner.authors = list(other.authors)
+    if other.is_retracted and not owner.is_retracted:
+        owner.is_retracted = True
+        owner.retraction_notice = other.retraction_notice or owner.retraction_notice
+
+
 @dataclass
 class CitationAssignment:
     """A citation that has been assigned a final number."""
