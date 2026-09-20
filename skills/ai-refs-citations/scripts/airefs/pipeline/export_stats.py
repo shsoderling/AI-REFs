@@ -15,6 +15,7 @@ class ExportStats:
     unmatched_markers: int = 0   # DOCX markers the pipeline never saw (e.g. in a heading)
     new_refs_added: int = 0
     existing_refs_renumbered: int = 0
+    identifiers_filled: int = 0  # embedded records completed (PMC id, DOI, PMID) from supplied records
     duplicates_merged: int = 0  # new citations matched to existing bib entries
     citations_converted: int = 0  # numeric sites converted to author-date
     bibliography_size: int = 0
@@ -55,6 +56,9 @@ class ExportStats:
         lines.append(f"New references added: {self.new_refs_added}")
         if self.existing_refs_renumbered:
             lines.append(f"Existing references renumbered: {self.existing_refs_renumbered}")
+        if self.identifiers_filled:
+            lines.append(f"Existing records completed with identifiers (PMC id, DOI, PMID): "
+                         f"{self.identifiers_filled}")
         if self.citations_converted:
             lines.append(
                 f"Citation sites converted to author-date: {self.citations_converted}")

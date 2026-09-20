@@ -98,11 +98,25 @@ def suggestion_mismatches(plan: dict, project: ProjectState) -> list[str]:
 
 
 def style_prints_pmcid(style: CitationStyle) -> bool:
-    """Whether the style's reference entries carry the PMC id (NIH grant, NLM)."""
+    """Whether the style's reference entries print the PMC id (NIH grant, NLM)."""
     try:
-        return 'variable="PMCID"' in Path(get_csl_path(style)).read_text(encoding="utf-8")
+        csl = Path(get_csl_path(style)).read_text(encoding="utf-8")
     except (OSError, ValueError):
         return False
+    return re.search(r'<text\s+variable="PMCID"', csl) is not None
+
+
+def _rerendered_existing(project: ProjectState) -> list:
+    """Records already in a tracked document whose entries the writer re-renders.
+
+    Entries adopted from plain text keep their own wording (``raw_entry``),
+    so their records never reach the style."""
+    tracking = project.doc_tracking
+    existing = project.existing_citations
+    if existing is None or tracking is None or tracking.tier != DocumentTier.TRACKED:
+        return []
+    return [e.matched_candidate for e in existing.bib_entries.values()
+            if e.matched_candidate is not None and not e.matched_candidate.raw_entry]
 
 
 def records_missing_pmcid(project: ProjectState) -> list[str]:
@@ -112,15 +126,19 @@ def records_missing_pmcid(project: ProjectState) -> list[str]:
     only when the record has none, so a record written down without its PMC
     id (the connector reports it as identifiers.pmc) quietly turns into a
     "PMID:" entry in the grant. Reported, not fixed: a paper that is not in
-    PMC keeps its PMID, and only a lookup tells the two cases apart.
+    PMC keeps its PMID, and only a lookup tells the two cases apart. Records
+    already embedded in a tracked document count too, since their entries
+    are re-rendered on every write.
     """
-    if not style_prints_pmcid(project.settings.citation_style):
+    if (not style_prints_pmcid(project.settings.citation_style)
+            or project.settings.bibliography_format == "nlm"):
         return []
+    cited = [cand for ev in project.evidence_map.values() for cand in ev.selected]
+    cited += _rerendered_existing(project)
     missing: dict[str, str] = {}
-    for ev in project.evidence_map.values():
-        for cand in ev.selected:
-            if cand.pmid and not cand.pmcid:
-                missing[cand.pmid] = f"{cand.first_author_year} (PMID {cand.pmid})"
+    for cand in cited:
+        if cand.pmid and not cand.pmcid:
+            missing[cand.pmid] = f"{cand.first_author_year} (PMID {cand.pmid})"
     return [missing[pmid] for pmid in sorted(missing)]
 
 
@@ -386,7 +404,9 @@ def main() -> None:
 
     try:
         if mode == "tracked":
-            stats = export_tracked(project, str(out))
+            # The records files also complete records the document already
+            # carries (a PMC id written without one, for instance).
+            stats = export_tracked(project, str(out), supplements=records)
         elif mode == "legacy":
             stats = export_legacy(project, str(out),
                                   ExportDecisions(convert_to_author_date=(args.convert_author_date == "yes")))
@@ -411,6 +431,7 @@ def main() -> None:
         "unresolved_sentences": stats.unresolved_sentence_ids,
         "sentences_without_decision": pending,
         "missing_pmcid": missing_pmcid,
+        "identifiers_filled": stats.identifiers_filled,
         "missing_pmcid_hint": ("these entries print the PMID because the record has no PMC id; "
                                "look the ids up (convert_article_ids, or fetch_records.py), add "
                                "them to the records file and write again") if missing_pmcid else None,

@@ -74,3 +74,93 @@ def test_preprint_without_pmid_is_not_a_missing_pmcid():
                                  authors=[Author(last_name="Smith", initials="J")])
     project = _project(CitationStyle.NIH_GRANT, preprint)
     assert write_docx.records_missing_pmcid(project) == []
+
+
+def test_the_classic_nlm_format_prints_pmids_whatever_the_record_holds():
+    project = _project(CitationStyle.NIH_GRANT, _candidate("32879322"))
+    project.settings.bibliography_format = "nlm"
+    assert write_docx.records_missing_pmcid(project) == []
+
+
+# ── records already embedded in a tracked document ──────────────────────────
+
+from airefs.models.sentence import MarkerType, SentenceRecord  # noqa: E402
+from airefs.pipeline.docx_export import export_fresh, export_tracked  # noqa: E402
+from airefs.pipeline.existing_citation_parser import ExistingCitationParser  # noqa: E402
+from airefs.services.docx_io import DocxHandler  # noqa: E402
+
+
+def _fresh_nih_document(tmp_path, candidate):
+    import docx
+    source = tmp_path / "in.docx"
+    document = docx.Document()
+    document.add_paragraph("A claim (REF).")
+    document.save(str(source))
+    project = _project(CitationStyle.NIH_GRANT, candidate)
+    project.input_docx_path = str(source)
+    project.sentences = [SentenceRecord(
+        id="S001", paragraph_index=0, raw_text="A claim (REF).", clean_text="A claim.",
+        marker_type=MarkerType.REF, marker_count=1, marker_types=[MarkerType.REF])]
+    out = tmp_path / "old.docx"
+    export_fresh(project, str(out))
+    return out
+
+
+def _reopen(path):
+    reopened = ExistingCitationParser(DocxHandler(str(path))).analyze()
+    project = ProjectState(settings={"citation_style": CitationStyle.NIH_GRANT})
+    project.input_docx_path = str(path)
+    project.existing_citations = reopened
+    project.doc_tracking = reopened.tracking
+    project.is_insert_mode = True
+    return project
+
+
+def _bibliography(path):
+    return [p.text for p in DocxHandler(str(path)).get_paragraphs() if "Udakis" in p.text]
+
+
+def test_an_embedded_record_without_pmc_id_is_reported_when_reopened(tmp_path):
+    old = _fresh_nih_document(tmp_path, _candidate("32879322"))
+    assert _bibliography(old)[-1].endswith("PMID: 32879322")     # the defect, as written
+
+    project = _reopen(old)
+    assert write_docx.records_missing_pmcid(project) == ["Udakis, 2020 (PMID 32879322)"]
+
+
+def test_records_passed_on_the_next_pass_fill_the_pmc_id_and_it_sticks(tmp_path):
+    old = _fresh_nih_document(tmp_path, _candidate("32879322"))
+    project = _reopen(old)
+    records = {"32879322": _candidate("32879322", pmcid="PMC7467931")}   # as index_records builds it
+
+    healed = tmp_path / "healed.docx"
+    stats = export_tracked(project, str(healed), supplements=records)
+
+    assert stats.identifiers_filled == 1
+    assert write_docx.records_missing_pmcid(project) == []          # what the writer reports afterwards
+    assert _bibliography(healed)[-1].endswith("PMCID: PMC7467931")
+    reread = _reopen(healed)                                        # the field carries it now
+    assert [e.matched_candidate.pmcid for e in reread.existing_citations.bib_entries.values()] == ["PMC7467931"]
+    assert write_docx.records_missing_pmcid(reread) == []
+
+
+def test_a_record_the_files_do_not_know_stays_reported(tmp_path):
+    old = _fresh_nih_document(tmp_path, _candidate("32879322"))
+    project = _reopen(old)
+    out = tmp_path / "out.docx"
+    stats = export_tracked(project, str(out), supplements={"1": _candidate("1", pmcid="PMC1")})
+    assert stats.identifiers_filled == 0
+    assert write_docx.records_missing_pmcid(project) == ["Udakis, 2020 (PMID 32879322)"]
+    assert _bibliography(out)[-1].endswith("PMID: 32879322")
+
+
+def test_an_entry_adopted_from_plain_text_keeps_its_wording_and_is_not_reported():
+    adopted = _candidate("32879322")
+    adopted.raw_entry = "1. Udakis M. A paper. Nat Commun. 2020."
+    from airefs.models.embedded import DocumentTier, TrackingReport
+    from airefs.models.existing_refs import ExistingBibEntry, ExistingCitationMap
+    project = _project(CitationStyle.NIH_GRANT)
+    project.existing_citations = ExistingCitationMap(
+        bib_entries={1: ExistingBibEntry(original_number=1, matched_candidate=adopted)})
+    project.doc_tracking = TrackingReport(tier=DocumentTier.TRACKED)
+    assert write_docx.records_missing_pmcid(project) == []

@@ -304,26 +304,62 @@ def export_fresh(project: ProjectState, output_path: str) -> ExportStats:
 
 # ── tracked export ────────────────────────────────────────────────────
 
-def export_tracked(project: ProjectState, output_path: str) -> ExportStats:
+def fill_missing_identifiers(existing: ExistingCitationMap,
+                             supplements: dict[str, CitationCandidate]) -> int:
+    """Complete the identifiers of embedded records from *supplements*.
+
+    A record written into a document without, say, its PMC id keeps printing
+    without it, because a tracked export re-renders entries from the record
+    (the NIH grant style then ends the entry with the PMID). A supplement
+    sharing one of the record's identifiers lends the ones it lacks; nothing
+    already set changes, and entries adopted from plain text keep their own
+    wording. *supplements* is keyed by PMID, lower-case DOI or upper-case PMC
+    id. Returns the number of records completed.
+    """
+    filled = 0
+    for entry in existing.bib_entries.values():
+        cand = entry.matched_candidate
+        if cand is None or cand.raw_entry:
+            continue
+        keys = [k for k in ((cand.pmid or "").strip(), (cand.doi or "").strip().lower(),
+                            (cand.pmcid or "").strip().upper()) if k]
+        other = next((supplements[k] for k in keys if k in supplements), None)
+        if other is None:
+            continue
+        before = (cand.pmid, cand.pmcid, cand.doi)
+        cand.pmid = cand.pmid or (other.pmid or "").strip()
+        cand.pmcid = cand.pmcid or (other.pmcid or "").strip()
+        cand.doi = cand.doi or (other.doi or "").strip()
+        if (cand.pmid, cand.pmcid, cand.doi) != before:
+            filled += 1
+    return filled
+
+
+def export_tracked(project: ProjectState, output_path: str,
+                   supplements: Optional[dict[str, CitationCandidate]] = None) -> ExportStats:
     """Export a tracked document: renumber through its citation fields, add
     fields for new markers and rebuild the bibliography field in place.
 
     The document's fields are the source of truth, so the map is re-read
-    from the file being written (offline). Raises :class:`ExportBlocked`
-    when the guard refuses (pending tracked changes, damaged analysis), a
-    table citation would have to change, or validation fails; nothing is
-    written in those cases.
+    from the file being written (offline). *supplements* are records the
+    caller knows (keyed by PMID, lower-case DOI or PMC id) that complete the
+    identifiers of embedded records, see :func:`fill_missing_identifiers`.
+    Raises :class:`ExportBlocked` when the guard refuses (pending tracked
+    changes, damaged analysis), a table citation would have to change, or
+    validation fails; nothing is written in those cases.
     """
     settings = project.settings
     style = settings.citation_style
     handler = DocxHandler(project.input_docx_path)
     existing = build_tracked_map(handler, keep_uncited=settings.keep_uncited_entries)
+    filled = fill_missing_identifiers(existing, supplements) if supplements else 0
     project.existing_citations = existing
     reasons = check_export_guard(existing, "tracked", settings)
     if reasons:
         raise ExportBlocked(reasons)
     layout = parse_csl_layout(style)
     stats = ExportStats(output_path=output_path)
+    stats.identifiers_filled = filled
     stats.uncited_dropped = sum(1 for i in existing.tracking.reconcile if i.kind == 'uncited')
 
     clusters, table_fields = collect_clusters(handler, stats)

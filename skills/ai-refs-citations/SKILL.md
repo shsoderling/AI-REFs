@@ -230,7 +230,11 @@ Two writer options belong to the bibliography:
 The writer's JSON output lists `missing_pmcid` when the style prints PMC ids and a cited
 PubMed record has none on file. Look those up (`convert_article_ids` with the PMIDs, or
 `fetch_records.py`), add the ids to the records file and write again; a paper that is
-genuinely not in PMC keeps its PMID, which is what the style does on purpose.
+genuinely not in PMC keeps its PMID, which is what the style does on purpose. On a
+document written earlier, the records files also complete the records it already
+carries: a PMC id the document lacks is filled from a record sharing its PMID or DOI, so
+reopening a grant written before this check and passing the looked-up records fixes its
+entries too (`identifiers_filled` in the output).
 If the scan found markers in tables, fill them once the main write is done:
 
 ```bash
