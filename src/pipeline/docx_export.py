@@ -26,7 +26,7 @@ from .author_date_convert import (
 )
 from .bib_format import format_bib_entry
 from .citation_numbers import expand_bracket_numbers
-from .csl_mapping import ensure_record_uuid
+from .csl_mapping import ensure_record_uuid, normalize_doi
 from .existing_citation_parser import (
     BRACKET_CITE_PATTERN, in_field_result, superscript_groups,
 )
@@ -328,9 +328,11 @@ def fill_missing_identifiers(existing: ExistingCitationMap,
             continue
         before = (cand.pmid, cand.pmcid, cand.doi)
         cand.pmid = cand.pmid or (other.pmid or "").strip()
-        cand.pmcid = cand.pmcid or (other.pmcid or "").strip()
-        cand.doi = cand.doi or (other.doi or "").strip()
+        cand.pmcid = cand.pmcid or (other.pmcid or "").strip().upper()
+        cand.doi = cand.doi or normalize_doi(other.doi)
         if (cand.pmid, cand.pmcid, cand.doi) != before:
+            # The entry mirrors the record's PMID and DOI for numbering.
+            entry.pmid, entry.doi = cand.pmid, cand.doi
             filled += 1
     return filled
 
@@ -342,7 +344,7 @@ def export_tracked(project: ProjectState, output_path: str,
 
     The document's fields are the source of truth, so the map is re-read
     from the file being written (offline). *supplements* are records the
-    caller knows (keyed by PMID, lower-case DOI or PMC id) that complete the
+    caller knows (keyed by PMID, lower-case DOI or upper-case PMC id) that complete the
     identifiers of embedded records, see :func:`fill_missing_identifiers`.
     Raises :class:`ExportBlocked` when the guard refuses (pending tracked
     changes, damaged analysis), a table citation would have to change, or

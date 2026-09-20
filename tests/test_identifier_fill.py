@@ -92,3 +92,57 @@ def test_the_tracked_export_completes_the_record_and_the_entry_prints_the_pmcid(
     assert entries(out)[-1].endswith("PMCID: PMC7467931")
     reread = ExistingCitationParser(DocxHandler(str(out))).analyze()
     assert [e.matched_candidate.pmcid for e in reread.bib_entries.values()] == ["PMC7467931"]
+
+
+def test_lent_identifiers_are_stored_in_canonical_form_and_mirrored_on_the_entry():
+    cand = _candidate(pmid="32879322")
+    existing = _existing(cand)
+    fill_missing_identifiers(existing, {"32879322": _candidate(
+        pmid="32879322", pmcid=" pmc7467931 ", doi="https://doi.org/10.1038/S41467-020-18074-8")})
+    assert (cand.pmcid, cand.doi) == ("PMC7467931", "10.1038/s41467-020-18074-8")
+    entry = existing.bib_entries[1]
+    assert (entry.pmid, entry.doi) == ("32879322", "10.1038/s41467-020-18074-8")
+
+
+def test_two_embedded_records_joined_by_a_lent_pmc_id_leave_one_entry_and_one_number(tmp_path):
+    """A record with the PMID only and one with the PMC id only are the same
+    paper once the supplement lends the PMC id; numbering has to merge them in
+    the same pass the records merge, or the file keeps an uncited entry."""
+    builder = DocBuilder()
+    builder.paragraph("First claim (REF).")
+    builder.paragraph("Second claim (REF).")
+    source = builder.save(tmp_path / "in.docx")
+    project = ProjectState(settings={"citation_style": CitationStyle.NIH_GRANT})
+    project.input_docx_path = str(source)
+    project.sentences = [
+        SentenceRecord(id="S001", paragraph_index=0, raw_text="First claim (REF).", clean_text="First claim.",
+                       marker_type=MarkerType.REF, marker_count=1, marker_types=[MarkerType.REF]),
+        SentenceRecord(id="S002", paragraph_index=1, raw_text="Second claim (REF).", clean_text="Second claim.",
+                       marker_type=MarkerType.REF, marker_count=1, marker_types=[MarkerType.REF])]
+    by_pmid = _candidate(pmid="32879322")
+    by_pmcid = _candidate(pmcid="PMC7467931")
+    by_pmcid.title = "The same paper, recorded under its PMC id"
+    project.evidence_map = {
+        "S001": EvidenceRecord(sentence_id="S001", selected=[by_pmid], review_decision=ReviewDecision.ACCEPTED),
+        "S002": EvidenceRecord(sentence_id="S002", selected=[by_pmcid], review_decision=ReviewDecision.ACCEPTED)}
+    old = tmp_path / "old.docx"
+    export_fresh(project, str(old))
+    entries = lambda path: [p.text for p in DocxHandler(str(path)).get_paragraphs() if "Udakis" in p.text]
+    assert len(entries(old)) == 2                                   # two records, as written
+
+    reopened = ExistingCitationParser(DocxHandler(str(old))).analyze()
+    second = ProjectState(settings={"citation_style": CitationStyle.NIH_GRANT})
+    second.input_docx_path = str(old)
+    second.existing_citations = reopened
+    second.doc_tracking = reopened.tracking
+    second.is_insert_mode = True
+    out = tmp_path / "joined.docx"
+    export_tracked(second, str(out), supplements={
+        "32879322": _candidate(pmid="32879322", pmcid="PMC7467931")})
+
+    assert len(entries(out)) == 1                                   # one paper, one entry
+    assert entries(out)[0].startswith("1. ") and entries(out)[0].endswith("PMCID: PMC7467931")
+    body = [p.text for p in DocxHandler(str(out)).get_paragraphs()][:2]
+    assert body == ["First claim 1.", "Second claim 1."]
+    reread = ExistingCitationParser(DocxHandler(str(out))).analyze()
+    assert len(reread.bib_entries) == 1

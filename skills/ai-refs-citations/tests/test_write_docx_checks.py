@@ -164,3 +164,14 @@ def test_an_entry_adopted_from_plain_text_keeps_its_wording_and_is_not_reported(
         bib_entries={1: ExistingBibEntry(original_number=1, matched_candidate=adopted)})
     project.doc_tracking = TrackingReport(tier=DocumentTier.TRACKED)
     assert write_docx.records_missing_pmcid(project) == []
+
+
+def test_a_records_file_doi_written_as_a_url_still_indexes_the_record(tmp_path):
+    import json
+    path = tmp_path / "records.json"
+    path.write_text(json.dumps({"records": [{
+        "pmid": "32879322", "doi": "https://doi.org/10.1038/S41467-020-18074-8", "title": "A paper",
+        "authors": [{"last_name": "Udakis", "initials": "M"}], "year": 2020, "journal": "Nat Commun"}]}))
+    index = common.index_records([path])
+    assert "10.1038/s41467-020-18074-8" in index
+    assert common.lookup_record(index, "10.1038/s41467-020-18074-8") is index["32879322"]

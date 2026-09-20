@@ -20,6 +20,7 @@ if str(HERE) not in sys.path:
 CONFIG_PATH = Path.home() / ".ai_refs" / "skill_config.json"
 
 from airefs.models.citation import CitationCandidate  # noqa: E402
+from airefs.pipeline.csl_mapping import normalize_doi  # noqa: E402
 
 
 def die(message: str, code: int = 2) -> None:
@@ -153,7 +154,7 @@ def record_keys(cand: CitationCandidate) -> list[str]:
     if cand.pmid:
         keys.append(cand.pmid.strip())
     if cand.doi:
-        keys.append(cand.doi.strip().lower())
+        keys.append(normalize_doi(cand.doi))       # bare and lower-case, URL prefix dropped
     if cand.pmcid:
         keys.append(cand.pmcid.strip().upper())
     return keys

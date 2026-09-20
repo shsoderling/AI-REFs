@@ -38,7 +38,8 @@ class CitationKeyIndex:
         self._alias_to_key: dict[str, str] = {}
 
     @staticmethod
-    def _aliases(pmid: str, doi: str, title: str, record_uuid: str = "") -> list[str]:
+    def _aliases(pmid: str, doi: str, title: str, record_uuid: str = "",
+                 pmcid: str = "") -> list[str]:
         aliases = []
         if record_uuid and record_uuid.strip():
             aliases.append(f"uuid:{record_uuid.strip()}")
@@ -46,6 +47,8 @@ class CitationKeyIndex:
             aliases.append(f"pmid:{pmid.strip()}")
         if doi and doi.strip():
             aliases.append(f"doi:{doi.strip().lower()}")
+        if pmcid and pmcid.strip():
+            aliases.append(f"pmcid:{pmcid.strip().upper()}")
         if title:
             norm = _normalize_title(title)
             if norm:
@@ -53,14 +56,16 @@ class CitationKeyIndex:
         return aliases
 
     def get_or_assign(self, pmid: str = "", doi: str = "", title: str = "",
-                      record_uuid: str = "") -> str:
+                      record_uuid: str = "", pmcid: str = "") -> str:
         """Return the canonical key for this identifier set, registering aliases.
 
         A record uuid (tracked documents) is the strongest alias and comes
-        first; PMID, DOI and normalised title follow, so a record found again
-        through any of them keeps one number.
+        first; PMID, DOI, PMC id and normalised title follow, so a record
+        found again through any of them keeps one number. The same strong
+        identifiers merge records (:class:`RecordCanonicaliser`), so what is
+        one record is also one number.
         """
-        aliases = self._aliases(pmid, doi, title, record_uuid)
+        aliases = self._aliases(pmid, doi, title, record_uuid, pmcid)
         if not aliases:
             return ""
         canonical = next(
@@ -72,12 +77,15 @@ class CitationKeyIndex:
         return canonical
 
     def key_for_candidate(self, cand: CitationCandidate) -> str:
-        return self.get_or_assign(cand.pmid, cand.doi, cand.title, cand.record_uuid)
+        return self.get_or_assign(cand.pmid, cand.doi, cand.title, cand.record_uuid,
+                                  cand.pmcid)
 
     def key_for_existing(self, entry: ExistingBibEntry) -> str:
         # Tracked entries carry a record uuid; enriched entries pmid/doi;
-        # bare entries may only have raw text.
-        key = self.get_or_assign(entry.pmid, entry.doi, entry.title, entry.record_uuid)
+        # bare entries may only have raw text. The PMC id lives on the record.
+        cand = entry.matched_candidate
+        key = self.get_or_assign(entry.pmid, entry.doi, entry.title, entry.record_uuid,
+                                 cand.pmcid if cand is not None else "")
         return key or f"existing_{entry.original_number}"
 
 

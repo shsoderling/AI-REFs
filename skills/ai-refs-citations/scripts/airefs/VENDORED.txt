@@ -1,1 +1,1 @@
-Copied from src/ at commit ee00394 by skills/sync_vendored_core.py. Do not edit here; edit src/ in the AI-REFs repository and re-run the sync script.
+Copied from src/ at commit 409c6fe by skills/sync_vendored_core.py. Do not edit here; edit src/ in the AI-REFs repository and re-run the sync script.
