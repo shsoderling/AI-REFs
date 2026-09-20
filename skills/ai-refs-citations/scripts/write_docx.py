@@ -24,7 +24,7 @@ from common import die, index_records, load_json, lookup_record, record_keys  # 
 from airefs.models.embedded import DocumentTier
 from airefs.models.evidence import EvidenceRecord, ReviewDecision
 from airefs.models.markers import MarkerConfig
-from airefs.models.project import CitationStyle, ProjectState
+from airefs.models.project import CitationStyle, ProjectState, get_csl_path
 from airefs.pipeline.docx_export import (
     ExportBlocked, ExportDecisions, check_export_guard, export_fresh, export_legacy, export_tracked,
     fresh_append_needs_confirmation,
@@ -95,6 +95,33 @@ def suggestion_mismatches(plan: dict, project: ProjectState) -> list[str]:
                 elif kind == "doi" and value and _norm_doi(value) not in have_dois:
                     problems.append(f"{sent['id']} {marker['text']}: doi {value} is not among the cited records")
     return problems
+
+
+def style_prints_pmcid(style: CitationStyle) -> bool:
+    """Whether the style's reference entries carry the PMC id (NIH grant, NLM)."""
+    try:
+        return 'variable="PMCID"' in Path(get_csl_path(style)).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+
+
+def records_missing_pmcid(project: ProjectState) -> list[str]:
+    """Cited PubMed records with no PMC id, in a style that would print one.
+
+    The NIH grant style ends each entry with the PMCID and prints the PMID
+    only when the record has none, so a record written down without its PMC
+    id (the connector reports it as identifiers.pmc) quietly turns into a
+    "PMID:" entry in the grant. Reported, not fixed: a paper that is not in
+    PMC keeps its PMID, and only a lookup tells the two cases apart.
+    """
+    if not style_prints_pmcid(project.settings.citation_style):
+        return []
+    missing: dict[str, str] = {}
+    for ev in project.evidence_map.values():
+        for cand in ev.selected:
+            if cand.pmid and not cand.pmcid:
+                missing[cand.pmid] = f"{cand.first_author_year} (PMID {cand.pmid})"
+    return [missing[pmid] for pmid in sorted(missing)]
 
 
 def build_project(plan: dict, decisions: dict, records, style: CitationStyle, embed: bool,
@@ -212,6 +239,10 @@ def write_report(path: str, plan: dict, project: ProjectState, mode: str, stats,
              f"Document mode: {mode}. Style: {project.settings.citation_style.value}.", "",
              "## Summary", ""]
     lines += [f"- {line.strip()}" for line in stats.summary_lines()]
+    missing_pmcid = records_missing_pmcid(project)
+    if missing_pmcid:
+        lines.append(f"- {len(missing_pmcid)} PubMed record(s) have no PMC id on file, so their entries "
+                     "print the PMID instead of the PMCID: " + "; ".join(missing_pmcid))
     lines += ["", "## Sentences", ""]
     for s in plan["sentences"]:
         ev = project.evidence_map.get(s["id"])
@@ -368,6 +399,7 @@ def main() -> None:
         write_report(args.report, plan, project, mode, stats, justification)
 
     pending = [s["id"] for s in plan["sentences"] if s["id"] not in project.evidence_map]
+    missing_pmcid = records_missing_pmcid(project)
     print(json.dumps({
         "output": str(out.resolve()),
         "mode": mode,
@@ -378,6 +410,10 @@ def main() -> None:
         "summary": stats.summary_lines(),
         "unresolved_sentences": stats.unresolved_sentence_ids,
         "sentences_without_decision": pending,
+        "missing_pmcid": missing_pmcid,
+        "missing_pmcid_hint": ("these entries print the PMID because the record has no PMC id; "
+                               "look the ids up (convert_article_ids, or fetch_records.py), add "
+                               "them to the records file and write again") if missing_pmcid else None,
         "report": str(Path(args.report).resolve()) if args.report else None,
     }, indent=2))
 

@@ -185,8 +185,8 @@ or unresolved) and that changing one is a one-line request away.
 
 ### 6. Fetch canonical records and write the document
 
-Bibliography entries need full metadata (authors, journal, volume, pages, DOI, PMID),
-which search snippets often lack, so fetch it for the final identifiers:
+Bibliography entries need full metadata (authors, journal, volume, issue, pages, DOI,
+PMID and PMC id), which search snippets often lack, so fetch it for the final identifiers:
 
 ```bash
 python3 scripts/fetch_records.py --pmids 32879322,31978345 \
@@ -194,8 +194,14 @@ python3 scripts/fetch_records.py --pmids 32879322,31978345 \
 ```
 
 With `lookups: connectors`, build the same file from `get_article_metadata` and
-`get_preprint` results instead. `resolved.json` and `search_library.py --records` are
-already in that format, and several `--records` files can be passed at once.
+`get_preprint` results instead, copying `identifiers.pmc` into the record's `pmcid`.
+That field matters more than it looks: the NIH grant style ends every entry with the
+PMCID (NIH's public access policy asks for it on cited papers) and prints the PMID
+only when the record has none, so a record written down without its PMC id becomes a
+`PMID:` entry in the grant. `search_articles` returns PMIDs only; `convert_article_ids`
+gives the PMC ids for a list of them in one call. `resolved.json` and
+`search_library.py --records` are already in the records format, and several
+`--records` files can be passed at once.
 
 Write `decisions.json` (format in `references/file-formats.md`): per sentence the
 decision and, per marker slot, the record keys, plus each citation's score, verdict and
@@ -220,6 +226,11 @@ Two writer options belong to the bibliography:
 - `--append-ids` adds the DOI and PMID to entries whose style omits them. Worth offering
   when the document may later be saved through Google Docs or Pages, which strips the
   hidden fields: the identifiers are then the only way back to the records.
+
+The writer's JSON output lists `missing_pmcid` when the style prints PMC ids and a cited
+PubMed record has none on file. Look those up (`convert_article_ids` with the PMIDs, or
+`fetch_records.py`), add the ids to the records file and write again; a paper that is
+genuinely not in PMC keeps its PMID, which is what the style does on purpose.
 If the scan found markers in tables, fill them once the main write is done:
 
 ```bash

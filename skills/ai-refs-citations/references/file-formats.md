@@ -93,6 +93,10 @@ exist": redo those lookups with the connectors.
 ```
 
 A record is addressed in decisions.json by its PMID, its DOI (any case) or its PMC id.
+`pmcid` is also what the NIH grant style prints at the end of each entry (`PMCID:
+PMC7467931`); without it the entry falls back to `PMID: 32879322`. The PubMed connector
+reports it as `identifiers.pmc` in `get_article_metadata`, and `convert_article_ids`
+returns it for a list of PMIDs.
 A hand-written record needs at least `title`, `authors`, `year` and `journal` to format
 a bibliography entry; `authors` may also be given as `"Smith, JA"` strings, and
 `journal_abbrev`, `volume`, `issue` and `pages` are used when present. Several

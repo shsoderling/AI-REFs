@@ -17,7 +17,8 @@
         "In-text citation numbers run in ascending order of first appearance",
         "A per-sentence review of the proposed citations was shown to the user before the document was written",
         "Each proposed citation is accompanied by a supporting quote or rationale tied to the sentence it cites",
-        "The output document reopens as a tracked AI REFs document (citations stored as hidden fields)"
+        "The output document reopens as a tracked AI REFs document (citations stored as hidden fields)",
+        "Reference entries for PubMed papers that have a PMC id end with 'PMCID: PMC...' rather than 'PMID: ...', as the NIH grant style requires"
       ]
     },
     {
