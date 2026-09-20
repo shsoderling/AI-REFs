@@ -52,6 +52,7 @@ a = Analysis(
         'src.pipeline.renumber_apply',
         'src.pipeline.renumber_plan',
         'src.pipeline.bib_format',
+        'src.pipeline.csl_bibliography',
         'src.pipeline.export_stats',
         'src.pipeline.author_date_convert',
         'src.pipeline.claim_context',
@@ -147,8 +148,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleName': 'AI REFs',
             'CFBundleDisplayName': 'AI REFs',
-            'CFBundleVersion': '1.3.0',
-            'CFBundleShortVersionString': '1.3.0',
+            'CFBundleVersion': '1.4.0',
+            'CFBundleShortVersionString': '1.4.0',
             'NSHighResolutionCapable': True,
             'NSAppTransportSecurity': {
                 'NSAllowsArbitraryLoads': True,

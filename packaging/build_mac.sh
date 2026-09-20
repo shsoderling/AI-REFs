@@ -5,7 +5,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 APP_NAME="AI REFs"
-VERSION="1.3.0"
+VERSION="1.4.0"
 DMG_NAME="${APP_NAME} ${VERSION}"
 DMG_FILE="${SCRIPT_DIR}/dist/${DMG_NAME}.dmg"
 
